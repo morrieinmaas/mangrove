@@ -1,0 +1,17 @@
+[package]
+name = "mangrove-typed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mangrove-core = { path = "../mangrove-core" }
+mangrove-syntax = { path = "../mangrove-syntax" }
+regex = { workspace = true }
+num-bigint = { workspace = true }
+bigdecimal = { workspace = true }
+
+[lints]
+workspace = true
