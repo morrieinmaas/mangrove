@@ -31,6 +31,9 @@ pub enum Tok {
     Lt,       // <
     Int(BigInt),
     Decimal(BigDecimal),
+    /// A unit literal: `(mantissa, suffix)`, e.g. `512Mi` → `(512, "Mi")`.
+    /// Resolved against a unit type during validation (M2b).
+    UnitLit(BigDecimal, String),
     Str(String),
     Bool(bool),
     Bytes(Vec<u8>),
@@ -317,14 +320,21 @@ impl Lexer {
             }
             self.take_digits(&mut s);
         }
-        // A number immediately followed by an identifier char is a unit literal,
-        // which requires a schema (L1). Reject it at L0 (Decision D3).
+        // A number immediately followed by an identifier is a unit literal
+        // (`512Mi`); it is resolved against a unit type later (D14).
         if matches!(self.peek(), Some(c) if is_ident_start(c)) {
-            return Err(LexError {
-                message: "unit literals require a schema (L1)".into(),
+            let mut suffix = String::new();
+            while matches!(self.peek(), Some(c) if c.is_ascii_alphanumeric() || c == '_') {
+                suffix.push(self.peek().unwrap());
+                self.bump();
+            }
+            let cleaned: String = s.chars().filter(|c| *c != '_').collect();
+            let mantissa = BigDecimal::from_str(&cleaned).map_err(|e| LexError {
+                message: format!("invalid unit-literal number {cleaned:?}: {e}"),
                 line,
                 col,
-            });
+            })?;
+            return Ok(Tok::UnitLit(mantissa, suffix));
         }
         let cleaned: String = s.chars().filter(|c| *c != '_').collect();
         if is_decimal {
@@ -656,8 +666,23 @@ mod tests {
     }
 
     #[test]
-    fn unit_suffix_is_error() {
-        assert!(lex("a: 512Mi").is_err());
+    fn unit_literal_lexes() {
+        use std::str::FromStr;
+        assert_eq!(
+            toks("a: 512Mi").get(2),
+            Some(&Tok::UnitLit(BigDecimal::from(512), "Mi".into()))
+        );
+        assert_eq!(
+            toks("x: 0.5btc").get(2),
+            Some(&Tok::UnitLit(
+                BigDecimal::from_str("0.5").unwrap(),
+                "btc".into()
+            ))
+        );
+        assert_eq!(
+            toks("x: 100_000_000sat").get(2),
+            Some(&Tok::UnitLit(BigDecimal::from(100_000_000), "sat".into()))
+        );
     }
 
     #[test]
