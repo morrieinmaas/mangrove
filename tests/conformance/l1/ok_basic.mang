@@ -1,0 +1,4 @@
+type Server = { host: str, port: int & >= 1 & <= 65535 }
+schema Server
+host: "h"
+port: 8443

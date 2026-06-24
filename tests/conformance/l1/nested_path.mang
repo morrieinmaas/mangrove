@@ -1,0 +1,3 @@
+type Doc = { listen: { port: int & <= 65535 } }
+schema Doc
+listen: { port: 70000 }

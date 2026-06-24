@@ -1,0 +1,4 @@
+type Env = "dev" | "staging" | "prod"
+type Doc = { env: Env }
+schema Doc
+env: "qa"
