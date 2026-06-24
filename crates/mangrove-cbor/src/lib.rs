@@ -177,4 +177,28 @@ mod tests {
         let d = BigDecimal::from_str("0").unwrap();
         assert_eq!(encode(&Value::Decimal(d)), vec![0xc4, 0x82, 0x00, 0x00]);
     }
+    #[test]
+    fn empty_list_and_map() {
+        assert_eq!(encode(&Value::List(vec![])), vec![0x80]);
+        assert_eq!(encode(&Value::Map(Default::default())), vec![0xa0]);
+    }
+    #[test]
+    fn list_preserves_order() {
+        let v = Value::List(vec![
+            Value::Int(BigInt::from(1)),
+            Value::Int(BigInt::from(2)),
+        ]);
+        assert_eq!(encode(&v), vec![0x82, 0x01, 0x02]);
+    }
+    #[test]
+    fn map_keys_sorted_by_codepoint() {
+        // Insert out of order; encoding must emit "a" before "b" (§7.1).
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("b".to_string(), Value::Int(BigInt::from(2)));
+        m.insert("a".to_string(), Value::Int(BigInt::from(1)));
+        assert_eq!(
+            encode(&Value::Map(m)),
+            vec![0xa2, 0x61, 0x61, 0x01, 0x61, 0x62, 0x02]
+        );
+    }
 }
