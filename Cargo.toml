@@ -15,6 +15,7 @@ num-traits = "0.2"
 bigdecimal = "0.4"
 blake3 = "1"
 regex = "1"
+toml = "0.8"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
