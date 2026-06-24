@@ -87,6 +87,14 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
             for f in fields {
                 match m.get(&f.name) {
                     Some(v) => errs.extend(check(v, &f.ty, &child(path, &f.name), env)),
+                    // a defaulted field absent is valid — but the default value
+                    // itself must satisfy the field type (caught at validation).
+                    None if f.default.is_some() => errs.extend(check(
+                        f.default.as_ref().unwrap(),
+                        &f.ty,
+                        &child(path, &f.name),
+                        env,
+                    )),
                     None if f.optional => {}
                     None => errs.push(
                         ValidationError::new(child(path, &f.name), "absent", render_type(&f.ty))
@@ -384,5 +392,18 @@ mod tests {
     fn brand_validates_against_inner() {
         assert!(errs(Value::Int(21000.into()), "brand int & >= 0").is_empty());
         assert_eq!(errs(Value::Int((-1).into()), "brand int & >= 0").len(), 1);
+    }
+
+    #[test]
+    fn absent_defaulted_field_is_valid() {
+        let v = map(&[]);
+        assert!(validate(&v, &ty("{ n: int | *1 }"), &env()).is_empty());
+    }
+
+    #[test]
+    fn ill_typed_default_errors() {
+        // default 0 violates >= 1
+        let v = map(&[]);
+        assert_eq!(validate(&v, &ty("{ n: int & >= 1 | *0 }"), &env()).len(), 1);
     }
 }

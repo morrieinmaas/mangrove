@@ -68,6 +68,25 @@ fn hash_resolves_units_so_512mi_equals_536870912() {
 }
 
 #[test]
+fn omitted_default_hashes_same_as_explicit() {
+    let schema = "type D = { name: str, replicas: int | *1 }\nschema D\n";
+    let omitted = std::env::temp_dir().join("m2c_omit.mang");
+    let explicit = std::env::temp_dir().join("m2c_expl.mang");
+    std::fs::write(&omitted, format!("{schema}name: \"a\"\n")).unwrap();
+    std::fs::write(&explicit, format!("{schema}name: \"a\"\nreplicas: 1\n")).unwrap();
+    let h = |p: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg("hash")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert_eq!(h(&omitted), h(&explicit)); // §7 step 3 / D18
+}
+
+#[test]
 fn schemaless_unit_literal_errors() {
     let p = std::env::temp_dir().join("m2b_bare.mang");
     std::fs::write(&p, "x: 512Mi\n").unwrap();

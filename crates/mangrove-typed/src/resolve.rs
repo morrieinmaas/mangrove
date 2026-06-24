@@ -53,6 +53,18 @@ fn resolve_at(
                     }
                 }
             }
+            // Materialize absent defaulted fields into the canonical form
+            // (§7 step 3, D18). An absent bare-optional field stays absent.
+            for f in fields {
+                if !out.contains_key(&f.name)
+                    && let Some(def) = &f.default
+                {
+                    out.insert(
+                        f.name.clone(),
+                        resolve_at(def, &f.ty, &child(path, &f.name), env)?,
+                    );
+                }
+            }
             Ok(Value::Map(out))
         }
 
@@ -197,6 +209,24 @@ mod tests {
             },
         );
         assert!(resolve(&Value::Map(m), &ty, &env).is_err());
+    }
+
+    #[test]
+    fn absent_default_is_materialized() {
+        let env = TypeEnv::build(&[], &[]).unwrap();
+        let ty = parse_type("{ n: int | *1 }").unwrap();
+        let resolved = resolve(&Value::Map(BTreeMap::new()), &ty, &env).unwrap();
+        let Value::Map(out) = resolved else { panic!() };
+        assert_eq!(out.get("n"), Some(&Value::Int(1.into())));
+    }
+
+    #[test]
+    fn absent_optional_is_not_materialized() {
+        let env = TypeEnv::build(&[], &[]).unwrap();
+        let ty = parse_type("{ n?: bool }").unwrap();
+        let resolved = resolve(&Value::Map(BTreeMap::new()), &ty, &env).unwrap();
+        let Value::Map(out) = resolved else { panic!() };
+        assert!(out.is_empty());
     }
 
     #[test]
