@@ -56,6 +56,7 @@ fn collect_refs(ty: &Type, out: &mut Vec<String>) {
             }
         }
         Type::Map(inner) | Type::List(inner) => collect_refs(inner, out),
+        Type::Brand { inner, .. } => collect_refs(inner, out),
         Type::Union(variants) => {
             for v in variants {
                 collect_refs(v, out);

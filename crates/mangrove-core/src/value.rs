@@ -14,6 +14,13 @@ pub enum Value {
     Bytes(Vec<u8>),
     List(Vec<Value>),
     Map(BTreeMap<String, Value>),
+    /// An unresolved unit literal (`512Mi`), carrying its mantissa and suffix.
+    /// Resolved to a base `Int` against a unit type before canonicalization
+    /// (M2b); it must never reach the CBOR encoder unresolved.
+    Unit {
+        mantissa: BigDecimal,
+        suffix: String,
+    },
 }
 
 impl Value {
@@ -29,6 +36,15 @@ impl Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_value_constructs() {
+        let u = Value::Unit {
+            mantissa: 512.into(),
+            suffix: "Mi".into(),
+        };
+        assert!(matches!(u, Value::Unit { .. }));
+    }
 
     #[test]
     fn map_iterates_in_codepoint_key_order() {

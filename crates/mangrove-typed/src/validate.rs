@@ -144,6 +144,10 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
                 ValidationError::new(path, render(value), n.clone()).with_failed("unknown type"),
             ],
         },
+
+        // §4.6: a brand validates exactly as its structural `inner` — a bare
+        // literal into a brand-typed slot is auto-constructed (no ceremony).
+        Type::Brand { inner, .. } => check(value, inner, path, env),
     }
 }
 
@@ -176,6 +180,7 @@ fn render(v: &Value) -> String {
         Value::Bytes(_) => "<bytes>".into(),
         Value::List(_) => "<list>".into(),
         Value::Map(_) => "<map>".into(),
+        Value::Unit { mantissa, suffix } => format!("{mantissa}{suffix}"),
     }
 }
 
@@ -200,6 +205,13 @@ fn render_type(ty: &Type) -> String {
         Type::List(t) => format!("[ {} ]", render_type(t)),
         Type::Union(vs) => vs.iter().map(render_type).collect::<Vec<_>>().join(" | "),
         Type::Named(n) => n.clone(),
+        Type::Brand { name, inner } => {
+            if name.is_empty() {
+                format!("brand {}", render_type(inner))
+            } else {
+                name.clone()
+            }
+        }
     }
 }
 

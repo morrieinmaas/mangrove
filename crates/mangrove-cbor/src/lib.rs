@@ -40,6 +40,14 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
                 encode_into(v, out);
             }
         }
+        // ponytail: a guard, not a code path — unit literals are resolved to a
+        // base Int against a schema before hashing (M2b); a schemaless unit
+        // literal errors earlier (D14), so this is unreachable in correct flows.
+        Value::Unit { .. } => {
+            panic!(
+                "unresolved unit literal reached the CBOR encoder — resolve against a schema first"
+            )
+        }
     }
 }
 

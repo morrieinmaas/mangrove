@@ -39,6 +39,13 @@ pub enum Type {
 
     // reference to a `type X = …`, resolved against a TypeEnv
     Named(String),
+
+    // nominal newtype (§4.6): distinct identity over a structural `inner`.
+    // `name` is filled from the enclosing `type X = brand …` binding.
+    Brand {
+        name: String,
+        inner: Box<Type>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
