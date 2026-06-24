@@ -602,7 +602,7 @@ impl Parser {
             {
                 self.advance(); // 'require'
                 self.expect(&Tok::Colon)?;
-                let pred = self.parse_pred()?;
+                let pred = self.parse_pred(0)?;
                 let anns = self.parse_annotations()?;
                 let message = Annotation::find(&anns, "message").map(str::to_string);
                 requires.push(crate::ty::Require { pred, message });
@@ -668,42 +668,64 @@ impl Parser {
 
     // ---- require predicate sublanguage (§4.7) ----
 
-    fn parse_pred(&mut self) -> Result<crate::ty::Pred, ParseError> {
-        self.parse_pred_or()
+    fn parse_pred(&mut self, depth: usize) -> Result<crate::ty::Pred, ParseError> {
+        // `depth` tracks the resulting tree's depth, so it bounds not just parse
+        // recursion but also the evaluator's recursion and the AST's recursive
+        // `Drop` — a flat `a && a && …` chain builds a left-deep tree that would
+        // otherwise overflow eval/Drop even though the parse loop is iterative.
+        if depth >= MAX_DEPTH {
+            return Err(self.error("predicate nesting too deep".into()));
+        }
+        self.parse_pred_or(depth)
     }
 
-    fn parse_pred_or(&mut self) -> Result<crate::ty::Pred, ParseError> {
-        let mut lhs = self.parse_pred_and()?;
+    fn parse_pred_or(&mut self, depth: usize) -> Result<crate::ty::Pred, ParseError> {
+        let mut lhs = self.parse_pred_and(depth)?;
+        let mut d = depth;
         while self.check(&Tok::PipePipe) {
             self.advance();
-            let rhs = self.parse_pred_and()?;
+            d += 1; // each chain link deepens the left-deep tree
+            if d >= MAX_DEPTH {
+                return Err(self.error("predicate nesting too deep".into()));
+            }
+            let rhs = self.parse_pred_and(d)?;
             lhs = crate::ty::Pred::Or(Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
     }
 
-    fn parse_pred_and(&mut self) -> Result<crate::ty::Pred, ParseError> {
-        let mut lhs = self.parse_pred_not()?;
+    fn parse_pred_and(&mut self, depth: usize) -> Result<crate::ty::Pred, ParseError> {
+        let mut lhs = self.parse_pred_not(depth)?;
+        let mut d = depth;
         while self.check(&Tok::AmpAmp) {
             self.advance();
-            let rhs = self.parse_pred_not()?;
+            d += 1;
+            if d >= MAX_DEPTH {
+                return Err(self.error("predicate nesting too deep".into()));
+            }
+            let rhs = self.parse_pred_not(d)?;
             lhs = crate::ty::Pred::And(Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
     }
 
-    fn parse_pred_not(&mut self) -> Result<crate::ty::Pred, ParseError> {
+    fn parse_pred_not(&mut self, depth: usize) -> Result<crate::ty::Pred, ParseError> {
         if self.check(&Tok::Bang) {
+            if depth >= MAX_DEPTH {
+                return Err(self.error("predicate nesting too deep".into()));
+            }
             self.advance();
-            Ok(crate::ty::Pred::Not(Box::new(self.parse_pred_not()?)))
+            Ok(crate::ty::Pred::Not(Box::new(
+                self.parse_pred_not(depth + 1)?,
+            )))
         } else {
-            self.parse_pred_cmp()
+            self.parse_pred_cmp(depth)
         }
     }
 
-    fn parse_pred_cmp(&mut self) -> Result<crate::ty::Pred, ParseError> {
+    fn parse_pred_cmp(&mut self, depth: usize) -> Result<crate::ty::Pred, ParseError> {
         use crate::ty::{CmpOp, Pred};
-        let lhs = self.parse_operand()?;
+        let lhs = self.parse_operand(depth)?;
         let op = match self.peek().tok {
             Tok::EqEq => Some(CmpOp::Eq),
             Tok::Ne => Some(CmpOp::Ne),
@@ -716,19 +738,19 @@ impl Parser {
         match op {
             Some(op) => {
                 self.advance();
-                let rhs = self.parse_operand()?;
+                let rhs = self.parse_operand(depth)?;
                 Ok(Pred::Compare { op, lhs, rhs })
             }
             None => Ok(Pred::Truthy(lhs)),
         }
     }
 
-    fn parse_operand(&mut self) -> Result<crate::ty::Operand, ParseError> {
+    fn parse_operand(&mut self, depth: usize) -> Result<crate::ty::Operand, ParseError> {
         use crate::ty::Operand;
         match self.peek().tok.clone() {
             Tok::LParen => {
                 self.advance();
-                let p = self.parse_pred()?;
+                let p = self.parse_pred(depth + 1)?;
                 self.expect(&Tok::RParen)?;
                 Ok(Operand::Pred(Box::new(p)))
             }
@@ -946,6 +968,35 @@ mod tests {
         };
         assert_eq!(bn, "Satoshis");
         assert!(matches!(**inner, Type::IntRange { .. }));
+    }
+
+    #[test]
+    fn deeply_nested_require_errors_instead_of_overflowing() {
+        // Was: SIGABRT via parser/evaluator/Drop recursion. Now a clean error.
+        let parens = format!(
+            "type C = {{ a: int, require: {}a == a{} }}\nschema C\n",
+            "(".repeat(5000),
+            ")".repeat(5000)
+        );
+        assert!(parse_document(&parens).is_err());
+        let bangs = format!(
+            "type C = {{ a: bool, require: {}a }}\nschema C\n",
+            "!".repeat(5000)
+        );
+        assert!(parse_document(&bangs).is_err());
+        // a long flat && chain (left-deep tree) is also bounded
+        let chain = format!(
+            "type C = {{ a: bool, require: {} }}\nschema C\n",
+            vec!["a"; 5000].join(" && ")
+        );
+        assert!(parse_document(&chain).is_err());
+        // a reasonable predicate still parses
+        assert!(
+            parse_document(
+                "type C = { a: int, b: int, require: (a <= b) && (b >= 0) }\nschema C\n"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
