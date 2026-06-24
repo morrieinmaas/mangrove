@@ -138,16 +138,38 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
             }
         }
 
-        Type::Named(n) => match env.resolve(n) {
-            Some(t) => check(value, t, path, env),
-            None => vec![
-                ValidationError::new(path, render(value), n.clone()).with_failed("unknown type"),
-            ],
-        },
+        Type::Named(n) => {
+            if let Some(t) = env.resolve(n) {
+                check(value, t, path, env)
+            } else if env.is_unit(n) {
+                check_unit(value, n, path, env)
+            } else {
+                vec![
+                    ValidationError::new(path, render(value), n.clone())
+                        .with_failed("unknown type"),
+                ]
+            }
+        }
 
         // §4.6: a brand validates exactly as its structural `inner` — a bare
         // literal into a brand-typed slot is auto-constructed (no ceremony).
         Type::Brand { inner, .. } => check(value, inner, path, env),
+    }
+}
+
+/// Validate a value against a unit type `unit` (§4.5): a unit literal must
+/// resolve (suffix is a member, exact-integer base); a bare base-unit integer
+/// is accepted; any other kind is a mismatch.
+fn check_unit(value: &Value, unit: &str, path: &str, env: &TypeEnv) -> Vec<ValidationError> {
+    match value {
+        Value::Unit { mantissa, suffix } => match env.resolve_unit(unit, mantissa, suffix) {
+            Ok(_) => vec![],
+            Err(msg) => {
+                vec![ValidationError::new(path, render(value), unit.to_string()).with_failed(msg)]
+            }
+        },
+        Value::Int(_) => vec![],
+        _ => vec![ValidationError::new(path, render(value), unit.to_string())],
     }
 }
 
@@ -163,7 +185,7 @@ fn mismatch(path: &str, value: &Value, ty: &Type) -> ValidationError {
     ValidationError::new(path, render(value), render_type(ty))
 }
 
-fn child(parent: &str, key: &str) -> String {
+pub(crate) fn child(parent: &str, key: &str) -> String {
     if parent.is_empty() {
         key.to_string()
     } else {
@@ -171,7 +193,7 @@ fn child(parent: &str, key: &str) -> String {
     }
 }
 
-fn render(v: &Value) -> String {
+pub(crate) fn render(v: &Value) -> String {
     match v {
         Value::Int(n) => n.to_string(),
         Value::Decimal(d) => d.to_string(),
@@ -323,5 +345,44 @@ mod tests {
         let e = validate(&v, &ty("{ [str]: int }"), &env());
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].path, "b");
+    }
+
+    fn bytes_env() -> TypeEnv {
+        TypeEnv::build(
+            &[],
+            &[mangrove_syntax::UnitDef {
+                name: "Bytes".into(),
+                members: vec![("B".into(), 1.into()), ("Mi".into(), 1_048_576.into())],
+            }],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unit_literal_validates_against_unit_type() {
+        let env = bytes_env();
+        let v = Value::Unit {
+            mantissa: 512.into(),
+            suffix: "Mi".into(),
+        };
+        assert!(validate(&v, &Type::Named("Bytes".into()), &env).is_empty());
+    }
+
+    #[test]
+    fn wrong_unit_suffix_errors() {
+        let env = bytes_env();
+        let v = Value::Unit {
+            mantissa: 1.into(),
+            suffix: "core".into(),
+        };
+        let e = validate(&v, &Type::Named("Bytes".into()), &env);
+        assert_eq!(e.len(), 1);
+        assert!(e[0].failed.as_deref().unwrap().contains("core"));
+    }
+
+    #[test]
+    fn brand_validates_against_inner() {
+        assert!(errs(Value::Int(21000.into()), "brand int & >= 0").is_empty());
+        assert_eq!(errs(Value::Int((-1).into()), "brand int & >= 0").len(), 1);
     }
 }
