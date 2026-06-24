@@ -10,6 +10,7 @@ repository.workspace = true
 mangrove-core = { path = "../mangrove-core" }
 mangrove-syntax = { path = "../mangrove-syntax" }
 mangrove-typed = { path = "../mangrove-typed" }
+mangrove-resolve = { path = "../mangrove-resolve" }
 
 [lints]
 workspace = true

@@ -162,6 +162,7 @@ name = "mangrove-compose"
 version = "0.1.0"
 dependencies = [
  "mangrove-core",
+ "mangrove-resolve",
  "mangrove-syntax",
  "mangrove-typed",
 ]

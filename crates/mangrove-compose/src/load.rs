@@ -5,6 +5,7 @@
 
 use crate::merge::merge;
 use mangrove_core::Value;
+use mangrove_resolve::{Lockfile, Resolvers};
 use mangrove_syntax::{
     Annotation, Document, ListOpItem, Stmt, Type, TypeDef, UnitDef, parse_document,
 };
@@ -30,12 +31,25 @@ pub struct Composed {
     pub body: Value,
 }
 
-/// Compose the document at `path` (resolving local `use`s and spreads).
+/// Compose the document at `path`, resolving local `use`s, spreads, and — via
+/// the resolver + lockfile (`.mangrove/resolvers.toml`, `mangrove.lock`) —
+/// namespaced `use`s (hash-verified before evaluation, §5.2).
 pub fn compose(path: &Path) -> Result<Composed, String> {
-    compose_rec(path, &mut Vec::new())
+    let canon = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let root_dir = canon.parent().unwrap_or_else(|| Path::new("."));
+    let resolvers = Resolvers::find_and_load(root_dir)?;
+    let lock = Lockfile::find_and_load(root_dir)?;
+    compose_rec(path, &mut Vec::new(), &resolvers, &lock)
 }
 
-fn compose_rec(path: &Path, visiting: &mut Vec<PathBuf>) -> Result<Composed, String> {
+fn compose_rec(
+    path: &Path,
+    visiting: &mut Vec<PathBuf>,
+    resolvers: &Resolvers,
+    lock: &Lockfile,
+) -> Result<Composed, String> {
     // `visiting.len()` is the current `use`-chain depth; cap it so a deep chain
     // of local files errors cleanly instead of overflowing the stack (SIGABRT).
     if visiting.len() >= MAX_USE_DEPTH {
@@ -50,19 +64,24 @@ fn compose_rec(path: &Path, visiting: &mut Vec<PathBuf>) -> Result<Composed, Str
     let src = std::fs::read_to_string(&canon).map_err(|e| format!("{}: {e}", path.display()))?;
     let doc = parse_document(&src).map_err(|e| format!("{}:{e}", path.display()))?;
 
-    // Resolve each local `use` to its composed body, keyed by alias.
+    // Resolve each `use` (local path or namespaced reference) to its composed
+    // body, keyed by alias.
     visiting.push(canon.clone());
     let dir = canon.parent().unwrap_or_else(|| Path::new("."));
     let mut bases: BTreeMap<String, Value> = BTreeMap::new();
     for u in &doc.uses {
-        if !(u.path.starts_with("./") || u.path.starts_with("../")) {
-            visiting.pop();
-            return Err(format!(
-                "remote/namespaced import `{}` requires a resolver (M3b); use a relative path",
-                u.path
-            ));
-        }
-        let base = compose_rec(&dir.join(&u.path), visiting)?;
+        let base_path = if u.path.starts_with("./") || u.path.starts_with("../") {
+            dir.join(&u.path)
+        } else {
+            // Namespaced: resolve to a file, then hash-verify the source bytes
+            // against the lockfile BEFORE composing (fail closed, §5.2).
+            let resolved = resolvers.resolve_path(&u.path)?;
+            let bytes = std::fs::read(&resolved)
+                .map_err(|e| format!("resolving `{}`: {}: {e}", u.path, resolved.display()))?;
+            lock.verify(&bytes, &u.path)?;
+            resolved
+        };
+        let base = compose_rec(&base_path, visiting, resolvers, lock)?;
         bases.insert(u.alias.clone(), base.body);
     }
     visiting.pop();
@@ -220,7 +239,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("m3a_compose_{}_{id}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (name, contents) in files {
-            let mut f = std::fs::File::create(dir.join(name)).unwrap();
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut f = std::fs::File::create(&path).unwrap();
             f.write_all(contents.as_bytes()).unwrap();
         }
         dir
@@ -271,10 +292,67 @@ mod tests {
     }
 
     #[test]
-    fn remote_import_errors_in_m3a() {
-        let dir = scratch(&[("d.mang", "use \"infra/k8s/core\" as k\n...k\n")]);
+    fn namespaced_use_without_resolver_errors() {
+        // No .mangrove/resolvers.toml → the namespace can't be resolved.
+        let dir = scratch(&[("d.mang", "use \"infra/k8s/core@v1\" as k\n...k\n")]);
         let e = compose(&dir.join("d.mang")).unwrap_err();
-        assert!(e.contains("resolver"));
+        assert!(e.contains("resolver"), "{e}");
+    }
+
+    #[test]
+    fn namespaced_use_verified_composes() {
+        let dir = scratch(&[
+            ("vendor/x.mang", "name: \"shared\"\nport: 80\n"),
+            ("root.mang", "use \"infra/x@v1\" as k\n...k\nport: 9090\n"),
+            (
+                ".mangrove/resolvers.toml",
+                "[namespace.infra]\nremote = \"vendor\"\n",
+            ),
+        ]);
+        // pin the correct hash of vendor/x.mang
+        let bytes = std::fs::read(dir.join("vendor/x.mang")).unwrap();
+        std::fs::write(
+            dir.join("mangrove.lock"),
+            format!(
+                "\"infra/x@v1\" = {:?}\n",
+                mangrove_resolve::source_hash(&bytes)
+            ),
+        )
+        .unwrap();
+        let c = compose(&dir.join("root.mang")).unwrap();
+        assert_eq!(get(&c.body, "name"), Some(&Value::Str("shared".into())));
+        assert_eq!(get(&c.body, "port"), Some(&Value::Int(9090.into()))); // override
+    }
+
+    #[test]
+    fn tampered_source_fails_integrity() {
+        let dir = scratch(&[
+            ("vendor/x.mang", "name: \"shared\"\n"),
+            ("root.mang", "use \"infra/x@v1\" as k\n...k\n"),
+            (
+                ".mangrove/resolvers.toml",
+                "[namespace.infra]\nremote = \"vendor\"\n",
+            ),
+            // lock pins a hash that won't match the actual source
+            ("mangrove.lock", "\"infra/x@v1\" = \"b3:deadbeef\"\n"),
+        ]);
+        let e = compose(&dir.join("root.mang")).unwrap_err();
+        assert!(e.contains("integrity check failed"), "{e}");
+    }
+
+    #[test]
+    fn missing_lock_entry_errors() {
+        let dir = scratch(&[
+            ("vendor/x.mang", "name: \"shared\"\n"),
+            ("root.mang", "use \"infra/x@v1\" as k\n...k\n"),
+            (
+                ".mangrove/resolvers.toml",
+                "[namespace.infra]\nremote = \"vendor\"\n",
+            ),
+            // no mangrove.lock
+        ]);
+        let e = compose(&dir.join("root.mang")).unwrap_err();
+        assert!(e.contains("mangrove update"), "{e}");
     }
 
     #[test]
