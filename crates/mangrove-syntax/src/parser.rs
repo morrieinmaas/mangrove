@@ -64,14 +64,35 @@ pub struct TypeDef {
     pub annotations: Vec<Annotation>,
 }
 
-/// A parsed document: any local `type`/`unit` definitions, an optional `schema`
-/// binding, and the data body. A pure L0 document has empty defs and
-/// `schema == None`.
+/// A local import (`use ./path.mang as alias`). M3a is local-path-only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Use {
+    pub path: String,
+    pub alias: String,
+}
+
+/// A body statement (L2): either a `key: value` binding or a `...alias` spread.
+/// Ordered, so composition can fold them left-to-right (later wins).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    Bind(String, Value),
+    Spread(String),
+}
+
+/// A parsed document: local `use`s, any `type`/`unit` definitions, an optional
+/// `schema` binding, the ordered body statements, and — for the common
+/// spread-free case — the folded body value. A pure L0 document has empty defs,
+/// no uses/spreads, and `schema == None`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Document {
+    pub uses: Vec<Use>,
     pub typedefs: Vec<TypeDef>,
     pub unitdefs: Vec<UnitDef>,
     pub schema: Option<String>,
+    /// Ordered body statements (binds + spreads), for the compose driver.
+    pub stmts: Vec<Stmt>,
+    /// The folded body of plain bindings (spread-free path; used by `hash`
+    /// until composition runs). Spreads do not contribute here.
     pub body: Value,
 }
 
@@ -154,16 +175,25 @@ impl Parser {
     /// Walk top-level statements: `type X = …` definitions, one `schema X`
     /// binding, and ordinary `key: value` bindings forming the body.
     fn parse_doc(&mut self) -> Result<Document, ParseError> {
+        let mut uses = Vec::new();
         let mut typedefs = Vec::new();
         let mut unitdefs = Vec::new();
         let mut schema: Option<String> = None;
+        let mut stmts: Vec<Stmt> = Vec::new();
         let mut body = BTreeMap::new();
         self.skip_seps();
         loop {
             if self.at_eof() {
                 break;
             }
-            if self.is_keyword_stmt("type") {
+            if matches!(&self.peek().tok, Tok::Bareword(b) if b == "use")
+                && matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.tok),
+                    Some(Tok::Str(_))
+                )
+            {
+                uses.push(self.parse_use()?);
+            } else if self.is_keyword_stmt("type") {
                 typedefs.push(self.parse_typedef()?);
             } else if self.is_keyword_stmt("unit") {
                 unitdefs.push(self.parse_unitdef()?);
@@ -182,12 +212,31 @@ impl Parser {
                     return Err(self.error("duplicate `schema` statement".into()));
                 }
                 schema = Some(name);
+            } else if self.check(&Tok::DotDotDot) {
+                // `...alias` spread
+                self.advance();
+                let alias = match self.peek().tok.clone() {
+                    Tok::Bareword(n) => {
+                        self.advance();
+                        n
+                    }
+                    other => {
+                        return Err(self.error(format!("expected a spread alias, found {other:?}")));
+                    }
+                };
+                stmts.push(Stmt::Spread(alias));
             } else {
                 let (key, value) = self.parse_binding(0)?;
-                if body.contains_key(&key) {
-                    return Err(self.error(format!("duplicate key {key:?}")));
+                // The folded body is the spread-free convenience view (used by
+                // `hash` until composition runs). A duplicate plain key is a
+                // typo error here; `unset` with no base collapses to absence.
+                if !matches!(value, Value::Unset) {
+                    if body.contains_key(&key) {
+                        return Err(self.error(format!("duplicate key {key:?}")));
+                    }
+                    body.insert(key.clone(), value.clone());
                 }
-                body.insert(key, value);
+                stmts.push(Stmt::Bind(key, value));
             }
 
             let had_sep = self.at_sep();
@@ -197,11 +246,44 @@ impl Parser {
             }
         }
         Ok(Document {
+            uses,
             typedefs,
             unitdefs,
             schema,
+            stmts,
             body: Value::Map(body),
         })
+    }
+
+    /// `use ./path.mang as alias` (M3a: local relative path only).
+    fn parse_use(&mut self) -> Result<Use, ParseError> {
+        self.advance(); // 'use'
+        let path = match self.peek().tok.clone() {
+            Tok::Str(s) => {
+                self.advance();
+                s
+            }
+            other => {
+                return Err(self.error(format!(
+                    "expected a quoted path after `use`, found {other:?}"
+                )));
+            }
+        };
+        // expect `as alias`
+        match self.peek().tok.clone() {
+            Tok::Bareword(b) if b == "as" => self.advance(),
+            other => {
+                return Err(self.error(format!("expected `as` after use path, found {other:?}")));
+            }
+        }
+        let alias = match self.peek().tok.clone() {
+            Tok::Bareword(n) => {
+                self.advance();
+                n
+            }
+            other => return Err(self.error(format!("expected an alias, found {other:?}"))),
+        };
+        Ok(Use { path, alias })
     }
 
     /// True if the current statement is the keyword `kw` followed by a bareword
@@ -432,6 +514,11 @@ impl Parser {
             Tok::Bool(b) => {
                 self.advance();
                 Ok(Value::Bool(b))
+            }
+            // `unset` (§5.4): the composition marker; legal anywhere a value is.
+            Tok::Bareword(b) if b == "unset" => {
+                self.advance();
+                Ok(Value::Unset)
             }
             Tok::Bytes(b) => {
                 self.advance();
@@ -934,6 +1021,30 @@ mod tests {
     fn pure_l0_document_has_no_typedefs_or_schema() {
         let d = parse_document("a: 1\nb: 2").unwrap();
         assert!(d.typedefs.is_empty() && d.schema.is_none());
+        assert!(d.uses.is_empty());
+    }
+
+    #[test]
+    fn spread_and_unset_and_use_parse() {
+        use super::{Stmt, Use};
+        let d = parse_document("use \"./base.mang\" as base\n...base\nport: 9090\ndebug: unset\n")
+            .unwrap();
+        assert_eq!(
+            d.uses,
+            vec![Use {
+                path: "./base.mang".into(),
+                alias: "base".into()
+            }]
+        );
+        // stmts in order: Spread(base), Bind(port,9090), Bind(debug, Unset)
+        assert_eq!(d.stmts.len(), 3);
+        assert!(matches!(&d.stmts[0], Stmt::Spread(a) if a == "base"));
+        assert!(matches!(&d.stmts[1], Stmt::Bind(k, _) if k == "port"));
+        assert!(matches!(&d.stmts[2], Stmt::Bind(k, v) if k == "debug" && *v == Value::Unset));
+        // folded body (spread-free view) has the plain bind, not the unset
+        let Value::Map(m) = &d.body else { panic!() };
+        assert_eq!(m.get("port"), Some(&Value::Int(9090.into())));
+        assert!(!m.contains_key("debug"));
     }
 
     #[test]

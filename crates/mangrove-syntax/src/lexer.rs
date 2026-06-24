@@ -32,14 +32,15 @@ pub enum Tok {
     Gt,       // >
     Lt,       // <
     // M2c tokens (defaults, annotations, require predicates)
-    Star,     // *
-    At,       // @
-    Dot,      // .
-    EqEq,     // ==
-    Ne,       // !=
-    Bang,     // !
-    AmpAmp,   // &&
-    PipePipe, // ||
+    Star,      // *
+    At,        // @
+    Dot,       // .
+    DotDotDot, // ...
+    EqEq,      // ==
+    Ne,        // !=
+    Bang,      // !
+    AmpAmp,    // &&
+    PipePipe,  // ||
     Int(BigInt),
     Decimal(BigDecimal),
     /// A unit literal: `(mantissa, suffix)`, e.g. `512Mi` → `(512, "Mi")`.
@@ -234,7 +235,13 @@ impl Lexer {
                 }
                 '.' => {
                     self.bump();
-                    Tok::Dot
+                    if self.peek() == Some('.') && self.peek_at(1) == Some('.') {
+                        self.bump();
+                        self.bump();
+                        Tok::DotDotDot
+                    } else {
+                        Tok::Dot
+                    }
                 }
                 '!' => {
                     self.bump();
