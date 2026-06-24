@@ -1,0 +1,16 @@
+[package]
+name = "mangrove-cbor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mangrove-core = { path = "../mangrove-core" }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+bigdecimal = { workspace = true }
+
+[lints]
+workspace = true
