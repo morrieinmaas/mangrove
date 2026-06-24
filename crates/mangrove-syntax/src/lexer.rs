@@ -16,6 +16,8 @@ pub enum Tok {
     RBrace,
     LBracket,
     RBracket,
+    LParen,
+    RParen,
     Colon,
     Comma,
     Newline,
@@ -183,6 +185,14 @@ impl Lexer {
                 ']' => {
                     self.bump();
                     Tok::RBracket
+                }
+                '(' => {
+                    self.bump();
+                    Tok::LParen
+                }
+                ')' => {
+                    self.bump();
+                    Tok::RParen
                 }
                 ':' => {
                     self.bump();

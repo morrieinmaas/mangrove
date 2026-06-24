@@ -6,4 +6,4 @@ pub mod validate;
 
 pub use env::TypeEnv;
 pub use resolve::resolve;
-pub use validate::validate;
+pub use validate::{deprecations, validate};

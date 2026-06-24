@@ -5,13 +5,60 @@
 use crate::env::TypeEnv;
 use mangrove_core::Value;
 use mangrove_core::error::ValidationError;
-use mangrove_syntax::Type;
+use mangrove_syntax::{Annotation, Type};
 use regex::Regex;
 use std::collections::HashSet;
 
 /// Validate `value` against `ty`. An empty Vec means valid.
 pub fn validate(value: &Value, ty: &Type, env: &TypeEnv) -> Vec<ValidationError> {
     check(value, ty, "", env)
+}
+
+/// Advisory `@deprecated` messages for every present field whose definition is
+/// `@deprecated` (§4.9). Never errors; used by `mangrove check` for warnings.
+pub fn deprecations(value: &Value, ty: &Type, env: &TypeEnv) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_deprecations(value, ty, "", env, &mut out);
+    out
+}
+
+fn walk_deprecations(value: &Value, ty: &Type, path: &str, env: &TypeEnv, out: &mut Vec<String>) {
+    match ty {
+        Type::Named(n) => {
+            if let Some(t) = env.resolve(n) {
+                walk_deprecations(value, t, path, env, out);
+            }
+        }
+        Type::Brand { inner, .. } => walk_deprecations(value, inner, path, env, out),
+        Type::Record { fields } => {
+            if let Value::Map(m) = value {
+                for f in fields {
+                    if let Some(v) = m.get(&f.name) {
+                        let p = child(path, &f.name);
+                        if let Some(msg) = Annotation::find(&f.annotations, "deprecated") {
+                            out.push(format!("{p}: deprecated: {msg}"));
+                        }
+                        walk_deprecations(v, &f.ty, &p, env, out);
+                    }
+                }
+            }
+        }
+        Type::Map(vt) => {
+            if let Value::Map(m) = value {
+                for (k, v) in m {
+                    walk_deprecations(v, vt, &child(path, k), env, out);
+                }
+            }
+        }
+        Type::List(elem) => {
+            if let Value::List(xs) = value {
+                for (i, x) in xs.iter().enumerate() {
+                    walk_deprecations(x, elem, &format!("{path}[{i}]"), env, out);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationError> {
@@ -148,7 +195,17 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
 
         Type::Named(n) => {
             if let Some(t) = env.resolve(n) {
-                check(value, t, path, env)
+                let mut sub = check(value, t, path, env);
+                // A named type's @message overrides the default message on its
+                // own failures (§4.9, §12).
+                if let Some(msg) = env.message(n) {
+                    for e in &mut sub {
+                        if e.message.is_none() {
+                            e.message = Some(msg.to_string());
+                        }
+                    }
+                }
+                sub
             } else if env.is_unit(n) {
                 check_unit(value, n, path, env)
             } else {
@@ -392,6 +449,35 @@ mod tests {
     fn brand_validates_against_inner() {
         assert!(errs(Value::Int(21000.into()), "brand int & >= 0").is_empty());
         assert_eq!(errs(Value::Int((-1).into()), "brand int & >= 0").len(), 1);
+    }
+
+    #[test]
+    fn message_annotation_surfaces_in_error() {
+        use mangrove_syntax::{Annotation, TypeDef, parse_type};
+        let env = TypeEnv::build(
+            &[TypeDef {
+                name: "Port".into(),
+                ty: parse_type("int & >= 1 & <= 65535").unwrap(),
+                annotations: vec![Annotation {
+                    name: "message".into(),
+                    arg: Some("bad port".into()),
+                }],
+            }],
+            &[],
+        )
+        .unwrap();
+        let e = validate(&Value::Int(70000.into()), &Type::Named("Port".into()), &env);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].message.as_deref(), Some("bad port"));
+    }
+
+    #[test]
+    fn deprecated_field_yields_advisory() {
+        let ty = ty("{ image: str @deprecated(\"use image_ref\") }");
+        let v = map(&[("image", Value::Str("x".into()))]);
+        let warns = super::deprecations(&v, &ty, &env());
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("image") && warns[0].contains("image_ref"));
     }
 
     #[test]

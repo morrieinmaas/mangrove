@@ -57,6 +57,26 @@ pub struct FieldDef {
     /// Default value (`field: T | *value`), materialized into the canonical
     /// form when the field is absent (§4.7, §7 step 3).
     pub default: Option<Value>,
+    /// Metadata annotations (`@doc`/`@message`/`@deprecated`, §4.9). Never part
+    /// of the data hash.
+    pub annotations: Vec<Annotation>,
+}
+
+/// A metadata annotation: `@name(arg)` (§4.9). `arg` is the single string
+/// argument, when present.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Annotation {
+    pub name: String,
+    pub arg: Option<String>,
+}
+
+impl Annotation {
+    /// The `@<name>` argument of the first matching annotation, if any.
+    pub fn find<'a>(anns: &'a [Annotation], name: &str) -> Option<&'a str> {
+        anns.iter()
+            .find(|a| a.name == name)
+            .and_then(|a| a.arg.as_deref())
+    }
 }
 
 #[cfg(test)]

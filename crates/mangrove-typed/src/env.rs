@@ -3,26 +3,32 @@
 //! (`Named`) cycle — recursion is forbidden by the totality axiom (§2.6).
 
 use bigdecimal::BigDecimal;
-use mangrove_syntax::{Type, UnitDef};
+use mangrove_syntax::{Annotation, Type, TypeDef, UnitDef};
 use num_bigint::BigInt;
 use std::collections::HashMap;
 
 pub struct TypeEnv {
     types: HashMap<String, Type>,
     units: HashMap<String, Vec<(String, BigInt)>>,
+    /// `@message(…)` per named type, surfaced in §12 errors (§4.9).
+    messages: HashMap<String, String>,
 }
 
 impl TypeEnv {
     /// Build an environment from a document's `type` and `unit` definitions.
     /// Errors on a duplicate name, an unknown referenced type, or a `Named`
     /// cycle.
-    pub fn build(typedefs: &[(String, Type)], unitdefs: &[UnitDef]) -> Result<TypeEnv, String> {
+    pub fn build(typedefs: &[TypeDef], unitdefs: &[UnitDef]) -> Result<TypeEnv, String> {
         let mut types = HashMap::new();
-        for (name, ty) in typedefs {
-            if types.contains_key(name) {
-                return Err(format!("duplicate type definition: {name}"));
+        let mut messages = HashMap::new();
+        for td in typedefs {
+            if types.contains_key(&td.name) {
+                return Err(format!("duplicate type definition: {}", td.name));
             }
-            types.insert(name.clone(), ty.clone());
+            types.insert(td.name.clone(), td.ty.clone());
+            if let Some(msg) = Annotation::find(&td.annotations, "message") {
+                messages.insert(td.name.clone(), msg.to_string());
+            }
         }
         let mut units: HashMap<String, Vec<(String, BigInt)>> = HashMap::new();
         for u in unitdefs {
@@ -49,7 +55,11 @@ impl TypeEnv {
             adj.insert(name.clone(), type_refs);
         }
         detect_cycle(&adj)?;
-        Ok(TypeEnv { types, units })
+        Ok(TypeEnv {
+            types,
+            units,
+            messages,
+        })
     }
 
     /// Look up a named type.
@@ -60,6 +70,11 @@ impl TypeEnv {
     /// Whether `name` is a declared unit type.
     pub fn is_unit(&self, name: &str) -> bool {
         self.units.contains_key(name)
+    }
+
+    /// The `@message` declared on a named type, if any (§4.9).
+    pub fn message(&self, name: &str) -> Option<&str> {
+        self.messages.get(name).map(String::as_str)
     }
 
     /// Resolve a unit literal `mantissa<suffix>` against unit type `unit` to its
@@ -159,6 +174,13 @@ mod tests {
     fn bd(s: &str) -> BigDecimal {
         BigDecimal::from_str(s).unwrap()
     }
+    fn td(name: &str, ty: Type) -> TypeDef {
+        TypeDef {
+            name: name.into(),
+            ty,
+            annotations: vec![],
+        }
+    }
     fn bytes_unit() -> Vec<UnitDef> {
         vec![UnitDef {
             name: "Bytes".into(),
@@ -172,19 +194,19 @@ mod tests {
 
     #[test]
     fn resolves_named_types() {
-        let env = TypeEnv::build(&[("Port".into(), Type::Int)], &[]).unwrap();
+        let env = TypeEnv::build(&[td("Port", Type::Int)], &[]).unwrap();
         assert_eq!(env.resolve("Port"), Some(&Type::Int));
         assert_eq!(env.resolve("Missing"), None);
     }
 
     #[test]
     fn duplicate_type_name_errors() {
-        assert!(TypeEnv::build(&[("A".into(), Type::Int), ("A".into(), Type::Str)], &[]).is_err());
+        assert!(TypeEnv::build(&[td("A", Type::Int), td("A", Type::Str)], &[]).is_err());
     }
 
     #[test]
     fn direct_cycle_errors() {
-        assert!(TypeEnv::build(&[("A".into(), Type::Named("A".into()))], &[]).is_err());
+        assert!(TypeEnv::build(&[td("A", Type::Named("A".into()))], &[]).is_err());
     }
 
     #[test]
@@ -192,8 +214,8 @@ mod tests {
         assert!(
             TypeEnv::build(
                 &[
-                    ("A".into(), Type::Named("B".into())),
-                    ("B".into(), Type::Named("A".into())),
+                    td("A", Type::Named("B".into())),
+                    td("B", Type::Named("A".into())),
                 ],
                 &[]
             )
@@ -205,7 +227,7 @@ mod tests {
     fn cycle_through_container_errors() {
         assert!(
             TypeEnv::build(
-                &[("A".into(), Type::List(Box::new(Type::Named("A".into()))))],
+                &[td("A", Type::List(Box::new(Type::Named("A".into()))))],
                 &[]
             )
             .is_err()
@@ -214,13 +236,13 @@ mod tests {
 
     #[test]
     fn unknown_referenced_type_errors() {
-        assert!(TypeEnv::build(&[("A".into(), Type::Named("Nope".into()))], &[]).is_err());
+        assert!(TypeEnv::build(&[td("A", Type::Named("Nope".into()))], &[]).is_err());
     }
 
     #[test]
     fn named_may_reference_a_unit_type() {
         // A = Named("Bytes") where Bytes is a unit — valid, not "unknown type".
-        let env = TypeEnv::build(&[("A".into(), Type::Named("Bytes".into()))], &bytes_unit());
+        let env = TypeEnv::build(&[td("A", Type::Named("Bytes".into()))], &bytes_unit());
         assert!(env.is_ok());
         assert!(env.unwrap().is_unit("Bytes"));
     }
@@ -229,18 +251,19 @@ mod tests {
     fn non_recursive_nested_is_fine() {
         let env = TypeEnv::build(
             &[
-                (
-                    "A".into(),
+                td(
+                    "A",
                     Type::Record {
                         fields: vec![mangrove_syntax::FieldDef {
                             name: "b".into(),
                             optional: false,
                             ty: Type::Named("B".into()),
                             default: None,
+                            annotations: vec![],
                         }],
                     },
                 ),
-                ("B".into(), Type::Int),
+                td("B", Type::Int),
             ],
             &[],
         );
@@ -250,11 +273,28 @@ mod tests {
     #[test]
     fn long_acyclic_chain_does_not_overflow() {
         let n = 50_000;
-        let mut defs: Vec<(String, Type)> = (0..n)
-            .map(|i| (format!("A{i}"), Type::Named(format!("A{}", i + 1))))
+        let mut defs: Vec<TypeDef> = (0..n)
+            .map(|i| td(&format!("A{i}"), Type::Named(format!("A{}", i + 1))))
             .collect();
-        defs.push((format!("A{n}"), Type::Int));
+        defs.push(td(&format!("A{n}"), Type::Int));
         assert!(TypeEnv::build(&defs, &[]).is_ok());
+    }
+
+    #[test]
+    fn message_annotation_is_stored() {
+        let env = TypeEnv::build(
+            &[TypeDef {
+                name: "Port".into(),
+                ty: Type::Int,
+                annotations: vec![Annotation {
+                    name: "message".into(),
+                    arg: Some("bad port".into()),
+                }],
+            }],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(env.message("Port"), Some("bad port"));
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! as separators here (not folded into the value — Decision D5).
 
 use crate::lexer::{Tok, Token, lex};
-use crate::ty::{FieldDef, Type};
+use crate::ty::{Annotation, FieldDef, Type};
 use bigdecimal::BigDecimal;
 use mangrove_core::Value;
 use num_bigint::BigInt;
@@ -56,12 +56,20 @@ pub struct UnitDef {
     pub members: Vec<(String, BigInt)>,
 }
 
+/// A named type definition with its metadata annotations (§4.9).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDef {
+    pub name: String,
+    pub ty: Type,
+    pub annotations: Vec<Annotation>,
+}
+
 /// A parsed document: any local `type`/`unit` definitions, an optional `schema`
 /// binding, and the data body. A pure L0 document has empty defs and
 /// `schema == None`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Document {
-    pub typedefs: Vec<(String, Type)>,
+    pub typedefs: Vec<TypeDef>,
     pub unitdefs: Vec<UnitDef>,
     pub schema: Option<String>,
     pub body: Value,
@@ -206,7 +214,7 @@ impl Parser {
             )
     }
 
-    fn parse_typedef(&mut self) -> Result<(String, Type), ParseError> {
+    fn parse_typedef(&mut self) -> Result<TypeDef, ParseError> {
         self.advance(); // 'type'
         let name = match self.peek().tok.clone() {
             Tok::Bareword(n) => {
@@ -225,7 +233,49 @@ impl Parser {
             },
             other => other,
         };
-        Ok((name, ty))
+        let annotations = self.parse_annotations()?;
+        Ok(TypeDef {
+            name,
+            ty,
+            annotations,
+        })
+    }
+
+    /// Parse a run of `@name(arg)` annotations (§4.9), possibly empty.
+    fn parse_annotations(&mut self) -> Result<Vec<Annotation>, ParseError> {
+        let mut anns = Vec::new();
+        while self.check(&Tok::At) {
+            self.advance(); // @
+            let name = match self.peek().tok.clone() {
+                Tok::Bareword(n) => {
+                    self.advance();
+                    n
+                }
+                other => {
+                    return Err(self.error(format!("expected an annotation name, found {other:?}")));
+                }
+            };
+            let arg = if self.check(&Tok::LParen) {
+                self.advance(); // (
+                let s = match self.peek().tok.clone() {
+                    Tok::Str(s) => {
+                        self.advance();
+                        s
+                    }
+                    other => {
+                        return Err(
+                            self.error(format!("expected a string argument, found {other:?}"))
+                        );
+                    }
+                };
+                self.expect(&Tok::RParen)?;
+                Some(s)
+            } else {
+                None
+            };
+            anns.push(Annotation { name, arg });
+        }
+        Ok(anns)
     }
 
     /// `unit Name : int { member = value, … }` (§4.5). Each member value is an
@@ -571,11 +621,13 @@ impl Parser {
             } else {
                 None
             };
+            let annotations = self.parse_annotations()?;
             fields.push(FieldDef {
                 name,
                 optional,
                 ty,
                 default,
+                annotations,
             });
 
             let had_sep = self.at_sep();
@@ -705,7 +757,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(d.typedefs.len(), 1);
-        assert_eq!(d.typedefs[0].0, "Port");
+        assert_eq!(d.typedefs[0].name, "Port");
         assert_eq!(d.schema.as_deref(), Some("Server"));
         let Value::Map(m) = &d.body else { panic!() };
         assert!(m.contains_key("host") && m.contains_key("port"));
@@ -751,13 +803,36 @@ mod tests {
         use crate::ty::Type;
         let d =
             parse_document("type Satoshis = brand int & >= 0\nschema Satoshis\nx: 1\n").unwrap();
-        let (name, ty) = &d.typedefs[0];
-        assert_eq!(name, "Satoshis");
-        let Type::Brand { name: bn, inner } = ty else {
+        let td = &d.typedefs[0];
+        assert_eq!(td.name, "Satoshis");
+        let Type::Brand { name: bn, inner } = &td.ty else {
             panic!()
         };
         assert_eq!(bn, "Satoshis");
         assert!(matches!(**inner, Type::IntRange { .. }));
+    }
+
+    #[test]
+    fn annotations_parse_on_typedef_and_field() {
+        use crate::ty::Type;
+        let d = parse_document(
+            "type Port = int @doc(\"p\") @message(\"m\")\ntype R = { image: str @deprecated(\"use x\") }\nschema R\n",
+        )
+        .unwrap();
+        let port = d.typedefs.iter().find(|t| t.name == "Port").unwrap();
+        assert_eq!(port.annotations.len(), 2);
+        assert_eq!(
+            crate::ty::Annotation::find(&port.annotations, "message"),
+            Some("m")
+        );
+        let r = d.typedefs.iter().find(|t| t.name == "R").unwrap();
+        let Type::Record { fields } = &r.ty else {
+            panic!()
+        };
+        assert_eq!(
+            crate::ty::Annotation::find(&fields[0].annotations, "deprecated"),
+            Some("use x")
+        );
     }
 
     #[test]

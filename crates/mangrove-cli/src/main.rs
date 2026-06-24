@@ -133,6 +133,10 @@ fn cmd_check(path: &str) -> ExitCode {
         eprintln!("{path}: unknown schema type: {schema_name}");
         return ExitCode::from(1);
     };
+    // Advisory @deprecated warnings (never affect the exit code).
+    for warning in mangrove_typed::deprecations(&doc.body, schema_ty, &env) {
+        eprintln!("warning: {warning}");
+    }
     let errors = mangrove_typed::validate(&doc.body, schema_ty, &env);
     if errors.is_empty() {
         println!("ok");
