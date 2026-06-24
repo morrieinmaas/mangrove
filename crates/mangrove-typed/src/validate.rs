@@ -237,7 +237,7 @@ mod tests {
         parse_type(s).unwrap()
     }
     fn env() -> TypeEnv {
-        TypeEnv::build(&[]).unwrap()
+        TypeEnv::build(&[], &[]).unwrap()
     }
     fn errs(v: Value, t: &str) -> Vec<mangrove_core::error::ValidationError> {
         validate(&v, &ty(t), &env())

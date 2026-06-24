@@ -66,7 +66,7 @@ fn cmd_check(path: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let env = match mangrove_typed::TypeEnv::build(&doc.typedefs) {
+    let env = match mangrove_typed::TypeEnv::build(&doc.typedefs, &doc.unitdefs) {
         Ok(e) => e,
         Err(msg) => {
             eprintln!("{path}: schema error: {msg}");

@@ -2,17 +2,21 @@
 //! Building one rejects duplicate names, unknown references, and any recursive
 //! (`Named`) cycle — recursion is forbidden by the totality axiom (§2.6).
 
-use mangrove_syntax::Type;
+use bigdecimal::BigDecimal;
+use mangrove_syntax::{Type, UnitDef};
+use num_bigint::BigInt;
 use std::collections::HashMap;
 
 pub struct TypeEnv {
     types: HashMap<String, Type>,
+    units: HashMap<String, Vec<(String, BigInt)>>,
 }
 
 impl TypeEnv {
-    /// Build an environment from a document's `type` definitions. Errors on a
-    /// duplicate type name, an unknown referenced type, or a `Named` cycle.
-    pub fn build(typedefs: &[(String, Type)]) -> Result<TypeEnv, String> {
+    /// Build an environment from a document's `type` and `unit` definitions.
+    /// Errors on a duplicate name, an unknown referenced type, or a `Named`
+    /// cycle.
+    pub fn build(typedefs: &[(String, Type)], unitdefs: &[UnitDef]) -> Result<TypeEnv, String> {
         let mut types = HashMap::new();
         for (name, ty) in typedefs {
             if types.contains_key(name) {
@@ -20,27 +24,68 @@ impl TypeEnv {
             }
             types.insert(name.clone(), ty.clone());
         }
-        // Build the name-reference graph (rejecting unknown references), then
-        // check it for cycles iteratively — so an arbitrarily long acyclic
-        // chain `A0 -> A1 -> … -> An` cannot overflow the call stack.
+        let mut units: HashMap<String, Vec<(String, BigInt)>> = HashMap::new();
+        for u in unitdefs {
+            if units.contains_key(&u.name) || types.contains_key(&u.name) {
+                return Err(format!("duplicate type/unit definition: {}", u.name));
+            }
+            units.insert(u.name.clone(), u.members.clone());
+        }
+        // Build the type-reference graph (a Named may also point at a unit type,
+        // which is a valid leaf and never part of a cycle), reject unknown
+        // references, then check for cycles iteratively — so an arbitrarily long
+        // acyclic chain `A0 -> A1 -> … -> An` cannot overflow the call stack.
         let mut adj: HashMap<String, Vec<String>> = HashMap::new();
         for (name, ty) in &types {
             let mut refs = Vec::new();
             collect_refs(ty, &mut refs);
             for r in &refs {
-                if !types.contains_key(r) {
+                if !types.contains_key(r) && !units.contains_key(r) {
                     return Err(format!("unknown type: {r}"));
                 }
             }
-            adj.insert(name.clone(), refs);
+            let type_refs: Vec<String> =
+                refs.into_iter().filter(|r| types.contains_key(r)).collect();
+            adj.insert(name.clone(), type_refs);
         }
         detect_cycle(&adj)?;
-        Ok(TypeEnv { types })
+        Ok(TypeEnv { types, units })
     }
 
     /// Look up a named type.
     pub fn resolve(&self, name: &str) -> Option<&Type> {
         self.types.get(name)
+    }
+
+    /// Whether `name` is a declared unit type.
+    pub fn is_unit(&self, name: &str) -> bool {
+        self.units.contains_key(name)
+    }
+
+    /// Resolve a unit literal `mantissa<suffix>` against unit type `unit` to its
+    /// base integer. Errors if the unit/suffix is unknown or the result is not
+    /// an exact integer in the base unit (§4.5).
+    pub fn resolve_unit(
+        &self,
+        unit: &str,
+        mantissa: &BigDecimal,
+        suffix: &str,
+    ) -> Result<BigInt, String> {
+        let members = self
+            .units
+            .get(unit)
+            .ok_or_else(|| format!("unknown unit type: {unit}"))?;
+        let base = members
+            .iter()
+            .find(|(n, _)| n == suffix)
+            .map(|(_, b)| b.clone())
+            .ok_or_else(|| {
+                let valid: Vec<&str> = members.iter().map(|(n, _)| n.as_str()).collect();
+                format!("unknown unit `{suffix}`; valid: {}", valid.join(", "))
+            })?;
+        let product = mantissa.clone() * BigDecimal::from(base);
+        mangrove_core::exact_bigint(&product)
+            .ok_or_else(|| format!("`{mantissa}{suffix}` is not an exact integer in the base unit"))
     }
 }
 
@@ -109,74 +154,135 @@ fn detect_cycle(adj: &HashMap<String, Vec<String>>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    fn bd(s: &str) -> BigDecimal {
+        BigDecimal::from_str(s).unwrap()
+    }
+    fn bytes_unit() -> Vec<UnitDef> {
+        vec![UnitDef {
+            name: "Bytes".into(),
+            members: vec![
+                ("B".into(), 1.into()),
+                ("Ki".into(), 1024.into()),
+                ("Mi".into(), 1_048_576.into()),
+            ],
+        }]
+    }
 
     #[test]
     fn resolves_named_types() {
-        let env = TypeEnv::build(&[("Port".into(), Type::Int)]).unwrap();
+        let env = TypeEnv::build(&[("Port".into(), Type::Int)], &[]).unwrap();
         assert_eq!(env.resolve("Port"), Some(&Type::Int));
         assert_eq!(env.resolve("Missing"), None);
     }
 
     #[test]
     fn duplicate_type_name_errors() {
-        assert!(TypeEnv::build(&[("A".into(), Type::Int), ("A".into(), Type::Str)]).is_err());
+        assert!(TypeEnv::build(&[("A".into(), Type::Int), ("A".into(), Type::Str)], &[]).is_err());
     }
 
     #[test]
     fn direct_cycle_errors() {
-        assert!(TypeEnv::build(&[("A".into(), Type::Named("A".into()))]).is_err());
+        assert!(TypeEnv::build(&[("A".into(), Type::Named("A".into()))], &[]).is_err());
     }
 
     #[test]
     fn mutual_cycle_errors() {
         assert!(
-            TypeEnv::build(&[
-                ("A".into(), Type::Named("B".into())),
-                ("B".into(), Type::Named("A".into())),
-            ])
+            TypeEnv::build(
+                &[
+                    ("A".into(), Type::Named("B".into())),
+                    ("B".into(), Type::Named("A".into())),
+                ],
+                &[]
+            )
             .is_err()
         );
     }
 
     #[test]
     fn cycle_through_container_errors() {
-        // A = [ A ] — a cycle through a list child.
         assert!(
-            TypeEnv::build(&[("A".into(), Type::List(Box::new(Type::Named("A".into()))))]).is_err()
+            TypeEnv::build(
+                &[("A".into(), Type::List(Box::new(Type::Named("A".into()))))],
+                &[]
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn unknown_referenced_type_errors() {
-        assert!(TypeEnv::build(&[("A".into(), Type::Named("Nope".into()))]).is_err());
+        assert!(TypeEnv::build(&[("A".into(), Type::Named("Nope".into()))], &[]).is_err());
+    }
+
+    #[test]
+    fn named_may_reference_a_unit_type() {
+        // A = Named("Bytes") where Bytes is a unit — valid, not "unknown type".
+        let env = TypeEnv::build(&[("A".into(), Type::Named("Bytes".into()))], &bytes_unit());
+        assert!(env.is_ok());
+        assert!(env.unwrap().is_unit("Bytes"));
     }
 
     #[test]
     fn non_recursive_nested_is_fine() {
-        let env = TypeEnv::build(&[
-            (
-                "A".into(),
-                Type::Record {
-                    fields: vec![mangrove_syntax::FieldDef {
-                        name: "b".into(),
-                        optional: false,
-                        ty: Type::Named("B".into()),
-                    }],
-                },
-            ),
-            ("B".into(), Type::Int),
-        ]);
+        let env = TypeEnv::build(
+            &[
+                (
+                    "A".into(),
+                    Type::Record {
+                        fields: vec![mangrove_syntax::FieldDef {
+                            name: "b".into(),
+                            optional: false,
+                            ty: Type::Named("B".into()),
+                        }],
+                    },
+                ),
+                ("B".into(), Type::Int),
+            ],
+            &[],
+        );
         assert!(env.is_ok());
     }
 
     #[test]
     fn long_acyclic_chain_does_not_overflow() {
-        // Was: SIGABRT via recursive cycle-check. Now iterative — builds fine.
         let n = 50_000;
         let mut defs: Vec<(String, Type)> = (0..n)
             .map(|i| (format!("A{i}"), Type::Named(format!("A{}", i + 1))))
             .collect();
         defs.push((format!("A{n}"), Type::Int));
-        assert!(TypeEnv::build(&defs).is_ok());
+        assert!(TypeEnv::build(&defs, &[]).is_ok());
+    }
+
+    #[test]
+    fn resolve_unit_literal_to_base_int() {
+        let env = TypeEnv::build(&[], &bytes_unit()).unwrap();
+        assert_eq!(
+            env.resolve_unit("Bytes", &512.into(), "Mi").unwrap(),
+            536_870_912.into()
+        );
+    }
+
+    #[test]
+    fn unknown_suffix_errors_with_valid_list() {
+        let env = TypeEnv::build(&[], &bytes_unit()).unwrap();
+        let e = env.resolve_unit("Bytes", &256.into(), "MB").unwrap_err();
+        assert!(e.contains("MB") && e.contains("Mi"));
+    }
+
+    #[test]
+    fn fractional_must_be_exact() {
+        let units = vec![UnitDef {
+            name: "Sats".into(),
+            members: vec![("sat".into(), 1.into()), ("btc".into(), 100_000_000.into())],
+        }];
+        let env = TypeEnv::build(&[], &units).unwrap();
+        assert_eq!(
+            env.resolve_unit("Sats", &bd("0.5"), "btc").unwrap(),
+            50_000_000.into()
+        );
+        assert!(env.resolve_unit("Sats", &bd("0.5"), "sat").is_err());
     }
 }

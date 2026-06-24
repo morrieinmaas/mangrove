@@ -50,7 +50,7 @@ pub fn run_check_vector(input: &Path, expected: &Path) {
 
 fn render_check(src: &str) -> Result<String, String> {
     let doc = mangrove_syntax::parse_document(src).map_err(|e| e.to_string())?;
-    let env = mangrove_typed::TypeEnv::build(&doc.typedefs)?;
+    let env = mangrove_typed::TypeEnv::build(&doc.typedefs, &doc.unitdefs)?;
     let Some(schema_name) = doc.schema else {
         return Ok("ok".to_string());
     };
