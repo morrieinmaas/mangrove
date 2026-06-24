@@ -411,6 +411,47 @@ mod tests {
         assert!(e.contains("integrity check failed"), "{e}");
     }
 
+    fn git(args: &[&str], cwd: &std::path::Path) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn git_backend_composes_with_verified_lock() {
+        // End-to-end: a namespaced import served from a git repo is hash-verified
+        // against the lock before composing — proving D27 holds for git bytes.
+        let content = "name: \"shared\"\nport: 80\n";
+        let repo = scratch(&[]).join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "--quiet"], &repo);
+        std::fs::write(repo.join("x.mang"), content).unwrap();
+        git(&["add", "."], &repo);
+        git(&["commit", "--quiet", "--no-verify", "-m", "init"], &repo);
+        git(&["tag", "v1"], &repo);
+
+        let resolvers = format!("[namespace.pkg]\ngit = {:?}\n", repo.to_str().unwrap());
+        let lock = format!(
+            "\"pkg/x@v1\" = {:?}\n",
+            mangrove_resolve::source_hash(content.as_bytes())
+        );
+        let dir = scratch(&[
+            ("root.mang", "use \"pkg/x@v1\" as k\n...k\nport: 9090\n"),
+            (".mangrove/resolvers.toml", resolvers.as_str()),
+            ("mangrove.lock", lock.as_str()),
+        ]);
+        let c = compose(&dir.join("root.mang")).unwrap();
+        assert_eq!(get(&c.body, "name"), Some(&Value::Str("shared".into())));
+        assert_eq!(get(&c.body, "port"), Some(&Value::Int(9090.into())));
+    }
+
     #[test]
     fn remote_package_local_import_is_refused() {
         // B1: a pinned entry file must not smuggle in an unpinned `./` sibling.
