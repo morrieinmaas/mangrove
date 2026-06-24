@@ -71,12 +71,28 @@ pub struct Use {
     pub alias: String,
 }
 
-/// A body statement (L2): either a `key: value` binding or a `...alias` spread.
-/// Ordered, so composition can fold them left-to-right (later wins).
+/// A body statement (L2), ordered so composition folds them left-to-right.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
+    /// `key: value`
     Bind(String, Value),
+    /// `...alias`
     Spread(String),
+    /// `key += [ … ]` — append to the inherited list.
+    Append(String, Value),
+    /// `key { patch …, append: …, remove: … }` — `@key` list operations (§5.3).
+    ListOp(String, Vec<ListOpItem>),
+}
+
+/// One operation inside a `@key` list-op block (§5.3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListOpItem {
+    /// `patch "k": { … }` — deep-merge into the element whose key field == "k".
+    Patch(String, Value),
+    /// `append: { … }` — add an element (error if its key already exists).
+    Append(Value),
+    /// `remove: "k"` — drop the element whose key field == "k".
+    Remove(String),
 }
 
 /// A parsed document: local `use`s, any `type`/`unit` definitions, an optional
@@ -226,17 +242,48 @@ impl Parser {
                 };
                 stmts.push(Stmt::Spread(alias));
             } else {
-                let (key, value) = self.parse_binding(0)?;
-                // The folded body is the spread-free convenience view (used by
-                // `hash` until composition runs). A duplicate plain key is a
-                // typo error here; `unset` with no base collapses to absence.
-                if !matches!(value, Value::Unset) {
-                    if body.contains_key(&key) {
-                        return Err(self.error(format!("duplicate key {key:?}")));
+                // A keyed body statement: `k: v`, `k += [..]`, or `k { ops }`.
+                let key = match self.peek().tok.clone() {
+                    Tok::Bareword(n) => {
+                        self.advance();
+                        n
                     }
-                    body.insert(key.clone(), value.clone());
+                    Tok::Str(n) => {
+                        self.advance();
+                        n
+                    }
+                    other => return Err(self.error(format!("expected a key, found {other:?}"))),
+                };
+                match self.peek().tok {
+                    Tok::Colon => {
+                        self.advance();
+                        let value = self.parse_value(0)?;
+                        // The folded body is the spread-free convenience view
+                        // (used by `hash` until composition runs). A duplicate
+                        // plain key is a typo error; `unset` with no base → absent.
+                        if !matches!(value, Value::Unset) {
+                            if body.contains_key(&key) {
+                                return Err(self.error(format!("duplicate key {key:?}")));
+                            }
+                            body.insert(key.clone(), value.clone());
+                        }
+                        stmts.push(Stmt::Bind(key, value));
+                    }
+                    Tok::PlusEq => {
+                        self.advance();
+                        let value = self.parse_value(0)?;
+                        stmts.push(Stmt::Append(key, value));
+                    }
+                    Tok::LBrace => {
+                        let items = self.parse_list_op_block()?;
+                        stmts.push(Stmt::ListOp(key, items));
+                    }
+                    ref other => {
+                        return Err(self.error(format!(
+                            "expected ':', '+=', or '{{' after key, found {other:?}"
+                        )));
+                    }
                 }
-                stmts.push(Stmt::Bind(key, value));
             }
 
             let had_sep = self.at_sep();
@@ -284,6 +331,82 @@ impl Parser {
             other => return Err(self.error(format!("expected an alias, found {other:?}"))),
         };
         Ok(Use { path, alias })
+    }
+
+    /// `{ patch "k": value, append: value, remove: "k", … }` (§5.3).
+    fn parse_list_op_block(&mut self) -> Result<Vec<ListOpItem>, ParseError> {
+        self.expect(&Tok::LBrace)?;
+        let mut items = Vec::new();
+        self.skip_seps();
+        loop {
+            if self.check(&Tok::RBrace) {
+                self.advance();
+                break;
+            }
+            if self.at_eof() {
+                return Err(self.error("unterminated list-op block".into()));
+            }
+            let verb = match self.peek().tok.clone() {
+                Tok::Bareword(b) => {
+                    self.advance();
+                    b
+                }
+                other => {
+                    return Err(
+                        self.error(format!("expected patch/append/remove, found {other:?}"))
+                    );
+                }
+            };
+            let item = match verb.as_str() {
+                "patch" => {
+                    let key = match self.peek().tok.clone() {
+                        Tok::Str(s) => {
+                            self.advance();
+                            s
+                        }
+                        other => {
+                            return Err(self.error(format!(
+                                "expected a key string after patch, found {other:?}"
+                            )));
+                        }
+                    };
+                    self.expect(&Tok::Colon)?;
+                    ListOpItem::Patch(key, self.parse_value(0)?)
+                }
+                "append" => {
+                    self.expect(&Tok::Colon)?;
+                    ListOpItem::Append(self.parse_value(0)?)
+                }
+                "remove" => {
+                    self.expect(&Tok::Colon)?;
+                    match self.peek().tok.clone() {
+                        Tok::Str(s) => {
+                            self.advance();
+                            ListOpItem::Remove(s)
+                        }
+                        other => {
+                            return Err(self.error(format!(
+                                "expected a key string after remove, found {other:?}"
+                            )));
+                        }
+                    }
+                }
+                other => {
+                    return Err(self.error(format!("unknown list op `{other}`")));
+                }
+            };
+            items.push(item);
+            let had_sep = self.at_sep();
+            self.skip_seps();
+            if self.check(&Tok::RBrace) {
+                self.advance();
+                break;
+            }
+            if !had_sep {
+                return Err(self.error("expected ',' or newline in list-op block".into()));
+            }
+        }
+        Ok(items)
     }
 
     /// True if the current statement is the keyword `kw` followed by a bareword
@@ -339,14 +462,15 @@ impl Parser {
             };
             let arg = if self.check(&Tok::LParen) {
                 self.advance(); // (
+                // arg is a string (`@message("…")`) or a bareword (`@key(name)`).
                 let s = match self.peek().tok.clone() {
-                    Tok::Str(s) => {
+                    Tok::Str(s) | Tok::Bareword(s) => {
                         self.advance();
                         s
                     }
                     other => {
                         return Err(
-                            self.error(format!("expected a string argument, found {other:?}"))
+                            self.error(format!("expected an annotation argument, found {other:?}"))
                         );
                     }
                 };

@@ -5,7 +5,10 @@
 
 use crate::merge::merge;
 use mangrove_core::Value;
-use mangrove_syntax::{Stmt, TypeDef, UnitDef, parse_document};
+use mangrove_syntax::{
+    Annotation, Document, ListOpItem, Stmt, Type, TypeDef, UnitDef, parse_document,
+};
+use mangrove_typed::TypeEnv;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -67,6 +70,13 @@ fn compose_rec(path: &Path, visiting: &mut Vec<PathBuf>) -> Result<Composed, Str
                 one.insert(k.clone(), v.clone());
                 acc = merge(acc, Value::Map(one));
             }
+            Stmt::Append(k, v) => {
+                acc = apply_append(acc, k, v.clone())?;
+            }
+            Stmt::ListOp(k, items) => {
+                let keyfield = key_field(&doc, k)?;
+                acc = apply_list_ops(acc, k, items, &keyfield)?;
+            }
         }
     }
 
@@ -76,6 +86,111 @@ fn compose_rec(path: &Path, visiting: &mut Vec<PathBuf>) -> Result<Composed, Str
         schema: doc.schema,
         body: acc,
     })
+}
+
+/// `key += [ … ]` — append a list to the inherited list (D22).
+fn apply_append(acc: Value, k: &str, v: Value) -> Result<Value, String> {
+    let Value::List(add) = v else {
+        return Err(format!("`{k} += …` requires a list on the right"));
+    };
+    let Value::Map(mut m) = acc else {
+        return Ok(Value::Map(BTreeMap::new()));
+    };
+    let mut list = match m.remove(k) {
+        Some(Value::List(l)) => l,
+        None => Vec::new(),
+        Some(_) => return Err(format!("`{k}` is not a list; cannot use `+=`")),
+    };
+    list.extend(add);
+    m.insert(k.to_string(), Value::List(list));
+    Ok(Value::Map(m))
+}
+
+/// Apply a `@key` list-op block (patch/append/remove) to the inherited list,
+/// matching elements by their `keyfield` value (D22).
+fn apply_list_ops(
+    acc: Value,
+    k: &str,
+    items: &[ListOpItem],
+    keyfield: &str,
+) -> Result<Value, String> {
+    let Value::Map(mut m) = acc else {
+        return Ok(Value::Map(BTreeMap::new()));
+    };
+    let mut list = match m.remove(k) {
+        Some(Value::List(l)) => l,
+        None => Vec::new(),
+        Some(_) => return Err(format!("`{k}` is not a list; cannot apply list ops")),
+    };
+    for item in items {
+        match item {
+            ListOpItem::Patch(key, val) => match find_by_key(&list, keyfield, key) {
+                Some(idx) => {
+                    let elem = list.remove(idx);
+                    list.insert(idx, merge(elem, val.clone()));
+                }
+                None => return Err(format!("patch: no element with {keyfield} == {key:?}")),
+            },
+            ListOpItem::Append(val) => {
+                let nk = elem_key(val, keyfield)?;
+                if find_by_key(&list, keyfield, &nk).is_some() {
+                    return Err(format!(
+                        "append: element with {keyfield} == {nk:?} already exists"
+                    ));
+                }
+                list.push(val.clone());
+            }
+            ListOpItem::Remove(key) => match find_by_key(&list, keyfield, key) {
+                Some(idx) => {
+                    list.remove(idx);
+                }
+                None => return Err(format!("remove: no element with {keyfield} == {key:?}")),
+            },
+        }
+    }
+    m.insert(k.to_string(), Value::List(list));
+    Ok(Value::Map(m))
+}
+
+/// Index of the list element that is a map with `map[keyfield] == Str(key)`.
+fn find_by_key(list: &[Value], keyfield: &str, key: &str) -> Option<usize> {
+    list.iter().position(|e| match e {
+        Value::Map(m) => matches!(m.get(keyfield), Some(Value::Str(s)) if s == key),
+        _ => false,
+    })
+}
+
+fn elem_key(val: &Value, keyfield: &str) -> Result<String, String> {
+    match val {
+        Value::Map(m) => match m.get(keyfield) {
+            Some(Value::Str(s)) => Ok(s.clone()),
+            _ => Err(format!("appended element lacks a string `{keyfield}` key")),
+        },
+        _ => Err("appended element must be a record".into()),
+    }
+}
+
+/// Resolve the `@key(field)` of a top-level list field from the document's local
+/// schema (M3a; cross-file schemas are M3b).
+fn key_field(doc: &Document, field: &str) -> Result<String, String> {
+    let schema = doc
+        .schema
+        .as_ref()
+        .ok_or_else(|| format!("list ops on `{field}` need a schema declaring `@key`"))?;
+    let env = TypeEnv::build(&doc.typedefs, &doc.unitdefs)?;
+    let ty = env
+        .resolve(schema)
+        .ok_or_else(|| format!("unknown schema type `{schema}`"))?;
+    let Type::Record { fields, .. } = ty else {
+        return Err(format!("schema `{schema}` is not a record"));
+    };
+    let fd = fields
+        .iter()
+        .find(|f| f.name == field)
+        .ok_or_else(|| format!("schema `{schema}` has no field `{field}`"))?;
+    Annotation::find(&fd.annotations, "key")
+        .map(str::to_string)
+        .ok_or_else(|| format!("field `{field}` has no `@key` annotation"))
 }
 
 #[cfg(test)]
@@ -147,5 +262,65 @@ mod tests {
         let dir = scratch(&[("d.mang", "use \"infra/k8s/core\" as k\n...k\n")]);
         let e = compose(&dir.join("d.mang")).unwrap_err();
         assert!(e.contains("resolver"));
+    }
+
+    #[test]
+    fn append_op_extends_inherited_list() {
+        let dir = scratch(&[
+            ("base.mang", "ports: [ 80 ]\n"),
+            (
+                "over.mang",
+                "use \"./base.mang\" as base\n...base\nports += [ 443 ]\n",
+            ),
+        ]);
+        let c = compose(&dir.join("over.mang")).unwrap();
+        assert_eq!(
+            get(&c.body, "ports"),
+            Some(&Value::List(vec![
+                Value::Int(80.into()),
+                Value::Int(443.into())
+            ]))
+        );
+    }
+
+    #[test]
+    fn key_list_ops_patch_append_remove() {
+        let schema = "type C = { name: str, image: str }\n\
+                      type D = { containers: [ C ] @key(name) }\nschema D\n";
+        let over = format!(
+            "use \"./base.mang\" as base\n{schema}...base\n\
+             containers {{ patch \"api\": {{ image: \"api:2.0\" }}, append: {{ name: \"envoy\", image: \"envoy:1\" }}, remove: \"cron\" }}\n"
+        );
+        let dir = scratch(&[
+            (
+                "base.mang",
+                "containers: [ { name: \"api\", image: \"api:1.0\" }, { name: \"cron\", image: \"cron:1\" } ]\n",
+            ),
+            ("over.mang", over.as_str()),
+        ]);
+        let c = compose(&dir.join("over.mang")).unwrap();
+        let Some(Value::List(list)) = get(&c.body, "containers") else {
+            panic!()
+        };
+        let names: Vec<&str> = list
+            .iter()
+            .filter_map(|e| match e {
+                Value::Map(m) => match m.get("name") {
+                    Some(Value::Str(s)) => Some(s.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["api", "envoy"]); // cron removed, envoy appended
+        // api was patched
+        let api = &list[0];
+        assert_eq!(
+            match api {
+                Value::Map(m) => m.get("image"),
+                _ => None,
+            },
+            Some(&Value::Str("api:2.0".into()))
+        );
     }
 }

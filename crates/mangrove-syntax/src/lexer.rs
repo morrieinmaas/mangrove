@@ -41,6 +41,7 @@ pub enum Tok {
     Bang,      // !
     AmpAmp,    // &&
     PipePipe,  // ||
+    PlusEq,    // +=
     Int(BigInt),
     Decimal(BigDecimal),
     /// A unit literal: `(mantissa, suffix)`, e.g. `512Mi` → `(512, "Mi")`.
@@ -232,6 +233,11 @@ impl Lexer {
                 '@' => {
                     self.bump();
                     Tok::At
+                }
+                '+' if self.peek_at(1) == Some('=') => {
+                    self.bump();
+                    self.bump();
+                    Tok::PlusEq
                 }
                 '.' => {
                     self.bump();
