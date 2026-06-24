@@ -4,5 +4,5 @@ pub mod lexer;
 pub mod parser;
 pub mod ty;
 
-pub use parser::{ParseError, parse, parse_type};
+pub use parser::{Document, ParseError, parse, parse_document, parse_type};
 pub use ty::{FieldDef, Type};

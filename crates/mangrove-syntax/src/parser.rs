@@ -48,14 +48,29 @@ impl std::error::Error for ParseError {}
 /// like `[[[[…`. Generous for real config, far below the overflow threshold.
 const MAX_DEPTH: usize = 128;
 
-/// Parse a complete L0 document into its (canonical) value.
-pub fn parse(src: &str) -> Result<Value, ParseError> {
+/// A parsed document: any local `type` definitions, an optional `schema`
+/// binding, and the data body. A pure L0 document has empty `typedefs` and
+/// `schema == None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Document {
+    pub typedefs: Vec<(String, Type)>,
+    pub schema: Option<String>,
+    pub body: Value,
+}
+
+/// Parse a complete document (typedefs + schema + body).
+pub fn parse_document(src: &str) -> Result<Document, ParseError> {
     let tokens = lex(src).map_err(|e| ParseError {
         message: e.message,
         line: e.line,
         col: e.col,
     })?;
-    Parser { tokens, pos: 0 }.parse_document()
+    Parser { tokens, pos: 0 }.parse_doc()
+}
+
+/// Parse a document and return just its data body (L0 entrypoint; used by `hash`).
+pub fn parse(src: &str) -> Result<Value, ParseError> {
+    parse_document(src).map(|d| d.body)
 }
 
 struct Parser {
@@ -114,8 +129,77 @@ impl Parser {
         }
     }
 
-    fn parse_document(&mut self) -> Result<Value, ParseError> {
-        Ok(Value::Map(self.parse_bindings(true, 0)?))
+    /// Walk top-level statements: `type X = …` definitions, one `schema X`
+    /// binding, and ordinary `key: value` bindings forming the body.
+    fn parse_doc(&mut self) -> Result<Document, ParseError> {
+        let mut typedefs = Vec::new();
+        let mut schema: Option<String> = None;
+        let mut body = BTreeMap::new();
+        self.skip_seps();
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            if self.is_keyword_stmt("type") {
+                typedefs.push(self.parse_typedef()?);
+            } else if self.is_keyword_stmt("schema") {
+                self.advance(); // 'schema'
+                let name = match self.peek().tok.clone() {
+                    Tok::Bareword(n) => {
+                        self.advance();
+                        n
+                    }
+                    other => {
+                        return Err(self.error(format!("expected a schema name, found {other:?}")));
+                    }
+                };
+                if schema.is_some() {
+                    return Err(self.error("duplicate `schema` statement".into()));
+                }
+                schema = Some(name);
+            } else {
+                let (key, value) = self.parse_binding(0)?;
+                if body.contains_key(&key) {
+                    return Err(self.error(format!("duplicate key {key:?}")));
+                }
+                body.insert(key, value);
+            }
+
+            let had_sep = self.at_sep();
+            self.skip_seps();
+            if !had_sep && !self.at_eof() {
+                return Err(self.error("expected ',' or newline between statements".into()));
+            }
+        }
+        Ok(Document {
+            typedefs,
+            schema,
+            body: Value::Map(body),
+        })
+    }
+
+    /// True if the current statement is the keyword `kw` followed by a bareword
+    /// (a `type`/`schema` statement), as opposed to a field named `kw` (`kw:`).
+    fn is_keyword_stmt(&self, kw: &str) -> bool {
+        matches!(&self.peek().tok, Tok::Bareword(b) if b == kw)
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.tok),
+                Some(Tok::Bareword(_))
+            )
+    }
+
+    fn parse_typedef(&mut self) -> Result<(String, Type), ParseError> {
+        self.advance(); // 'type'
+        let name = match self.peek().tok.clone() {
+            Tok::Bareword(n) => {
+                self.advance();
+                n
+            }
+            other => return Err(self.error(format!("expected a type name, found {other:?}"))),
+        };
+        self.expect(&Tok::Eq)?;
+        let ty = self.parse_type_expr()?;
+        Ok((name, ty))
     }
 
     /// Parse a sequence of bindings. `top_level` documents end at EOF; nested
@@ -463,9 +547,42 @@ fn refine_dec(ty: Type, op: &Tok, d: BigDecimal) -> Type {
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{parse, parse_document};
     use mangrove_core::Value;
     use num_bigint::BigInt;
+
+    #[test]
+    fn parses_typedefs_schema_and_body() {
+        let d = parse_document(
+            "type Port = int & >= 1 & <= 65535\nschema Server\nhost: \"x\"\nport: 8443",
+        )
+        .unwrap();
+        assert_eq!(d.typedefs.len(), 1);
+        assert_eq!(d.typedefs[0].0, "Port");
+        assert_eq!(d.schema.as_deref(), Some("Server"));
+        let Value::Map(m) = &d.body else { panic!() };
+        assert!(m.contains_key("host") && m.contains_key("port"));
+    }
+
+    #[test]
+    fn field_named_type_or_schema_is_a_binding_not_a_statement() {
+        let d = parse_document("type: \"lib\"\nschema: \"x\"").unwrap();
+        assert!(d.typedefs.is_empty() && d.schema.is_none());
+        let Value::Map(m) = &d.body else { panic!() };
+        assert_eq!(m.get("type"), Some(&Value::Str("lib".into())));
+        assert_eq!(m.get("schema"), Some(&Value::Str("x".into())));
+    }
+
+    #[test]
+    fn pure_l0_document_has_no_typedefs_or_schema() {
+        let d = parse_document("a: 1\nb: 2").unwrap();
+        assert!(d.typedefs.is_empty() && d.schema.is_none());
+    }
+
+    #[test]
+    fn two_schema_statements_is_error() {
+        assert!(parse_document("schema A\nschema B").is_err());
+    }
 
     #[test]
     fn top_level_bindings_make_a_map() {
