@@ -1,1 +1,14 @@
+# Rust / Cargo build artifacts
 /target
+**/*.rs.bk
+*.pdb
+
+# Note: Cargo.lock IS tracked — Mangrove ships as a tool/binary, not a library.
+
+# macOS
+.DS_Store
+
+# Editor/IDE
+*.swp
+.idea/
+.vscode/

@@ -14,11 +14,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Build
-        run: cargo build --workspace --locked
-      - name: Test
-        run: cargo test --workspace --locked
+      - uses: taiki-e/install-action@just
+      - name: CI gate (fmt-check, lint, build, test)
+        run: just ci
