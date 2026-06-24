@@ -12,6 +12,11 @@ use mangrove_typed::TypeEnv;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Bound on `use`-chain depth — guards against stack overflow on a deep chain
+/// of local imports (cf. the parser/merge `MAX_DEPTH`). Far beyond any real
+/// project's layering.
+const MAX_USE_DEPTH: usize = 128;
+
 /// A composed document: the merged body plus the importing document's own
 /// type/unit/schema declarations (used downstream for resolve + validate). It
 /// mirrors the fields the CLI used from a parsed `Document`.
@@ -31,6 +36,11 @@ pub fn compose(path: &Path) -> Result<Composed, String> {
 }
 
 fn compose_rec(path: &Path, visiting: &mut Vec<PathBuf>) -> Result<Composed, String> {
+    // `visiting.len()` is the current `use`-chain depth; cap it so a deep chain
+    // of local files errors cleanly instead of overflowing the stack (SIGABRT).
+    if visiting.len() >= MAX_USE_DEPTH {
+        return Err(format!("`use` chain too deep (> {MAX_USE_DEPTH})"));
+    }
     let canon = path
         .canonicalize()
         .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -265,6 +275,30 @@ mod tests {
         let dir = scratch(&[("d.mang", "use \"infra/k8s/core\" as k\n...k\n")]);
         let e = compose(&dir.join("d.mang")).unwrap_err();
         assert!(e.contains("resolver"));
+    }
+
+    #[test]
+    fn deep_use_chain_errors_instead_of_overflowing() {
+        // Was: SIGABRT via unbounded compose_rec recursion. Now a clean error.
+        let n = 300usize; // > MAX_USE_DEPTH(128); shallow enough to build fast
+        let files: Vec<(String, String)> = (0..n)
+            .map(|i| {
+                let name = format!("f{i}.mang");
+                let body = if i + 1 < n {
+                    format!("use \"./f{}.mang\" as nxt\n...nxt\n", i + 1)
+                } else {
+                    "leaf: 1\n".to_string()
+                };
+                (name, body)
+            })
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_str()))
+            .collect();
+        let dir = scratch(&refs);
+        let e = compose(&dir.join("f0.mang")).unwrap_err();
+        assert!(e.contains("too deep"), "{e}");
     }
 
     #[test]

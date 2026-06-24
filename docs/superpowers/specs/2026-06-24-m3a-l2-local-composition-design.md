@@ -18,6 +18,8 @@ Builds on L0+L1 (M0–M2c). All composition here is over local files and resolve
 - **`unset`** (§5.4): the value meaning "absent"; removes an inherited field in an overlay; error on a schema-required field.
 - **Subtype redefinition** (§5.5): `schema Base & { field: NarrowerType }` — locally narrow a type; checked `New <: Old` (structural, covariant, depth-recursive; interval/enum containment; `require` re-validated, not implication-checked; regex containment deferred per the spec's stated limit).
 
+**Threat-model note (M3a, intentional):** a relative `use` reads any local file the process can access — there is **no path-traversal sandbox** (`use "../../secret"` resolves and reads). This is acceptable for local-only M3a; **resolver-level containment is an M3b concern** when remote/namespaced fetching lands. `compose_rec` is depth-bounded (`MAX_USE_DEPTH`) against deep-chain stack overflow.
+
 **Out (deferred to M3b / later):**
 - Namespaced/remote `use infra/k8s/core @v5.0`, `mangrove.lock`, `.mangrove/resolvers.toml`, git fetch + hash-verify, per-type pins (§5.6) → **M3b**.
 - Regex-refinement subtype containment (PSPACE) → deferred (spec limitation; `=~` narrowing is conservatively rejected unless syntactically identical).
