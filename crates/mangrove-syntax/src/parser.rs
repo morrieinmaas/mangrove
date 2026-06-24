@@ -25,6 +25,11 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Maximum container nesting depth. Past this, parsing errors instead of
+/// recursing — guards against stack-overflow (SIGABRT) on adversarial input
+/// like `[[[[…`. Generous for real config, far below the overflow threshold.
+const MAX_DEPTH: usize = 128;
+
 /// Parse a complete L0 document into its (canonical) value.
 pub fn parse(src: &str) -> Result<Value, ParseError> {
     let tokens = lex(src).map_err(|e| ParseError {
@@ -92,12 +97,17 @@ impl Parser {
     }
 
     fn parse_document(&mut self) -> Result<Value, ParseError> {
-        Ok(Value::Map(self.parse_bindings(true)?))
+        Ok(Value::Map(self.parse_bindings(true, 0)?))
     }
 
     /// Parse a sequence of bindings. `top_level` documents end at EOF; nested
-    /// maps end at `}` (which this consumes).
-    fn parse_bindings(&mut self, top_level: bool) -> Result<BTreeMap<String, Value>, ParseError> {
+    /// maps end at `}` (which this consumes). `depth` is the current container
+    /// nesting level (see [`MAX_DEPTH`]).
+    fn parse_bindings(
+        &mut self,
+        top_level: bool,
+        depth: usize,
+    ) -> Result<BTreeMap<String, Value>, ParseError> {
         let mut map = BTreeMap::new();
         self.skip_seps();
         loop {
@@ -111,7 +121,7 @@ impl Parser {
             if self.at_eof() {
                 return Err(self.error("unexpected end of input, expected '}'".into()));
             }
-            let (key, value) = self.parse_binding()?;
+            let (key, value) = self.parse_binding(depth)?;
             if map.contains_key(&key) {
                 return Err(self.error(format!("duplicate key {key:?}")));
             }
@@ -128,7 +138,7 @@ impl Parser {
         Ok(map)
     }
 
-    fn parse_binding(&mut self) -> Result<(String, Value), ParseError> {
+    fn parse_binding(&mut self, depth: usize) -> Result<(String, Value), ParseError> {
         let key = match &self.peek().tok {
             Tok::Bareword(s) => s.clone(),
             Tok::Str(s) => s.clone(),
@@ -136,11 +146,11 @@ impl Parser {
         };
         self.advance();
         self.expect(&Tok::Colon)?;
-        let value = self.parse_value()?;
+        let value = self.parse_value(depth)?;
         Ok((key, value))
     }
 
-    fn parse_value(&mut self) -> Result<Value, ParseError> {
+    fn parse_value(&mut self, depth: usize) -> Result<Value, ParseError> {
         match self.peek().tok.clone() {
             Tok::Int(n) => {
                 self.advance();
@@ -163,18 +173,24 @@ impl Parser {
                 Ok(Value::Bytes(b))
             }
             Tok::LBrace => {
+                if depth >= MAX_DEPTH {
+                    return Err(self.error("nesting too deep".into()));
+                }
                 self.advance();
-                Ok(Value::Map(self.parse_bindings(false)?))
+                Ok(Value::Map(self.parse_bindings(false, depth + 1)?))
             }
             Tok::LBracket => {
+                if depth >= MAX_DEPTH {
+                    return Err(self.error("nesting too deep".into()));
+                }
                 self.advance();
-                self.parse_list()
+                self.parse_list(depth + 1)
             }
             other => Err(self.error(format!("expected a value, found {other:?}"))),
         }
     }
 
-    fn parse_list(&mut self) -> Result<Value, ParseError> {
+    fn parse_list(&mut self, depth: usize) -> Result<Value, ParseError> {
         let mut items = Vec::new();
         self.skip_seps();
         loop {
@@ -185,7 +201,7 @@ impl Parser {
             if self.at_eof() {
                 return Err(self.error("unexpected end of input, expected ']'".into()));
             }
-            items.push(self.parse_value()?);
+            items.push(self.parse_value(depth)?);
 
             let had_sep = self.at_sep();
             self.skip_seps();
@@ -255,5 +271,15 @@ mod tests {
     fn parse_error_reports_position() {
         let e = parse("a: ").unwrap_err();
         assert!(format!("{e}").contains(':'), "{e}");
+    }
+
+    #[test]
+    fn deep_nesting_errors_instead_of_overflowing() {
+        // Was: SIGABRT stack overflow. Now a clean error well before the limit.
+        let src = format!("a: {}", "[".repeat(5000));
+        assert!(parse(&src).is_err());
+        // A reasonable nesting depth still parses fine.
+        let ok = format!("a: {}{}", "[".repeat(50), "]".repeat(50));
+        assert!(parse(&ok).is_ok());
     }
 }

@@ -185,8 +185,15 @@ impl Lexer {
                 }
                 '"' => self.lex_string_or_block(line, col)?,
                 'r' if self.peek_at(1) == Some('"') => {
-                    self.bump();
-                    self.lex_raw_string(line, col)?
+                    self.bump(); // consume 'r'
+                    // `r"""…"""` is a raw text block (spec §3.4); `r"…"` a raw string.
+                    // Text blocks carry no escapes either way, so both route to the
+                    // same literal text-block lexer.
+                    if self.starts_with("\"\"\"") {
+                        self.lex_text_block(line, col)?
+                    } else {
+                        self.lex_raw_string(line, col)?
+                    }
                 }
                 'b' if self.starts_with("b64\"") => self.lex_bytes(line, col)?,
                 '-' | '0'..='9' => self.lex_number(line, col)?,
@@ -233,6 +240,16 @@ impl Lexer {
         if self.peek() == Some('-') {
             s.push('-');
             self.bump();
+        }
+        // After an optional sign there must be at least one digit; otherwise this
+        // is not a number (e.g. a stray `-`), and a clear error beats the
+        // misleading unit-literal message below.
+        if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            return Err(LexError {
+                message: "expected a number".into(),
+                line,
+                col,
+            });
         }
         self.take_digits(&mut s);
         if self.peek() == Some('.') {
@@ -323,7 +340,13 @@ impl Lexer {
                 self.bump(); // consume 'x'
                 let hi = self.hex_digit(line, col)?;
                 let lo = self.hex_digit(line, col)?;
-                s.push(((hi << 4) | lo) as char);
+                let byte = (hi << 4) | lo;
+                // `\xNN` is restricted to ASCII (0x00–0x7F); use `\u{…}` for
+                // higher code points, so the byte-vs-code-point ambiguity cannot arise.
+                if byte > 0x7f {
+                    return Err(self.err("\\x escape must be 0x00–0x7F; use \\u{…}", line, col));
+                }
+                s.push(byte as char);
                 return Ok(());
             }
             Some('u') => {
@@ -340,7 +363,10 @@ impl Lexer {
                     let d = c
                         .to_digit(16)
                         .ok_or_else(|| self.err("invalid \\u hex digit", line, col))?;
-                    code = code * 16 + d;
+                    code = code
+                        .checked_mul(16)
+                        .and_then(|c| c.checked_add(d))
+                        .ok_or_else(|| self.err("\\u escape out of range", line, col))?;
                     self.bump();
                 }
                 if self.peek() != Some('}') {
@@ -389,6 +415,19 @@ impl Lexer {
         self.bump();
         self.bump();
         self.bump(); // consume opening """
+        // The opening line must contain only whitespace then a newline (spec §3.4
+        // grammar). Enforcing this prevents `"""hello"""` from silently dedenting
+        // to the empty string.
+        while matches!(self.peek(), Some(' ') | Some('\t') | Some('\r')) {
+            self.bump();
+        }
+        if self.peek() != Some('\n') {
+            return Err(self.err(
+                "text block content must begin on the line after \"\"\"",
+                line,
+                col,
+            ));
+        }
         let mut raw = String::new();
         loop {
             if self.peek().is_none() {
@@ -584,5 +623,31 @@ mod tests {
             toks(src).get(2),
             Some(&Tok::Str("line one\nline two".into()))
         );
+    }
+
+    #[test]
+    fn single_line_text_block_is_error_not_silent_drop() {
+        // Was: silently produced Str(""). Now an explicit error (spec §3.4).
+        assert!(lex("a: \"\"\"hello\"\"\"").is_err());
+        assert!(lex("a: \"\"\"\"\"\"").is_err()); // empty """""" too
+    }
+
+    #[test]
+    fn raw_text_block_is_recognized() {
+        let src = "a: r\"\"\"\n  raw \\n stays\n  \"\"\"";
+        assert_eq!(toks(src).get(2), Some(&Tok::Str("raw \\n stays".into())));
+    }
+
+    #[test]
+    fn unicode_escape_overflow_is_error_not_panic() {
+        assert!(lex("a: \"\\u{FFFFFFFFFFFFFFFF}\"").is_err());
+        assert!(lex("a: \"\\u{110000}\"").is_err()); // above max scalar
+        assert_eq!(toks("a: \"\\u{41}\"").get(2), Some(&Tok::Str("A".into())));
+    }
+
+    #[test]
+    fn hex_escape_restricted_to_ascii() {
+        assert!(lex("a: \"\\xFF\"").is_err());
+        assert_eq!(toks("a: \"\\x41\"").get(2), Some(&Tok::Str("A".into())));
     }
 }
