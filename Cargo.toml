@@ -9,6 +9,12 @@ rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/morrieinmaas/mangrove"
 
+[workspace.dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"
+bigdecimal = "0.4"
+blake3 = "1"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
