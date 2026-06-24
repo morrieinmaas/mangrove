@@ -19,6 +19,16 @@ pub enum Tok {
     Colon,
     Comma,
     Newline,
+    // L1 type-grammar tokens
+    Amp,      // &
+    Pipe,     // |
+    Eq,       // =
+    Match,    // =~
+    Question, // ?
+    Ge,       // >=
+    Le,       // <=
+    Gt,       // >
+    Lt,       // <
     Int(BigInt),
     Decimal(BigDecimal),
     Str(String),
@@ -169,6 +179,45 @@ impl Lexer {
                 ',' => {
                     self.bump();
                     Tok::Comma
+                }
+                '&' => {
+                    self.bump();
+                    Tok::Amp
+                }
+                '|' => {
+                    self.bump();
+                    Tok::Pipe
+                }
+                '?' => {
+                    self.bump();
+                    Tok::Question
+                }
+                '=' => {
+                    self.bump();
+                    if self.peek() == Some('~') {
+                        self.bump();
+                        Tok::Match
+                    } else {
+                        Tok::Eq
+                    }
+                }
+                '>' => {
+                    self.bump();
+                    if self.peek() == Some('=') {
+                        self.bump();
+                        Tok::Ge
+                    } else {
+                        Tok::Gt
+                    }
+                }
+                '<' => {
+                    self.bump();
+                    if self.peek() == Some('=') {
+                        self.bump();
+                        Tok::Le
+                    } else {
+                        Tok::Lt
+                    }
                 }
                 '#' => {
                     self.bump();
@@ -649,5 +698,37 @@ mod tests {
     fn hex_escape_restricted_to_ascii() {
         assert!(lex("a: \"\\xFF\"").is_err());
         assert_eq!(toks("a: \"\\x41\"").get(2), Some(&Tok::Str("A".into())));
+    }
+
+    #[test]
+    fn type_grammar_tokens() {
+        use Tok::*;
+        assert_eq!(
+            toks("a & b | c =~ d ? >= <= > <"),
+            vec![
+                Bareword("a".into()),
+                Amp,
+                Bareword("b".into()),
+                Pipe,
+                Bareword("c".into()),
+                Match,
+                Bareword("d".into()),
+                Question,
+                Ge,
+                Le,
+                Gt,
+                Lt,
+                Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn two_char_operators_are_greedy() {
+        assert_eq!(toks(">="), vec![Tok::Ge, Tok::Eof]);
+        assert_eq!(toks("=~"), vec![Tok::Match, Tok::Eof]);
+        assert_eq!(toks("<="), vec![Tok::Le, Tok::Eof]);
+        assert_eq!(toks("="), vec![Tok::Eq, Tok::Eof]);
+        assert_eq!(toks(">"), vec![Tok::Gt, Tok::Eof]);
     }
 }
