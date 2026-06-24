@@ -87,6 +87,36 @@ fn omitted_default_hashes_same_as_explicit() {
 }
 
 #[test]
+fn composed_overlay_hashes_like_handwritten() {
+    let dir = std::env::temp_dir().join(format!("m3a_cli_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("base.mang"),
+        "name: \"api\"\nport: 8080\nenv: \"dev\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("over.mang"),
+        "use \"./base.mang\" as base\n...base\nport: 9090\nenv: unset\n",
+    )
+    .unwrap();
+    // hand-written equivalent of the composed result: name + port(9090), no env
+    let hand = dir.join("hand.mang");
+    std::fs::write(&hand, "name: \"api\"\nport: 9090\n").unwrap();
+
+    let h = |p: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg("hash")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert_eq!(h(&dir.join("over.mang")), h(&hand)); // D12: compose ⇒ same value ⇒ same hash
+}
+
+#[test]
 fn schemaless_unit_literal_errors() {
     let p = std::env::temp_dir().join("m2b_bare.mang");
     std::fs::write(&p, "x: 512Mi\n").unwrap();

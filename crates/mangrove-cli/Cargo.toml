@@ -15,6 +15,7 @@ mangrove-core = { path = "../mangrove-core" }
 mangrove-syntax = { path = "../mangrove-syntax" }
 mangrove-canonical = { path = "../mangrove-canonical" }
 mangrove-typed = { path = "../mangrove-typed" }
+mangrove-compose = { path = "../mangrove-compose" }
 
 [lints]
 workspace = true

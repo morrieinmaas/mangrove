@@ -129,6 +129,7 @@ name = "mangrove-cli"
 version = "0.1.0"
 dependencies = [
  "mangrove-canonical",
+ "mangrove-compose",
  "mangrove-core",
  "mangrove-syntax",
  "mangrove-typed",

@@ -30,22 +30,13 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-fn read(path: &str) -> Result<String, ExitCode> {
-    std::fs::read_to_string(path).map_err(|e| {
-        eprintln!("{path}: {e}");
-        ExitCode::from(1)
-    })
-}
-
 fn cmd_hash(path: &str) -> ExitCode {
-    let src = match read(path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let doc = match mangrove_syntax::parse_document(&src) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{path}:{e}");
+    // Compose first (resolve local `use` + spread + unset → one merged value),
+    // then resolve/hash as before. A spread-free document composes to itself.
+    let doc = match mangrove_compose::compose(std::path::Path::new(path)) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("{path}: {msg}");
             return ExitCode::from(1);
         }
     };
@@ -107,14 +98,10 @@ fn contains_unit(v: &mangrove_core::Value) -> bool {
 }
 
 fn cmd_check(path: &str) -> ExitCode {
-    let src = match read(path) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let doc = match mangrove_syntax::parse_document(&src) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("{path}:{e}");
+    let doc = match mangrove_compose::compose(std::path::Path::new(path)) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("{path}: {msg}");
             return ExitCode::from(1);
         }
     };
