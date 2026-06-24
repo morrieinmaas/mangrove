@@ -46,6 +46,23 @@ impl ValidationError {
     }
 }
 
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = if self.path.is_empty() {
+            "(root)"
+        } else {
+            &self.path
+        };
+        write!(f, "{path}: got {}, expected {}", self.got, self.expected)?;
+        if let Some(failed) = &self.failed {
+            write!(f, " (failed: {failed})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ValidationError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

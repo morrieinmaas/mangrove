@@ -366,6 +366,10 @@ impl Parser {
                 self.advance();
                 Ok(Value::Decimal(d))
             }
+            Tok::UnitLit(mantissa, suffix) => {
+                self.advance();
+                Ok(Value::Unit { mantissa, suffix })
+            }
             Tok::Str(s) => {
                 self.advance();
                 Ok(Value::Str(s))

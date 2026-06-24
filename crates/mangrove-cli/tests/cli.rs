@@ -48,6 +48,38 @@ fn check_no_schema_is_ok() {
 }
 
 #[test]
+fn hash_resolves_units_so_512mi_equals_536870912() {
+    let unit =
+        "unit Bytes : int { B = 1, Ki = 1024B, Mi = 1024Ki }\ntype D = { size: Bytes }\nschema D\n";
+    let a = std::env::temp_dir().join("m2b_a.mang");
+    let b = std::env::temp_dir().join("m2b_b.mang");
+    std::fs::write(&a, format!("{unit}size: 512Mi\n")).unwrap();
+    std::fs::write(&b, format!("{unit}size: 536870912\n")).unwrap();
+    let h = |p: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg("hash")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert_eq!(h(&a), h(&b)); // §4.5: 512Mi and 536870912 are the same value
+}
+
+#[test]
+fn schemaless_unit_literal_errors() {
+    let p = std::env::temp_dir().join("m2b_bare.mang");
+    std::fs::write(&p, "x: 512Mi\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+        .arg("hash")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn version_flag_prints_name_and_version() {
     let out = Command::new(env!("CARGO_BIN_EXE_mangrove"))
         .arg("--version")

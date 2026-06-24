@@ -42,15 +42,57 @@ fn cmd_hash(path: &str) -> ExitCode {
         Ok(s) => s,
         Err(code) => return code,
     };
-    match mangrove_syntax::parse(&src) {
-        Ok(value) => {
-            println!("{}", mangrove_canonical::hash(&value));
-            ExitCode::SUCCESS
-        }
+    let doc = match mangrove_syntax::parse_document(&src) {
+        Ok(d) => d,
         Err(e) => {
             eprintln!("{path}:{e}");
-            ExitCode::from(1)
+            return ExitCode::from(1);
         }
+    };
+    let env = match mangrove_typed::TypeEnv::build(&doc.typedefs, &doc.unitdefs) {
+        Ok(e) => e,
+        Err(msg) => {
+            eprintln!("{path}: schema error: {msg}");
+            return ExitCode::from(1);
+        }
+    };
+    // The content address is the schema-RESOLVED canonical form (D12): a bound
+    // schema resolves unit literals to base integers; a schemaless document
+    // hashes its raw data (M1 behaviour) but may not contain unit literals (D14).
+    let to_hash = match &doc.schema {
+        Some(name) => {
+            let Some(ty) = env.resolve(name) else {
+                eprintln!("{path}: unknown schema type: {name}");
+                return ExitCode::from(1);
+            };
+            match mangrove_typed::resolve(&doc.body, ty, &env) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{path}: {e}");
+                    return ExitCode::from(1);
+                }
+            }
+        }
+        None => {
+            if contains_unit(&doc.body) {
+                eprintln!("{path}: a unit literal requires a schema");
+                return ExitCode::from(1);
+            }
+            doc.body
+        }
+    };
+    println!("{}", mangrove_canonical::hash(&to_hash));
+    ExitCode::SUCCESS
+}
+
+/// Whether a value tree contains an unresolved unit literal (schemaless guard, D14).
+fn contains_unit(v: &mangrove_core::Value) -> bool {
+    use mangrove_core::Value;
+    match v {
+        Value::Unit { .. } => true,
+        Value::List(xs) => xs.iter().any(contains_unit),
+        Value::Map(m) => m.values().any(contains_unit),
+        _ => false,
     }
 }
 
