@@ -1,5 +1,52 @@
 use std::process::Command;
 
+fn run_check(name: &str, contents: &str) -> std::process::Output {
+    let p = std::env::temp_dir().join(name);
+    std::fs::write(&p, contents).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_mangrove"))
+        .arg("check")
+        .arg(&p)
+        .output()
+        .expect("run")
+}
+
+#[test]
+fn check_valid_document_exits_0() {
+    let out = run_check(
+        "m2a_ok.mang",
+        concat!(
+            "type Server = { host: str, port: int & >= 1 & <= 65535 }\n",
+            "schema Server\n",
+            "host: \"h\"\nport: 8443\n"
+        ),
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn check_invalid_document_exits_1_and_names_field() {
+    let out = run_check(
+        "m2a_bad.mang",
+        concat!(
+            "type Server = { host: str, port: int & >= 1 & <= 65535 }\n",
+            "schema Server\n",
+            "host: \"h\"\nport: 70000\n"
+        ),
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("port"));
+}
+
+#[test]
+fn check_no_schema_is_ok() {
+    let out = run_check("m2a_noschema.mang", "a: 1\n");
+    assert!(out.status.success());
+}
+
 #[test]
 fn version_flag_prints_name_and_version() {
     let out = Command::new(env!("CARGO_BIN_EXE_mangrove"))
