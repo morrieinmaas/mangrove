@@ -65,6 +65,16 @@ fn cmd_hash(path: &str) -> ExitCode {
                 eprintln!("{path}: unknown schema type: {name}");
                 return ExitCode::from(1);
             };
+            // Only a valid document has a canonical resolved form, so validate
+            // before resolving — this also keeps invalid input (e.g. a unit
+            // literal in a non-unit field) from ever reaching the encoder.
+            let errors = mangrove_typed::validate(&doc.body, ty, &env);
+            if !errors.is_empty() {
+                for e in &errors {
+                    eprintln!("{path}: {e}");
+                }
+                return ExitCode::from(1);
+            }
             match mangrove_typed::resolve(&doc.body, ty, &env) {
                 Ok(v) => v,
                 Err(e) => {

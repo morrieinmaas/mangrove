@@ -46,6 +46,9 @@ fn resolve_at(
                         out.insert(k.clone(), resolve_at(v, &f.ty, &child(path, k), env)?);
                     }
                     None => {
+                        // Unknown key (validation rejects it); never forward a
+                        // unit literal to the encoder — reject it here too.
+                        reject_stray_unit(v, &child(path, k))?;
                         out.insert(k.clone(), v.clone());
                     }
                 }
@@ -75,11 +78,36 @@ fn resolve_at(
             Ok(Value::List(out))
         }
 
-        // Non-unit scalars/leaves: copy through. A `Value::Unit` in a non-unit
-        // field is a validation error, not a resolution concern — copy it and
-        // let validation report it (it will never reach the encoder for a valid
-        // doc).
-        _ => Ok(value.clone()),
+        // Non-unit scalar/leaf type. A unit literal here is a kind mismatch
+        // (a unit literal only belongs in a unit-typed field); reject it rather
+        // than copy it forward to the encoder, which panics on an unresolved
+        // unit. Other values copy through.
+        _ => {
+            reject_stray_unit(value, path)?;
+            Ok(value.clone())
+        }
+    }
+}
+
+/// Error if `value` is (or contains) an unresolved unit literal — a unit
+/// literal in a non-unit-typed slot. Keeps `resolve` panic-proof even for an
+/// invalid document (the encoder aborts on `Value::Unit`).
+fn reject_stray_unit(value: &Value, path: &str) -> Result<(), Box<ValidationError>> {
+    if contains_unit(value) {
+        return Err(Box::new(
+            ValidationError::new(path, render(value), "a non-unit type")
+                .with_failed("unit literal in a non-unit field"),
+        ));
+    }
+    Ok(())
+}
+
+fn contains_unit(v: &Value) -> bool {
+    match v {
+        Value::Unit { .. } => true,
+        Value::List(xs) => xs.iter().any(contains_unit),
+        Value::Map(m) => m.values().any(contains_unit),
+        _ => false,
     }
 }
 
@@ -153,6 +181,22 @@ mod tests {
             resolve(&Value::Int(7.into()), &ty, &env).unwrap(),
             Value::Int(7.into())
         );
+    }
+
+    #[test]
+    fn unit_in_non_unit_field_errors_not_panics() {
+        // Was: copied through to the CBOR encoder → panic. Now a clean error.
+        let env = bytes_env();
+        let ty = parse_type("{ n: int }").unwrap();
+        let mut m = BTreeMap::new();
+        m.insert(
+            "n".to_string(),
+            Value::Unit {
+                mantissa: 512.into(),
+                suffix: "Mi".into(),
+            },
+        );
+        assert!(resolve(&Value::Map(m), &ty, &env).is_err());
     }
 
     #[test]
