@@ -21,7 +21,7 @@ pub fn parse_type(src: &str) -> Result<Type, ParseError> {
         col: e.col,
     })?;
     let mut p = Parser { tokens, pos: 0 };
-    let ty = p.parse_type_expr()?;
+    let ty = p.parse_type_expr(0)?;
     if !p.at_eof() {
         return Err(p.error(format!("unexpected token after type: {:?}", p.peek().tok)));
     }
@@ -198,7 +198,7 @@ impl Parser {
             other => return Err(self.error(format!("expected a type name, found {other:?}"))),
         };
         self.expect(&Tok::Eq)?;
-        let ty = self.parse_type_expr()?;
+        let ty = self.parse_type_expr(0)?;
         Ok((name, ty))
     }
 
@@ -320,12 +320,14 @@ impl Parser {
 
     // ---- type grammar (L1) ----
 
-    /// `union = intersection { "|" intersection }`
-    fn parse_type_expr(&mut self) -> Result<Type, ParseError> {
-        let mut variants = vec![self.parse_intersection()?];
+    /// `union = intersection { "|" intersection }`. `depth` is the container
+    /// nesting level — guards the type parser against stack-overflow on inputs
+    /// like `[[[[…` exactly as the value parser does (see [`MAX_DEPTH`]).
+    fn parse_type_expr(&mut self, depth: usize) -> Result<Type, ParseError> {
+        let mut variants = vec![self.parse_intersection(depth)?];
         while self.check(&Tok::Pipe) {
             self.advance();
-            variants.push(self.parse_intersection()?);
+            variants.push(self.parse_intersection(depth)?);
         }
         if variants.len() == 1 {
             Ok(variants.pop().unwrap())
@@ -335,8 +337,8 @@ impl Parser {
     }
 
     /// `intersection = atom { "&" refinement }`
-    fn parse_intersection(&mut self) -> Result<Type, ParseError> {
-        let mut ty = self.parse_atom()?;
+    fn parse_intersection(&mut self, depth: usize) -> Result<Type, ParseError> {
+        let mut ty = self.parse_atom(depth)?;
         while self.check(&Tok::Amp) {
             self.advance();
             ty = self.apply_refinement(ty)?;
@@ -344,7 +346,7 @@ impl Parser {
         Ok(ty)
     }
 
-    fn parse_atom(&mut self) -> Result<Type, ParseError> {
+    fn parse_atom(&mut self, depth: usize) -> Result<Type, ParseError> {
         match self.peek().tok.clone() {
             Tok::Bareword(name) => {
                 self.advance();
@@ -370,19 +372,28 @@ impl Parser {
                 Ok(Type::LitBool(b))
             }
             Tok::LBracket => {
+                if depth >= MAX_DEPTH {
+                    return Err(self.error("type nesting too deep".into()));
+                }
                 self.advance();
-                let inner = self.parse_type_expr()?;
+                let inner = self.parse_type_expr(depth + 1)?;
                 self.skip_seps();
                 self.expect(&Tok::RBracket)?;
                 Ok(Type::List(Box::new(inner)))
             }
-            Tok::LBrace => self.parse_record_or_map(),
+            Tok::LBrace => {
+                if depth >= MAX_DEPTH {
+                    return Err(self.error("type nesting too deep".into()));
+                }
+                self.parse_record_or_map(depth + 1)
+            }
             other => Err(self.error(format!("expected a type, found {other:?}"))),
         }
     }
 
-    /// `{ [str]: V }` (map) or `{ name [?] : type, … }` (record).
-    fn parse_record_or_map(&mut self) -> Result<Type, ParseError> {
+    /// `{ [str]: V }` (map) or `{ name [?] : type, … }` (record). `depth` is
+    /// already the nesting level of this `{` (incremented by the caller).
+    fn parse_record_or_map(&mut self, depth: usize) -> Result<Type, ParseError> {
         self.expect(&Tok::LBrace)?;
         if self.check(&Tok::LBracket) {
             // map: { [str]: V }
@@ -395,7 +406,7 @@ impl Parser {
             }
             self.expect(&Tok::RBracket)?;
             self.expect(&Tok::Colon)?;
-            let v = self.parse_type_expr()?;
+            let v = self.parse_type_expr(depth)?;
             self.skip_seps();
             self.expect(&Tok::RBrace)?;
             return Ok(Type::Map(Box::new(v)));
@@ -428,7 +439,7 @@ impl Parser {
                 false
             };
             self.expect(&Tok::Colon)?;
-            let ty = self.parse_type_expr()?;
+            let ty = self.parse_type_expr(depth)?;
             fields.push(FieldDef { name, optional, ty });
 
             let had_sep = self.at_sep();

@@ -135,4 +135,16 @@ mod tests {
         assert!(parse_type("int & =~ \"re\"").is_err());
         assert!(parse_type("bool & >= 1").is_err());
     }
+
+    #[test]
+    fn deeply_nested_type_errors_instead_of_overflowing() {
+        // Was: SIGABRT stack overflow. Now a clean error well before the limit.
+        let list = format!("{}int{}", "[".repeat(5000), "]".repeat(5000));
+        assert!(parse_type(&list).is_err());
+        let record = format!("{}int{}", "{ a: ".repeat(5000), " }".repeat(5000));
+        assert!(parse_type(&record).is_err());
+        // A reasonable nesting depth still parses fine.
+        let ok = format!("{}int{}", "[".repeat(50), "]".repeat(50));
+        assert!(parse_type(&ok).is_ok());
+    }
 }

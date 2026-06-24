@@ -1,6 +1,6 @@
 //! The type environment: named `type` definitions resolved for validation.
-//! Building one rejects duplicate names and any recursive (`Named`) cycle —
-//! recursion is forbidden by the totality axiom (§2.6).
+//! Building one rejects duplicate names, unknown references, and any recursive
+//! (`Named`) cycle — recursion is forbidden by the totality axiom (§2.6).
 
 use mangrove_syntax::Type;
 use std::collections::HashMap;
@@ -20,52 +20,89 @@ impl TypeEnv {
             }
             types.insert(name.clone(), ty.clone());
         }
-        let env = TypeEnv { types };
-        for name in env.types.keys() {
-            let mut stack = Vec::new();
-            env.check_acyclic(name, &mut stack)?;
+        // Build the name-reference graph (rejecting unknown references), then
+        // check it for cycles iteratively — so an arbitrarily long acyclic
+        // chain `A0 -> A1 -> … -> An` cannot overflow the call stack.
+        let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, ty) in &types {
+            let mut refs = Vec::new();
+            collect_refs(ty, &mut refs);
+            for r in &refs {
+                if !types.contains_key(r) {
+                    return Err(format!("unknown type: {r}"));
+                }
+            }
+            adj.insert(name.clone(), refs);
         }
-        Ok(env)
+        detect_cycle(&adj)?;
+        Ok(TypeEnv { types })
     }
 
     /// Look up a named type.
     pub fn resolve(&self, name: &str) -> Option<&Type> {
         self.types.get(name)
     }
+}
 
-    fn check_acyclic(&self, name: &str, stack: &mut Vec<String>) -> Result<(), String> {
-        if stack.iter().any(|n| n == name) {
-            stack.push(name.to_string());
-            return Err(format!("recursive type definition: {}", stack.join(" -> ")));
+/// Collect the names of every `Named` reference inside `ty`. Recurses over type
+/// *structure* only (bounded by the parser's nesting cap), never across the
+/// name-reference graph — that traversal is iterative (see `detect_cycle`).
+fn collect_refs(ty: &Type, out: &mut Vec<String>) {
+    match ty {
+        Type::Named(n) => out.push(n.clone()),
+        Type::Record { fields } => {
+            for f in fields {
+                collect_refs(&f.ty, out);
+            }
         }
-        let Some(ty) = self.types.get(name) else {
-            return Err(format!("unknown type: {name}"));
-        };
-        stack.push(name.to_string());
-        self.walk(ty, stack)?;
-        stack.pop();
-        Ok(())
+        Type::Map(inner) | Type::List(inner) => collect_refs(inner, out),
+        Type::Union(variants) => {
+            for v in variants {
+                collect_refs(v, out);
+            }
+        }
+        _ => {}
     }
+}
 
-    fn walk(&self, ty: &Type, stack: &mut Vec<String>) -> Result<(), String> {
-        match ty {
-            Type::Named(n) => self.check_acyclic(n, stack),
-            Type::Record { fields } => {
-                for f in fields {
-                    self.walk(&f.ty, stack)?;
+/// Iterative three-colour DFS over the name-reference graph. Errors (naming a
+/// node on the cycle) if one exists. The work stack lives on the heap, so chain
+/// length is bounded only by memory, never by the call stack.
+fn detect_cycle(adj: &HashMap<String, Vec<String>>) -> Result<(), String> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Color {
+        Gray,
+        Black,
+    }
+    let mut color: HashMap<&str, Color> = HashMap::new();
+    for start in adj.keys() {
+        if color.contains_key(start.as_str()) {
+            continue;
+        }
+        let mut stack: Vec<(&str, usize)> = vec![(start.as_str(), 0)];
+        color.insert(start.as_str(), Color::Gray);
+        while let Some(&(node, idx)) = stack.last() {
+            let children = &adj[node];
+            if idx < children.len() {
+                stack.last_mut().unwrap().1 += 1;
+                let child = children[idx].as_str();
+                match color.get(child) {
+                    Some(Color::Gray) => {
+                        return Err(format!("recursive type definition involving {child}"));
+                    }
+                    Some(Color::Black) => {}
+                    None => {
+                        color.insert(child, Color::Gray);
+                        stack.push((child, 0));
+                    }
                 }
-                Ok(())
+            } else {
+                color.insert(node, Color::Black);
+                stack.pop();
             }
-            Type::Map(inner) | Type::List(inner) => self.walk(inner, stack),
-            Type::Union(variants) => {
-                for v in variants {
-                    self.walk(v, stack)?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -101,13 +138,20 @@ mod tests {
     }
 
     #[test]
+    fn cycle_through_container_errors() {
+        // A = [ A ] — a cycle through a list child.
+        assert!(
+            TypeEnv::build(&[("A".into(), Type::List(Box::new(Type::Named("A".into()))))]).is_err()
+        );
+    }
+
+    #[test]
     fn unknown_referenced_type_errors() {
         assert!(TypeEnv::build(&[("A".into(), Type::Named("Nope".into()))]).is_err());
     }
 
     #[test]
     fn non_recursive_nested_is_fine() {
-        // A references B, B is a leaf — no cycle.
         let env = TypeEnv::build(&[
             (
                 "A".into(),
@@ -122,5 +166,16 @@ mod tests {
             ("B".into(), Type::Int),
         ]);
         assert!(env.is_ok());
+    }
+
+    #[test]
+    fn long_acyclic_chain_does_not_overflow() {
+        // Was: SIGABRT via recursive cycle-check. Now iterative — builds fine.
+        let n = 50_000;
+        let mut defs: Vec<(String, Type)> = (0..n)
+            .map(|i| (format!("A{i}"), Type::Named(format!("A{}", i + 1))))
+            .collect();
+        defs.push((format!("A{n}"), Type::Int));
+        assert!(TypeEnv::build(&defs).is_ok());
     }
 }
