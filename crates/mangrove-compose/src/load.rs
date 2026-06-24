@@ -120,6 +120,55 @@ fn compose_rec(
     })
 }
 
+/// Walk the `use` graph reachable from `path` and return every namespaced
+/// reference mapped to its source-bytes hash (for `mangrove update`). Unlike
+/// composing, this does NOT verify against the lockfile — it *produces* it.
+pub fn lock_references(path: &Path) -> Result<BTreeMap<String, String>, String> {
+    let canon = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let root_dir = canon.parent().unwrap_or_else(|| Path::new("."));
+    let resolvers = Resolvers::find_and_load(root_dir)?;
+    let mut out = BTreeMap::new();
+    collect_rec(&canon, &resolvers, &mut Vec::new(), &mut out)?;
+    Ok(out)
+}
+
+fn collect_rec(
+    path: &Path,
+    resolvers: &Resolvers,
+    visiting: &mut Vec<PathBuf>,
+    out: &mut BTreeMap<String, String>,
+) -> Result<(), String> {
+    if visiting.len() >= MAX_USE_DEPTH {
+        return Err(format!("`use` chain too deep (> {MAX_USE_DEPTH})"));
+    }
+    let canon = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if visiting.contains(&canon) {
+        return Err(format!("cyclic `use` involving {}", path.display()));
+    }
+    let src = std::fs::read_to_string(&canon).map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc = parse_document(&src).map_err(|e| format!("{}:{e}", path.display()))?;
+    visiting.push(canon.clone());
+    let dir = canon.parent().unwrap_or_else(|| Path::new("."));
+    for u in &doc.uses {
+        let resolved = if u.path.starts_with("./") || u.path.starts_with("../") {
+            dir.join(&u.path)
+        } else {
+            let p = resolvers.resolve_path(&u.path)?;
+            let bytes = std::fs::read(&p)
+                .map_err(|e| format!("resolving `{}`: {}: {e}", u.path, p.display()))?;
+            out.insert(u.path.clone(), mangrove_resolve::source_hash(&bytes));
+            p
+        };
+        collect_rec(&resolved, resolvers, visiting, out)?;
+    }
+    visiting.pop();
+    Ok(())
+}
+
 /// `key += [ … ]` — append a list to the inherited list (D22).
 fn apply_append(acc: Value, k: &str, v: Value) -> Result<Value, String> {
     let Value::List(add) = v else {

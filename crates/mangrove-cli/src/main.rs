@@ -21,13 +21,43 @@ fn main() -> ExitCode {
             Some(path) => cmd_check(path),
             None => usage(),
         },
+        Some("update") => match args.get(2) {
+            Some(path) => cmd_update(path),
+            None => usage(),
+        },
         _ => usage(),
     }
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: mangrove [--version | hash <file> | check <file>]");
+    eprintln!("usage: mangrove [--version | hash <file> | check <file> | update <file>]");
     ExitCode::from(2)
+}
+
+/// `mangrove update <file>` — resolve every reachable namespaced `use`, hash each
+/// source, and write `mangrove.lock` next to the document (§5.2; the only writer).
+fn cmd_update(path: &str) -> ExitCode {
+    let refs = match mangrove_compose::lock_references(std::path::Path::new(path)) {
+        Ok(r) => r,
+        Err(msg) => {
+            eprintln!("{path}: {msg}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut text = String::new();
+    for (k, v) in &refs {
+        text.push_str(&format!("{k:?} = {v:?}\n"));
+    }
+    let lock_path = std::path::Path::new(path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("mangrove.lock");
+    if let Err(e) = std::fs::write(&lock_path, text) {
+        eprintln!("{}: {e}", lock_path.display());
+        return ExitCode::from(1);
+    }
+    println!("wrote {} pin(s) to {}", refs.len(), lock_path.display());
+    ExitCode::SUCCESS
 }
 
 fn cmd_hash(path: &str) -> ExitCode {

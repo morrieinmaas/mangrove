@@ -152,6 +152,47 @@ fn subtype_redefinition_accepts_narrowing_rejects_loosening() {
 }
 
 #[test]
+fn update_writes_lockfile_then_check_passes() {
+    let dir = std::env::temp_dir().join(format!("m3b_cli_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("vendor")).unwrap();
+    std::fs::create_dir_all(dir.join(".mangrove")).unwrap();
+    std::fs::write(dir.join("vendor/base.mang"), "name: \"shared\"\n").unwrap();
+    std::fs::write(
+        dir.join(".mangrove/resolvers.toml"),
+        "[namespace.infra]\nremote = \"vendor\"\n",
+    )
+    .unwrap();
+    let root = dir.join("root.mang");
+    std::fs::write(&root, "use \"infra/base@v1\" as k\n...k\n").unwrap();
+
+    let run = |cmd: &str| {
+        Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg(cmd)
+            .arg(&root)
+            .output()
+            .unwrap()
+    };
+    // no lockfile yet → check fails closed
+    assert_eq!(run("check").status.code(), Some(1));
+    // update writes the lock
+    let upd = run("update");
+    assert!(
+        upd.status.success(),
+        "{}",
+        String::from_utf8_lossy(&upd.stderr)
+    );
+    assert!(dir.join("mangrove.lock").exists());
+    // now check passes (verified import)
+    let chk = run("check");
+    assert!(
+        chk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&chk.stderr)
+    );
+}
+
+#[test]
 fn schemaless_unit_literal_errors() {
     let p = std::env::temp_dir().join("m2b_bare.mang");
     std::fs::write(&p, "x: 512Mi\n").unwrap();
