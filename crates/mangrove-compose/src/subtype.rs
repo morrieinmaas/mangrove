@@ -132,8 +132,9 @@ fn sub(new: &Type, old: &Type, env: &TypeEnv, depth: usize) -> Result<(), String
         | (Type::Bool, Type::Bool)
         | (Type::Bytes, Type::Bytes) => Ok(()),
 
-        // int refinement <: int / int-range  (interval containment)
-        (Type::IntRange { .. } | Type::Int, Type::Int) => Ok(()),
+        // int refinement <: int / int-range  (interval containment).
+        // (Int, Int) is handled by the exact-match arm above.
+        (Type::IntRange { .. }, Type::Int) => Ok(()),
         (
             n,
             Type::IntRange {
@@ -162,7 +163,7 @@ fn sub(new: &Type, old: &Type, env: &TypeEnv, depth: usize) -> Result<(), String
             }
             Ok(())
         }
-        (Type::DecRange { .. } | Type::Decimal, Type::Decimal) => Ok(()),
+        (Type::DecRange { .. }, Type::Decimal) => Ok(()),
         (
             n,
             Type::DecRange {
@@ -188,8 +189,9 @@ fn sub(new: &Type, old: &Type, env: &TypeEnv, depth: usize) -> Result<(), String
             Ok(())
         }
 
-        // strings & regex (containment deferred — identical only)
-        (Type::StrRegex(_) | Type::Str, Type::Str) => Ok(()),
+        // strings & regex (containment deferred — identical only).
+        // (Str, Str) is handled by the exact-match arm above.
+        (Type::StrRegex(_), Type::Str) => Ok(()),
         (Type::StrRegex(a), Type::StrRegex(b)) if a == b => Ok(()),
         (_, Type::StrRegex(_)) => {
             Err("regex subtype not supported (deferred); narrowing must be identical".into())
