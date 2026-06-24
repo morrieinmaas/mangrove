@@ -7,5 +7,9 @@ name = "mangrove-cli"
 version = "0.1.0"
 
 [[package]]
+name = "mangrove-conformance"
+version = "0.1.0"
+
+[[package]]
 name = "mangrove-core"
 version = "0.1.0"
