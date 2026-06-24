@@ -48,12 +48,21 @@ impl std::error::Error for ParseError {}
 /// like `[[[[…`. Generous for real config, far below the overflow threshold.
 const MAX_DEPTH: usize = 128;
 
-/// A parsed document: any local `type` definitions, an optional `schema`
-/// binding, and the data body. A pure L0 document has empty `typedefs` and
+/// A unit type definition (§4.5): each member mapped to its base integer value
+/// (e.g. `Mi -> 1048576`), in declaration order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitDef {
+    pub name: String,
+    pub members: Vec<(String, BigInt)>,
+}
+
+/// A parsed document: any local `type`/`unit` definitions, an optional `schema`
+/// binding, and the data body. A pure L0 document has empty defs and
 /// `schema == None`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Document {
     pub typedefs: Vec<(String, Type)>,
+    pub unitdefs: Vec<UnitDef>,
     pub schema: Option<String>,
     pub body: Value,
 }
@@ -133,6 +142,7 @@ impl Parser {
     /// binding, and ordinary `key: value` bindings forming the body.
     fn parse_doc(&mut self) -> Result<Document, ParseError> {
         let mut typedefs = Vec::new();
+        let mut unitdefs = Vec::new();
         let mut schema: Option<String> = None;
         let mut body = BTreeMap::new();
         self.skip_seps();
@@ -142,6 +152,8 @@ impl Parser {
             }
             if self.is_keyword_stmt("type") {
                 typedefs.push(self.parse_typedef()?);
+            } else if self.is_keyword_stmt("unit") {
+                unitdefs.push(self.parse_unitdef()?);
             } else if self.is_keyword_stmt("schema") {
                 self.advance(); // 'schema'
                 let name = match self.peek().tok.clone() {
@@ -173,6 +185,7 @@ impl Parser {
         }
         Ok(Document {
             typedefs,
+            unitdefs,
             schema,
             body: Value::Map(body),
         })
@@ -199,7 +212,98 @@ impl Parser {
         };
         self.expect(&Tok::Eq)?;
         let ty = self.parse_type_expr(0)?;
+        // A top-level `type X = brand …` takes its identity from the typedef name.
+        let ty = match ty {
+            Type::Brand { inner, .. } => Type::Brand {
+                name: name.clone(),
+                inner,
+            },
+            other => other,
+        };
         Ok((name, ty))
+    }
+
+    /// `unit Name : int { member = value, … }` (§4.5). Each member value is an
+    /// integer or `<coefficient><earlier-member>` (Decision D13), evaluated to a
+    /// base integer.
+    fn parse_unitdef(&mut self) -> Result<UnitDef, ParseError> {
+        self.advance(); // 'unit'
+        let name = match self.peek().tok.clone() {
+            Tok::Bareword(n) => {
+                self.advance();
+                n
+            }
+            other => return Err(self.error(format!("expected a unit name, found {other:?}"))),
+        };
+        self.expect(&Tok::Colon)?;
+        match self.peek().tok.clone() {
+            Tok::Bareword(b) if b == "int" => self.advance(),
+            other => {
+                return Err(self.error(format!("unit base type must be `int`, found {other:?}")));
+            }
+        }
+        self.expect(&Tok::LBrace)?;
+        let mut members: Vec<(String, BigInt)> = Vec::new();
+        self.skip_seps();
+        loop {
+            if self.check(&Tok::RBrace) {
+                self.advance();
+                break;
+            }
+            if self.at_eof() {
+                return Err(self.error("unterminated unit declaration".into()));
+            }
+            let mname = match self.peek().tok.clone() {
+                Tok::Bareword(n) => {
+                    self.advance();
+                    n
+                }
+                other => return Err(self.error(format!("expected a unit member, found {other:?}"))),
+            };
+            self.expect(&Tok::Eq)?;
+            let base = match self.peek().tok.clone() {
+                Tok::Int(n) => {
+                    self.advance();
+                    n
+                }
+                Tok::UnitLit(coeff, suffix) => {
+                    self.advance();
+                    let c = mangrove_core::exact_bigint(&coeff).ok_or_else(|| {
+                        self.error(format!(
+                            "unit member coefficient must be an integer: {coeff}"
+                        ))
+                    })?;
+                    let earlier = members
+                        .iter()
+                        .find(|(n, _)| *n == suffix)
+                        .map(|(_, b)| b.clone())
+                        .ok_or_else(|| {
+                            self.error(format!("unknown earlier unit member `{suffix}`"))
+                        })?;
+                    c * earlier
+                }
+                other => {
+                    return Err(self.error(format!(
+                        "unit member value must be an integer or <int><member>, found {other:?}"
+                    )));
+                }
+            };
+            if members.iter().any(|(n, _)| *n == mname) {
+                return Err(self.error(format!("duplicate unit member `{mname}`")));
+            }
+            members.push((mname, base));
+
+            let had_sep = self.at_sep();
+            self.skip_seps();
+            if self.check(&Tok::RBrace) {
+                self.advance();
+                break;
+            }
+            if !had_sep {
+                return Err(self.error("expected ',' or newline in unit declaration".into()));
+            }
+        }
+        Ok(UnitDef { name, members })
     }
 
     /// Parse a sequence of bindings. `top_level` documents end at EOF; nested
@@ -347,6 +451,15 @@ impl Parser {
     }
 
     fn parse_atom(&mut self, depth: usize) -> Result<Type, ParseError> {
+        // `brand <type>` — a nominal newtype; the name is filled by the typedef.
+        if matches!(&self.peek().tok, Tok::Bareword(b) if b == "brand") {
+            self.advance();
+            let inner = self.parse_intersection(depth)?;
+            return Ok(Type::Brand {
+                name: String::new(),
+                inner: Box::new(inner),
+            });
+        }
         match self.peek().tok.clone() {
             Tok::Bareword(name) => {
                 self.advance();
@@ -593,6 +706,47 @@ mod tests {
     #[test]
     fn two_schema_statements_is_error() {
         assert!(parse_document("schema A\nschema B").is_err());
+    }
+
+    #[test]
+    fn parses_unit_declaration() {
+        let d = parse_document(
+            "unit Bytes : int { B = 1, Ki = 1024B, Mi = 1024Ki }\nschema Bytes\nx: 1\n",
+        )
+        .unwrap();
+        assert_eq!(d.unitdefs.len(), 1);
+        let b = &d.unitdefs[0];
+        assert_eq!(b.name, "Bytes");
+        assert_eq!(
+            b.members.iter().find(|(n, _)| n == "Mi").unwrap().1,
+            1_048_576.into()
+        );
+    }
+
+    #[test]
+    fn brand_type_parses_and_takes_typedef_name() {
+        use crate::ty::Type;
+        let d =
+            parse_document("type Satoshis = brand int & >= 0\nschema Satoshis\nx: 1\n").unwrap();
+        let (name, ty) = &d.typedefs[0];
+        assert_eq!(name, "Satoshis");
+        let Type::Brand { name: bn, inner } = ty else {
+            panic!()
+        };
+        assert_eq!(bn, "Satoshis");
+        assert!(matches!(**inner, Type::IntRange { .. }));
+    }
+
+    #[test]
+    fn unit_member_unknown_ref_errors() {
+        assert!(parse_document("unit U : int { a = 1b }\nschema U\n").is_err());
+    }
+
+    #[test]
+    fn unit_field_named_is_a_binding() {
+        // `unit:` (colon) is a field, not a unit declaration.
+        let d = parse_document("unit: \"x\"").unwrap();
+        assert!(d.unitdefs.is_empty());
     }
 
     #[test]
