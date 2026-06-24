@@ -2,6 +2,7 @@
 //! consumed by `mangrove-typed` for resolution and validation.
 
 use bigdecimal::BigDecimal;
+use mangrove_core::Value;
 use num_bigint::BigInt;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +54,9 @@ pub struct FieldDef {
     pub name: String,
     pub optional: bool,
     pub ty: Type,
+    /// Default value (`field: T | *value`), materialized into the canonical
+    /// form when the field is absent (§4.7, §7 step 3).
+    pub default: Option<Value>,
 }
 
 #[cfg(test)]
@@ -122,6 +126,30 @@ mod tests {
     #[test]
     fn empty_record() {
         assert_eq!(pt("{}"), Type::Record { fields: vec![] });
+    }
+
+    #[test]
+    fn field_defaults_parse() {
+        use mangrove_core::Value;
+        let Type::Record { fields } = pt("{ ns: str | *\"d\", n: int | *1, f?: bool }") else {
+            panic!()
+        };
+        let ns = fields.iter().find(|f| f.name == "ns").unwrap();
+        assert_eq!(ns.default, Some(Value::Str("d".into())));
+        let n = fields.iter().find(|f| f.name == "n").unwrap();
+        assert_eq!(n.default, Some(Value::Int(1.into())));
+        let f = fields.iter().find(|f| f.name == "f").unwrap();
+        assert_eq!(f.default, None);
+        assert!(f.optional);
+    }
+
+    #[test]
+    fn real_union_field_not_confused_with_default() {
+        let Type::Record { fields } = pt("{ a: str | int }") else {
+            panic!()
+        };
+        assert!(matches!(fields[0].ty, Type::Union(_)));
+        assert_eq!(fields[0].default, None);
     }
 
     #[test]

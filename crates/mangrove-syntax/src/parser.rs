@@ -107,6 +107,11 @@ impl Parser {
         &self.peek().tok == t
     }
 
+    /// Whether the token *after* the current one equals `t`.
+    fn next_is(&self, t: &Tok) -> bool {
+        self.tokens.get(self.pos + 1).map(|x| &x.tok) == Some(t)
+    }
+
     fn at_sep(&self) -> bool {
         matches!(
             self.peek().tok,
@@ -433,7 +438,8 @@ impl Parser {
     /// like `[[[[…` exactly as the value parser does (see [`MAX_DEPTH`]).
     fn parse_type_expr(&mut self, depth: usize) -> Result<Type, ParseError> {
         let mut variants = vec![self.parse_intersection(depth)?];
-        while self.check(&Tok::Pipe) {
+        // `| *value` is a field default, not a union variant — stop before it.
+        while self.check(&Tok::Pipe) && !self.next_is(&Tok::Star) {
             self.advance();
             variants.push(self.parse_intersection(depth)?);
         }
@@ -557,7 +563,20 @@ impl Parser {
             };
             self.expect(&Tok::Colon)?;
             let ty = self.parse_type_expr(depth)?;
-            fields.push(FieldDef { name, optional, ty });
+            // optional default: `| *value`
+            let default = if self.check(&Tok::Pipe) && self.next_is(&Tok::Star) {
+                self.advance(); // |
+                self.advance(); // *
+                Some(self.parse_value(depth)?)
+            } else {
+                None
+            };
+            fields.push(FieldDef {
+                name,
+                optional,
+                ty,
+                default,
+            });
 
             let had_sep = self.at_sep();
             self.skip_seps();

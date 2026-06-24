@@ -236,6 +236,7 @@ mod tests {
                             name: "b".into(),
                             optional: false,
                             ty: Type::Named("B".into()),
+                            default: None,
                         }],
                     },
                 ),
