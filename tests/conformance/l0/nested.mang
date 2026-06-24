@@ -1,0 +1,2 @@
+server: { host: "localhost", ports: [ 80, 443 ] }
+tags: [ "a", "b", "c" ]

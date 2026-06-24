@@ -1,0 +1,6 @@
+plain: "hello\nworld"
+raw: r"no\escapes here"
+block: """
+  line one
+  line two
+  """

@@ -25,3 +25,14 @@ pub fn vector_pairs(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     pairs.sort();
     pairs
 }
+
+/// Parse the `input` document, compute its canonical hash, and assert it equals
+/// the trimmed contents of `expected`. Panics with a descriptive message on any
+/// mismatch — the test harness surfaces it as a failure.
+pub fn run_vector(input: &Path, expected: &Path) {
+    let src = fs::read_to_string(input).unwrap_or_else(|e| panic!("read {input:?}: {e}"));
+    let want = fs::read_to_string(expected).unwrap_or_else(|e| panic!("read {expected:?}: {e}"));
+    let value = mangrove_syntax::parse(&src).unwrap_or_else(|e| panic!("parse {input:?}: {e}"));
+    let got = mangrove_canonical::hash(&value);
+    assert_eq!(got, want.trim(), "hash mismatch for {input:?}");
+}

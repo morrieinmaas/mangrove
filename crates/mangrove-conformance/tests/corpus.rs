@@ -12,3 +12,10 @@ fn every_l0_input_has_an_expected_file() {
         "no conformance vectors found under {L0_CORPUS}"
     );
 }
+
+#[test]
+fn all_l0_vectors_hash_to_expected() {
+    for (input, expected) in vector_pairs(Path::new(L0_CORPUS)) {
+        mangrove_conformance::run_vector(&input, &expected);
+    }
+}

@@ -1,1 +1,2 @@
-{ name: "smoke", replicas: 1 }
+name: "smoke"
+replicas: 1

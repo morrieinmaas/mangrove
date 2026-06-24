@@ -1,0 +1,4 @@
+# keys deliberately out of order; canonical form sorts them by code point
+zebra: 1
+alpha: 2
+middle: 3
