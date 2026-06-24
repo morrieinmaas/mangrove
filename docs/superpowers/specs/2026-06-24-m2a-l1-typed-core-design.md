@@ -15,6 +15,7 @@ Builds on M1 (L0): the lexer/parser/value-model/canonical-hash are reused unchan
 
 **Out (deferred):**
 - Units & brands → **M2b** (and unit-normalization folding into canonical form).
+- **Default values** (`field: T | *value`, per the §6.1/§4.7 worked examples — *not* the `= value` of §4.2; see Decision D7) → deferred to a later slice. Defaults interact with §7-step-3 materialization (D9), so they land together. In M2a a field is either required or optional, nothing more.
 - `match`, `require`, metadata annotations (`@doc`/`@message`/`@deprecated`) → **M2c**. (M2a errors carry the violated constraint but not custom `@message` text yet.)
 - Imports / `use` / cross-file schema resolution / lockfile → **M3 (L2)**. M2a schemas are self-contained in one file.
 - Defaults materialization into canonical form (§7 step 3) and `##`/`#!` hashing (M1 D5) → still deferred; `hash` stays the L0 data hash (Decision D9).
@@ -73,7 +74,7 @@ refinement = ( ">=" | "<=" | ">" | "<" ) , number
            | "=~" , string ;
 atom       = primitive | name | record-type | list-type | map-type | literal ;
 record-type= "{" , { field [ sep ] } , "}" ;
-field      = name , [ "?" ] , ":" , type , [ "=" , value ] ;   (* ? = optional, = default *)
+field      = name , [ "?" ] , ":" , type ;             (* ? = optional; no default in M2a *)
 map-type   = "{" , "[" , "str" , "]" , ":" , type , "}" ;
 list-type  = "[" , type , "]" ;
 literal    = string | int | bool ;
@@ -81,13 +82,19 @@ literal    = string | int | bool ;
 
 A record-type is distinguished from a map-type by its first token after `{`: `[` → map, a name → record (spec §3.2). Empty `{}` is an empty record.
 
-### Decision D7 — `:` in documents, `:`-type/`=`-default in schemas
+**Refinement–atom compatibility (Decision D10, enforced at type-load):** a refinement must match its atom's kind — interval bounds (`>= <= > <`) apply only to `int`/`decimal`, regex (`=~`) only to `str`. `str & >= 1` or `int & =~ "re"` is a **type error at load**, not a silent no-op. The refined atom collapses into the corresponding refined `Type` (`int & >=1 & <=10` → `IntRange{1,10}`; `str & =~ re` → `StrRegex(re)`).
+
+**Statement disambiguation (parser lookahead):** at statement position the parser distinguishes a `type X = …` definition and a `schema X` binding from an ordinary field named `type`/`schema`. The discriminator is the token *after* the leading bareword: a `:` means a field binding (`type: "lib"`, `schema: "x"`); `type <name> =` is a typedef; `schema <name>` (bareword, no colon) is the schema binding. One token of lookahead suffices.
+
+### Decision D7 — `:` in documents, `:`-type in schemas
 
 The source spec is inconsistent (M1 D1): §3/§6.3 use `key: value` in documents; §4.2 uses `=` for value-only. Resolution: **context decides.**
 - **Document body:** `key: value` (colon + value) — unchanged from L0, matches §6.3.
-- **Type/record definition:** `field: Type` (declaration), `field: Type = default` (default), `field?: Type` (optional). Here `:` introduces a *type* and `=` a *default value*.
+- **Type/record definition:** `field: Type` (required), `field?: Type` (optional); `type Name = <type>` binds a named type with `=`.
 
 The parser knows its context (inside a `type`/record definition vs a document body), so the same `:` is unambiguous. The bare `env = "prod"` value-only form from §4.2 is **not** supported in documents (colon is the document form); this is the one place we pick a single rule over the spec's two.
+
+**Defaults are not in M2a.** §4.2's `field: Type = default` and the worked examples' `field: T | *value` (§6.1/§4.7) are two different notations for the same feature; the `| *value` form is the one the actual examples use, and it is the one Mangrove adopts. Defaults are deferred (they interact with §7-step-3 canonical-form materialization, D9), so M2a parses neither `= default` nor `| *default`; a field is required or optional, full stop.
 
 ---
 
@@ -181,7 +188,7 @@ New `tests/conformance/l1/` with paired files: `name.mang` (a typed document) + 
 
 ## 11. Decisions to confirm
 
-- **D7** — `:`+value in documents; `:`+type (`=`+default, `?` optional) in type/record defs; bare `=`-value not supported in documents.
+- **D7** — `:`+value in documents; `:`+type (`?` optional) in type/record defs, `type Name = <type>` for named types; bare `=`-value not supported in documents; **defaults (`| *value`) deferred entirely from M2a**.
 - **D8** — M2a schemas are self-contained (local `type` defs + `schema <Name>`); imports deferred to M3.
 - **D9** — `hash` stays the L0 data hash; defaults-materialization and unit-normalization into canonical form deferred.
 - **D10** — refinements limited to interval/regex/enum; regex validated at value level, no subtype containment yet.
