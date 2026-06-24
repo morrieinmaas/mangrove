@@ -1,0 +1,15 @@
+[package]
+name = "mangrove-canonical"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mangrove-core = { path = "../mangrove-core" }
+mangrove-cbor = { path = "../mangrove-cbor" }
+blake3 = { workspace = true }
+
+[lints]
+workspace = true
