@@ -55,6 +55,8 @@ core ◄── cbor ◄── canonical ◄── typed ◄── compose ◄─
 
 Each milestone is one spec → plan → TDD cycle. "Done" means: TDD (failing test first), and CI green (fmt, clippy `-D warnings`, build, test).
 
+**Cross-cutting invariants (§2 axioms).** These are not features of any one milestone; every layer must uphold them and every milestone's tests must assert them where they apply: *no inference* (schema is the only type authority), *no null* (present-or-absent, never three states), *arbitrary precision* (no IEEE-754 float ever in the model), *totality* (all computation terminates; no recursion / no user Turing-complete functions), *braces are truth* (whitespace never read by the parser), *one canonical form* (semantic-equal ⇒ hash-equal). Treat regressions against these as conformance failures, not style nits.
+
 ### M0 — Scaffold + CI
 Workspace root, `mangrove-core` stub (error type skeleton), `mangrove-cli` stub, `.github/workflows/ci.yml`, and the **conformance harness skeleton** (a test that walks `tests/conformance/`, currently empty). Committed `Cargo.lock`. Tiny; unblocks everything.
 
@@ -71,6 +73,8 @@ Schema binding (§4.1), the single type grammar (§4.2), refinements + unions (�
 
 ### M4 — L3 Templated
 `params` as module parameters (§6.1), total non-recursive `fn` constructors (§6.2), value-layer interpolation (§6.3), `emit` document streams + `unset`-drops-document (§8), evaluation safety: pure / fuel + memory budget / opaque `secret()` (§11), emit projections + `clear()` null escape (§10), schema evolution `migrate` (§9).
+
+Note: `secret()` *parses and type-checks as `str`* at L1 (M2); only its resolution-deferral semantics (never resolved during evaluation, never in the canonical bytes or hash) belong to M4. Likewise §9's `@since`/`@deprecated`/`@removed` annotations are L1 metadata (M2) and schema-hash pinning is L2 (M3); only the `migrate` transform block is genuinely M4.
 
 ---
 
