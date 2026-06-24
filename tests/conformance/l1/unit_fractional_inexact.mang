@@ -1,0 +1,4 @@
+unit Sats : int { sat = 1, btc = 100_000_000sat }
+type W = { amount: Sats }
+schema W
+amount: 0.5sat

@@ -1,0 +1,4 @@
+type Satoshis = brand int & >= 0
+type W = { bal: Satoshis }
+schema W
+bal: -1

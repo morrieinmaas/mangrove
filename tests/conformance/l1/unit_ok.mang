@@ -1,0 +1,4 @@
+unit Bytes : int { B = 1, Ki = 1024B, Mi = 1024Ki }
+type D = { size: Bytes }
+schema D
+size: 512Mi
