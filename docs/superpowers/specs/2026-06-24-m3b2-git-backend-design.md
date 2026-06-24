@@ -46,3 +46,13 @@ A local git repo stands in for the remote — `git clone` from a filesystem path
 ## 5. Out-of-scope reminder
 
 §5.6 per-type pins and cross-file type imports are a separate, later milestone. M3b.2 finishes the *location* backend story; the *integrity* model (D27) and *namespace* model (D29) are unchanged.
+
+---
+
+## 6. Post-review hardening (D33)
+
+Adversarial review confirmed the integrity guarantee (D27) survives the git backend — git-sourced bytes reach the parser only through `compose_rec`'s read-once verify, and command/path injection (D32) holds on a modern git. Three edge findings were tightened:
+
+- **Per-segment `-`/`..` check.** `validate_component` now rejects a leading `-` (and `..`, empty) in *every* `/`-segment, not just the whole string, so `foo/-x` is refused — no segment can ever be read as a git option even if a future caller splits on `/`.
+- **Atomic, `.git`-validated cache.** A fetch clones+checks-out into a temp dir and `rename`s into place only after both git steps succeed; only a checkout that actually contains `.git` is treated as cached. A half-clone, an interrupted fetch, or a hand-placed directory in `.mangrove/cache/` is discarded and re-fetched — it can never be served as if it were the pinned ref (integrity already gated it; this removes the confusing-failure path).
+- **`ext::` RCE blocked on old git too.** The clone runs with `-c protocol.ext.allow=never`, so a hostile `url` cannot invoke a remote-helper command regardless of the host git's default protocol allowlist.

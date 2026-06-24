@@ -144,11 +144,13 @@ impl Resolvers {
     }
 }
 
-/// Reject empty/`..`/leading-`-` components and anything outside `[A-Za-z0-9._/-]`.
+/// Reject empty/`..`/leading-`-` segments and anything outside `[A-Za-z0-9._/-]`.
+/// The leading-`-` check is per *segment* (not per string), so `foo/-x` is also
+/// refused — no segment can ever be read as a git option (D32).
 fn validate_component(s: &str, what: &str) -> Result<(), String> {
     let ok = !s.is_empty()
-        && !s.starts_with('-')
-        && s.split('/').all(|seg| !seg.is_empty() && seg != "..")
+        && s.split('/')
+            .all(|seg| !seg.is_empty() && seg != ".." && !seg.starts_with('-'))
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'));
     if ok {
@@ -162,12 +164,28 @@ fn validate_component(s: &str, what: &str) -> Result<(), String> {
 /// Never goes through a shell; `url` is passed after `--` so it cannot be read as
 /// an option, and `git_ref` is pre-validated by [`validate_component`] (D32).
 fn git_fetch(url: &str, git_ref: &str, checkout: &Path) -> Result<(), String> {
-    if checkout.exists() {
-        return Ok(()); // cached (D31): one clone per (namespace, ref)
+    // Only a complete clone (one with a `.git`) counts as cached; a half-clone,
+    // a planted dir, or a wrong-ref worktree is discarded and redone (D31).
+    if checkout.join(".git").exists() {
+        return Ok(());
     }
-    if let Some(parent) = checkout.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("git cache dir: {e}"))?;
-    }
+    let _ = std::fs::remove_dir_all(checkout);
+    let parent = checkout
+        .parent()
+        .ok_or_else(|| "git cache path has no parent".to_string())?;
+    let name = checkout
+        .file_name()
+        .ok_or_else(|| "git cache path has no final component".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("git cache dir: {e}"))?;
+
+    // Clone+checkout into a temp dir, then atomically rename into place — the
+    // final path never exists until BOTH git steps succeeded, so a failed or
+    // interrupted fetch can never be mistaken for a valid cache entry.
+    let mut tmp_name = name.to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = parent.join(&tmp_name);
+    let _ = std::fs::remove_dir_all(&tmp);
+
     let run = |args: &[&std::ffi::OsStr]| -> Result<(), String> {
         let out = std::process::Command::new("git")
             .args(args)
@@ -176,30 +194,44 @@ fn git_fetch(url: &str, git_ref: &str, checkout: &Path) -> Result<(), String> {
         if out.status.success() {
             Ok(())
         } else {
-            let _ = std::fs::remove_dir_all(checkout); // don't leave a half clone cached
             Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
         }
     };
     use std::ffi::OsStr;
-    run(&[
-        OsStr::new("clone"),
-        OsStr::new("--quiet"),
-        OsStr::new("--"),
-        OsStr::new(url),
-        checkout.as_os_str(),
-    ])
-    .map_err(|e| format!("git clone {url} failed: {e}"))?;
-    run(&[
-        OsStr::new("-C"),
-        checkout.as_os_str(),
-        OsStr::new("-c"),
-        OsStr::new("advice.detachedHead=false"),
-        OsStr::new("checkout"),
-        OsStr::new("--quiet"),
-        OsStr::new(git_ref),
-        OsStr::new("--"),
-    ])
-    .map_err(|e| format!("git checkout {git_ref} failed: {e}"))?;
+    let fetch = || -> Result<(), String> {
+        run(&[
+            // Block the `ext::`/`fd::` remote-helper RCE on older gits too, not just
+            // modern defaults — a hostile `url` cannot smuggle a command.
+            OsStr::new("-c"),
+            OsStr::new("protocol.ext.allow=never"),
+            OsStr::new("clone"),
+            OsStr::new("--quiet"),
+            OsStr::new("--"),
+            OsStr::new(url),
+            tmp.as_os_str(),
+        ])
+        .map_err(|e| format!("git clone {url} failed: {e}"))?;
+        run(&[
+            OsStr::new("-C"),
+            tmp.as_os_str(),
+            OsStr::new("-c"),
+            OsStr::new("advice.detachedHead=false"),
+            OsStr::new("checkout"),
+            OsStr::new("--quiet"),
+            OsStr::new(git_ref),
+            OsStr::new("--"),
+        ])
+        .map_err(|e| format!("git checkout {git_ref} failed: {e}"))?;
+        Ok(())
+    };
+    if let Err(e) = fetch() {
+        let _ = std::fs::remove_dir_all(&tmp); // never leave a partial clone behind
+        return Err(e);
+    }
+    std::fs::rename(&tmp, checkout).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&tmp);
+        format!("publishing git cache: {e}")
+    })?;
     Ok(())
 }
 
@@ -416,6 +448,20 @@ mod tests {
         assert!(r.resolve_path("pkg/../escape@v1").is_err()); // `..` path escape
         assert!(r.resolve_path("pkg/x@-flag").is_err()); // git arg-injection via tag
         assert!(r.resolve_path("pkg/x@v 1").is_err()); // space outside charset
+        assert!(r.resolve_path("pkg/a/-x@v1").is_err()); // leading `-` in a *non-first* segment
+    }
+
+    #[test]
+    fn git_cache_ignores_a_planted_non_git_dir() {
+        // A dir hand-placed in the cache (no `.git`) must not be served as cached;
+        // git_fetch discards it and clones fresh. (Finding 3 hardening.)
+        let repo = make_git_repo("x.mang", "name: \"real\"\n");
+        let (proj, r) = git_project(&repo);
+        let planted = proj.join(".mangrove/cache/pkg/v1");
+        write(&planted.join("x.mang"), "name: \"planted\"\n");
+        let p = r.resolve_path("pkg/x@v1").unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "name: \"real\"\n");
+        assert!(p.parent().unwrap().join(".git").exists()); // a real checkout now
     }
 
     #[test]
