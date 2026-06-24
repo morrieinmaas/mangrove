@@ -6,9 +6,27 @@
 //! as separators here (not folded into the value — Decision D5).
 
 use crate::lexer::{Tok, Token, lex};
+use crate::ty::{FieldDef, Type};
+use bigdecimal::BigDecimal;
 use mangrove_core::Value;
+use num_bigint::BigInt;
 use std::collections::BTreeMap;
 use std::fmt;
+
+/// Parse a single type expression (test/embedding entrypoint).
+pub fn parse_type(src: &str) -> Result<Type, ParseError> {
+    let tokens = lex(src).map_err(|e| ParseError {
+        message: e.message,
+        line: e.line,
+        col: e.col,
+    })?;
+    let mut p = Parser { tokens, pos: 0 };
+    let ty = p.parse_type_expr()?;
+    if !p.at_eof() {
+        return Err(p.error(format!("unexpected token after type: {:?}", p.peek().tok)));
+    }
+    Ok(ty)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
@@ -215,6 +233,232 @@ impl Parser {
         }
         Ok(Value::List(items))
     }
+
+    // ---- type grammar (L1) ----
+
+    /// `union = intersection { "|" intersection }`
+    fn parse_type_expr(&mut self) -> Result<Type, ParseError> {
+        let mut variants = vec![self.parse_intersection()?];
+        while self.check(&Tok::Pipe) {
+            self.advance();
+            variants.push(self.parse_intersection()?);
+        }
+        if variants.len() == 1 {
+            Ok(variants.pop().unwrap())
+        } else {
+            Ok(Type::Union(variants))
+        }
+    }
+
+    /// `intersection = atom { "&" refinement }`
+    fn parse_intersection(&mut self) -> Result<Type, ParseError> {
+        let mut ty = self.parse_atom()?;
+        while self.check(&Tok::Amp) {
+            self.advance();
+            ty = self.apply_refinement(ty)?;
+        }
+        Ok(ty)
+    }
+
+    fn parse_atom(&mut self) -> Result<Type, ParseError> {
+        match self.peek().tok.clone() {
+            Tok::Bareword(name) => {
+                self.advance();
+                Ok(match name.as_str() {
+                    "int" => Type::Int,
+                    "decimal" => Type::Decimal,
+                    "str" => Type::Str,
+                    "bool" => Type::Bool,
+                    "bytes" => Type::Bytes,
+                    _ => Type::Named(name),
+                })
+            }
+            Tok::Str(s) => {
+                self.advance();
+                Ok(Type::LitStr(s))
+            }
+            Tok::Int(n) => {
+                self.advance();
+                Ok(Type::LitInt(n))
+            }
+            Tok::Bool(b) => {
+                self.advance();
+                Ok(Type::LitBool(b))
+            }
+            Tok::LBracket => {
+                self.advance();
+                let inner = self.parse_type_expr()?;
+                self.skip_seps();
+                self.expect(&Tok::RBracket)?;
+                Ok(Type::List(Box::new(inner)))
+            }
+            Tok::LBrace => self.parse_record_or_map(),
+            other => Err(self.error(format!("expected a type, found {other:?}"))),
+        }
+    }
+
+    /// `{ [str]: V }` (map) or `{ name [?] : type, … }` (record).
+    fn parse_record_or_map(&mut self) -> Result<Type, ParseError> {
+        self.expect(&Tok::LBrace)?;
+        if self.check(&Tok::LBracket) {
+            // map: { [str]: V }
+            self.advance();
+            match self.peek().tok.clone() {
+                Tok::Bareword(k) if k == "str" => self.advance(),
+                other => {
+                    return Err(self.error(format!("map key type must be `str`, found {other:?}")));
+                }
+            }
+            self.expect(&Tok::RBracket)?;
+            self.expect(&Tok::Colon)?;
+            let v = self.parse_type_expr()?;
+            self.skip_seps();
+            self.expect(&Tok::RBrace)?;
+            return Ok(Type::Map(Box::new(v)));
+        }
+        let mut fields = Vec::new();
+        self.skip_seps();
+        loop {
+            if self.check(&Tok::RBrace) {
+                self.advance();
+                break;
+            }
+            if self.at_eof() {
+                return Err(self.error("unterminated record type".into()));
+            }
+            let name = match self.peek().tok.clone() {
+                Tok::Bareword(n) => {
+                    self.advance();
+                    n
+                }
+                Tok::Str(n) => {
+                    self.advance();
+                    n
+                }
+                other => return Err(self.error(format!("expected a field name, found {other:?}"))),
+            };
+            let optional = if self.check(&Tok::Question) {
+                self.advance();
+                true
+            } else {
+                false
+            };
+            self.expect(&Tok::Colon)?;
+            let ty = self.parse_type_expr()?;
+            fields.push(FieldDef { name, optional, ty });
+
+            let had_sep = self.at_sep();
+            self.skip_seps();
+            if self.check(&Tok::RBrace) {
+                self.advance();
+                break;
+            }
+            if !had_sep {
+                return Err(self.error("expected ',' or newline in record type".into()));
+            }
+        }
+        Ok(Type::Record { fields })
+    }
+
+    /// Fold a refinement (after `&`) into `ty`. Enforces refinement-atom
+    /// compatibility (D10/F2): bounds only on int/decimal, regex only on str.
+    /// Dispatch is by the *atom's* kind, so a decimal atom accepts an int bound
+    /// (`decimal & >= 0`), but an int atom rejects a decimal bound.
+    fn apply_refinement(&mut self, ty: Type) -> Result<Type, ParseError> {
+        match self.peek().tok.clone() {
+            op @ (Tok::Ge | Tok::Le | Tok::Gt | Tok::Lt) => {
+                self.advance();
+                match &ty {
+                    Type::Int | Type::IntRange { .. } => {
+                        let n = match self.peek().tok.clone() {
+                            Tok::Int(n) => {
+                                self.advance();
+                                n
+                            }
+                            other => {
+                                return Err(self.error(format!(
+                                    "int bound must be an integer, found {other:?}"
+                                )));
+                            }
+                        };
+                        Ok(refine_int(ty, &op, n))
+                    }
+                    Type::Decimal | Type::DecRange { .. } => {
+                        let d = match self.peek().tok.clone() {
+                            Tok::Int(n) => {
+                                self.advance();
+                                BigDecimal::from(n)
+                            }
+                            Tok::Decimal(d) => {
+                                self.advance();
+                                d
+                            }
+                            other => {
+                                return Err(self.error(format!(
+                                    "decimal bound must be a number, found {other:?}"
+                                )));
+                            }
+                        };
+                        if matches!(op, Tok::Gt | Tok::Lt) {
+                            return Err(
+                                self.error("strict < / > on decimal is unsupported in M2a".into())
+                            );
+                        }
+                        Ok(refine_dec(ty, &op, d))
+                    }
+                    other => Err(self.error(format!(
+                        "interval bound applies only to int/decimal, not {other:?}"
+                    ))),
+                }
+            }
+            Tok::Match => {
+                self.advance();
+                match self.peek().tok.clone() {
+                    Tok::Str(re) => {
+                        self.advance();
+                        match ty {
+                            Type::Str => Ok(Type::StrRegex(re)),
+                            other => {
+                                Err(self.error(format!("=~ applies only to str, not {other:?}")))
+                            }
+                        }
+                    }
+                    other => {
+                        Err(self.error(format!("expected a string after =~, found {other:?}")))
+                    }
+                }
+            }
+            other => Err(self.error(format!("expected a refinement after &, found {other:?}"))),
+        }
+    }
+}
+
+fn refine_int(ty: Type, op: &Tok, n: BigInt) -> Type {
+    let (mut min, mut max) = match ty {
+        Type::IntRange { min, max } => (min, max),
+        _ => (None, None),
+    };
+    match op {
+        Tok::Ge => min = Some(n),
+        Tok::Gt => min = Some(n + BigInt::from(1)),
+        Tok::Le => max = Some(n),
+        Tok::Lt => max = Some(n - BigInt::from(1)),
+        _ => unreachable!(),
+    }
+    Type::IntRange { min, max }
+}
+
+fn refine_dec(ty: Type, op: &Tok, d: BigDecimal) -> Type {
+    let (mut min, mut max) = match ty {
+        Type::DecRange { min, max } => (min, max),
+        _ => (None, None),
+    };
+    match op {
+        Tok::Ge => min = Some(d),
+        Tok::Le => max = Some(d),
+        _ => unreachable!(),
+    }
+    Type::DecRange { min, max }
 }
 
 #[cfg(test)]
