@@ -1,0 +1,15 @@
+[package]
+name = "mangrove-compose"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mangrove-core = { path = "../mangrove-core" }
+mangrove-syntax = { path = "../mangrove-syntax" }
+mangrove-typed = { path = "../mangrove-typed" }
+
+[lints]
+workspace = true

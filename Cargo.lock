@@ -135,6 +135,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mangrove-compose"
+version = "0.1.0"
+dependencies = [
+ "mangrove-core",
+ "mangrove-syntax",
+ "mangrove-typed",
+]
+
+[[package]]
 name = "mangrove-conformance"
 version = "0.1.0"
 dependencies = [

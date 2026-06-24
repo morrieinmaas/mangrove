@@ -21,6 +21,10 @@ pub enum Value {
         mantissa: BigDecimal,
         suffix: String,
     },
+    /// The composition marker `unset` (§5.4): removes an inherited key on merge,
+    /// yielding *absence*. Removed during composition (L2); like `Unit`, it must
+    /// never reach the CBOR encoder.
+    Unset,
 }
 
 impl Value {

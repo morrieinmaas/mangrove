@@ -287,6 +287,7 @@ pub(crate) fn render(v: &Value) -> String {
         Value::List(_) => "<list>".into(),
         Value::Map(_) => "<map>".into(),
         Value::Unit { mantissa, suffix } => format!("{mantissa}{suffix}"),
+        Value::Unset => "unset".into(),
     }
 }
 

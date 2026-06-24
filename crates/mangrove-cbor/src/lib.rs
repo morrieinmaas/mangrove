@@ -48,6 +48,9 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
                 "unresolved unit literal reached the CBOR encoder — resolve against a schema first"
             )
         }
+        // ponytail: guard — `unset` is removed during composition (L2); it must
+        // never reach the encoder.
+        Value::Unset => panic!("`unset` reached the CBOR encoder — compose first"),
     }
 }
 
