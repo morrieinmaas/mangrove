@@ -41,17 +41,24 @@ pub fn compose(path: &Path) -> Result<Composed, String> {
     let root_dir = canon.parent().unwrap_or_else(|| Path::new("."));
     let resolvers = Resolvers::find_and_load(root_dir)?;
     let lock = Lockfile::find_and_load(root_dir)?;
-    compose_rec(path, &mut Vec::new(), &resolvers, &lock)
+    compose_rec(path, &mut Vec::new(), &resolvers, &lock, false, None)
 }
 
+/// `in_remote`: true once we have crossed a namespaced import — within a remote
+/// subtree every file is pinned and unpinnable local (`./`) imports are refused.
+/// `verify_as`: the lockfile reference to verify *this* file's bytes against
+/// (the bytes are read once and that exact buffer is both verified and parsed —
+/// no re-open, so no TOCTOU).
 fn compose_rec(
     path: &Path,
     visiting: &mut Vec<PathBuf>,
     resolvers: &Resolvers,
     lock: &Lockfile,
+    in_remote: bool,
+    verify_as: Option<&str>,
 ) -> Result<Composed, String> {
     // `visiting.len()` is the current `use`-chain depth; cap it so a deep chain
-    // of local files errors cleanly instead of overflowing the stack (SIGABRT).
+    // of files errors cleanly instead of overflowing the stack (SIGABRT).
     if visiting.len() >= MAX_USE_DEPTH {
         return Err(format!("`use` chain too deep (> {MAX_USE_DEPTH})"));
     }
@@ -61,27 +68,34 @@ fn compose_rec(
     if visiting.contains(&canon) {
         return Err(format!("cyclic `use` involving {}", path.display()));
     }
-    let src = std::fs::read_to_string(&canon).map_err(|e| format!("{}: {e}", path.display()))?;
+    // Read once; verify THIS buffer before parsing it (no second open → no TOCTOU).
+    let bytes = std::fs::read(&canon).map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(reference) = verify_as {
+        lock.verify(&bytes, reference)?;
+    }
+    let src = String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8", path.display()))?;
     let doc = parse_document(&src).map_err(|e| format!("{}:{e}", path.display()))?;
 
-    // Resolve each `use` (local path or namespaced reference) to its composed
-    // body, keyed by alias.
     visiting.push(canon.clone());
     let dir = canon.parent().unwrap_or_else(|| Path::new("."));
     let mut bases: BTreeMap<String, Value> = BTreeMap::new();
     for u in &doc.uses {
-        let base_path = if u.path.starts_with("./") || u.path.starts_with("../") {
-            dir.join(&u.path)
+        let base = if u.path.starts_with("./") || u.path.starts_with("../") {
+            // Local import. Inside a remote subtree it is unpinnable → refuse it,
+            // so a verified package cannot smuggle in unverified content (B1).
+            if in_remote {
+                return Err(format!(
+                    "a remote package may not use the local import `{}` (unpinnable; M3b.1)",
+                    u.path
+                ));
+            }
+            compose_rec(&dir.join(&u.path), visiting, resolvers, lock, false, None)?
         } else {
-            // Namespaced: resolve to a file, then hash-verify the source bytes
-            // against the lockfile BEFORE composing (fail closed, §5.2).
+            // Namespaced: resolve, then the recursive call verifies the bytes it
+            // reads against the lockfile before evaluating them (fail closed).
             let resolved = resolvers.resolve_path(&u.path)?;
-            let bytes = std::fs::read(&resolved)
-                .map_err(|e| format!("resolving `{}`: {}: {e}", u.path, resolved.display()))?;
-            lock.verify(&bytes, &u.path)?;
-            resolved
+            compose_rec(&resolved, visiting, resolvers, lock, true, Some(&u.path))?
         };
-        let base = compose_rec(&base_path, visiting, resolvers, lock)?;
         bases.insert(u.alias.clone(), base.body);
     }
     visiting.pop();
@@ -130,7 +144,7 @@ pub fn lock_references(path: &Path) -> Result<BTreeMap<String, String>, String> 
     let root_dir = canon.parent().unwrap_or_else(|| Path::new("."));
     let resolvers = Resolvers::find_and_load(root_dir)?;
     let mut out = BTreeMap::new();
-    collect_rec(&canon, &resolvers, &mut Vec::new(), &mut out)?;
+    collect_rec(&canon, &resolvers, &mut Vec::new(), &mut out, false)?;
     Ok(out)
 }
 
@@ -139,6 +153,7 @@ fn collect_rec(
     resolvers: &Resolvers,
     visiting: &mut Vec<PathBuf>,
     out: &mut BTreeMap<String, String>,
+    in_remote: bool,
 ) -> Result<(), String> {
     if visiting.len() >= MAX_USE_DEPTH {
         return Err(format!("`use` chain too deep (> {MAX_USE_DEPTH})"));
@@ -154,16 +169,23 @@ fn collect_rec(
     visiting.push(canon.clone());
     let dir = canon.parent().unwrap_or_else(|| Path::new("."));
     for u in &doc.uses {
-        let resolved = if u.path.starts_with("./") || u.path.starts_with("../") {
-            dir.join(&u.path)
+        // Mirror compose_rec: a `./` import inside a remote subtree is unpinnable,
+        // so refuse it here too — the lock we write must match what compose accepts.
+        if u.path.starts_with("./") || u.path.starts_with("../") {
+            if in_remote {
+                return Err(format!(
+                    "a remote package may not use the local import `{}` (unpinnable; M3b.1)",
+                    u.path
+                ));
+            }
+            collect_rec(&dir.join(&u.path), resolvers, visiting, out, false)?;
         } else {
             let p = resolvers.resolve_path(&u.path)?;
             let bytes = std::fs::read(&p)
                 .map_err(|e| format!("resolving `{}`: {}: {e}", u.path, p.display()))?;
             out.insert(u.path.clone(), mangrove_resolve::source_hash(&bytes));
-            p
-        };
-        collect_rec(&resolved, resolvers, visiting, out)?;
+            collect_rec(&p, resolvers, visiting, out, true)?;
+        }
     }
     visiting.pop();
     Ok(())
@@ -387,6 +409,31 @@ mod tests {
         ]);
         let e = compose(&dir.join("root.mang")).unwrap_err();
         assert!(e.contains("integrity check failed"), "{e}");
+    }
+
+    #[test]
+    fn remote_package_local_import_is_refused() {
+        // B1: a pinned entry file must not smuggle in an unpinned `./` sibling.
+        let dir = scratch(&[
+            ("vendor/x.mang", "use \"./secret.mang\" as s\n...s\n"),
+            ("vendor/secret.mang", "injected: \"PAYLOAD\"\n"), // NOT in the lock
+            ("root.mang", "use \"infra/x@v1\" as k\n...k\n"),
+            (
+                ".mangrove/resolvers.toml",
+                "[namespace.infra]\nremote = \"vendor\"\n",
+            ),
+        ]);
+        let bytes = std::fs::read(dir.join("vendor/x.mang")).unwrap();
+        std::fs::write(
+            dir.join("mangrove.lock"),
+            format!(
+                "\"infra/x@v1\" = {:?}\n",
+                mangrove_resolve::source_hash(&bytes)
+            ),
+        )
+        .unwrap();
+        let e = compose(&dir.join("root.mang")).unwrap_err();
+        assert!(e.contains("remote package may not use"), "{e}");
     }
 
     #[test]

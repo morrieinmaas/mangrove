@@ -44,19 +44,20 @@ fn cmd_update(path: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let mut text = String::new();
-    for (k, v) in &refs {
-        text.push_str(&format!("{k:?} = {v:?}\n"));
+    let count = refs.len();
+    let mut lock = mangrove_resolve::Lockfile::default();
+    for (k, v) in refs {
+        lock.insert(k, v);
     }
     let lock_path = std::path::Path::new(path)
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("mangrove.lock");
-    if let Err(e) = std::fs::write(&lock_path, text) {
+    if let Err(e) = std::fs::write(&lock_path, lock.to_toml()) {
         eprintln!("{}: {e}", lock_path.display());
         return ExitCode::from(1);
     }
-    println!("wrote {} pin(s) to {}", refs.len(), lock_path.display());
+    println!("wrote {count} pin(s) to {}", lock_path.display());
     ExitCode::SUCCESS
 }
 

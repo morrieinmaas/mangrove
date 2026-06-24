@@ -76,3 +76,15 @@ New workspace deps: `toml = "0.8"`.
 - **D26** — `mangrove.lock` at project root, committed, `"<ns>@<tag>" = "b3:<hash-of-source-bytes>"`.
 - **D27** — verify-before-eval, fail closed: mismatch or missing-entry → hard error before parsing; builds read the lock, never auto-resolve; `mangrove update` is the only writer.
 - Git-fetch backend + per-type pins → **M3b.2**.
+
+---
+
+## 6. Post-review hardening (D28) and known limits
+
+Adversarial security review of the implemented resolver surfaced three integrity-bypass paths; the fixes are part of M3b.1:
+
+- **Read-once verify (no TOCTOU).** `compose_rec` reads a file's bytes once, verifies *that* buffer against the lock, then parses the *same* buffer — it never re-opens the path. A previous design verified one read and composed a second read, leaving a swap window.
+- **Closed remote subtree (B1).** Once composition crosses a namespaced (remote) import, every file in that subtree is pinned; an unpinnable local `./`/`../` import *inside* a remote package is a hard error (`a remote package may not use the local import …`). Otherwise a pinned entry file could pull in unpinned sibling content. `mangrove update` enforces the same rule so the lock it writes matches what `compose` accepts. Multi-file remote packages must therefore compose their pieces via namespaced references (each pinned); relative-path packaging from a remote is deferred to M3b.2's content-addressed closure pinning.
+- **TOML-crate serialization (S4).** `mangrove.lock` is written via the `toml` crate, not `{:?}`, so a reference containing control characters round-trips instead of emitting invalid TOML that the reader then rejects.
+
+**Known limit — transitive lock/resolver anchoring (S3).** The `mangrove.lock` and `.mangrove/resolvers.toml` are discovered once at the root document's directory and applied to the whole graph, keyed by the bare reference string. A vendored package's *own* namespaced deps resolve against the root's resolvers and root's lock; two sub-packages that use the same reference string collide on one lock key. Re-anchoring resolver/lock discovery per resolved package (or namespacing lock keys by importing-package identity) is deferred to **M3b.2** with the git backend. Until then, D27's guarantee is whole-graph relative to the root project's lock.

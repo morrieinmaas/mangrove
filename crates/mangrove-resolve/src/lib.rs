@@ -140,12 +140,14 @@ impl Lockfile {
     }
 
     /// Serialize to the committed `mangrove.lock` text (sorted, deterministic).
+    /// Uses the `toml` crate so the writer's escaping matches the reader's — a
+    /// reference with a control char round-trips instead of emitting invalid TOML.
     pub fn to_toml(&self) -> String {
-        let mut out = String::new();
+        let mut table = toml::Table::new();
         for (k, v) in &self.map {
-            out.push_str(&format!("{k:?} = {v:?}\n"));
+            table.insert(k.clone(), toml::Value::String(v.clone()));
         }
-        out
+        toml::to_string(&table).unwrap_or_default()
     }
 }
 
@@ -223,11 +225,18 @@ mod tests {
     fn lock_roundtrips_to_toml() {
         let mut lock = Lockfile::default();
         lock.insert("infra/x@v1".into(), "b3:abc".into());
+        // a control char in the reference must still round-trip (S4: `{:?}`
+        // escaping emitted invalid TOML here; the toml crate does not).
+        lock.insert("a\u{1}b@v1".into(), "b3:def".into());
         let text = lock.to_toml();
         let reparsed: toml::Table = text.parse().unwrap();
         assert_eq!(
             reparsed.get("infra/x@v1").and_then(|v| v.as_str()),
             Some("b3:abc")
+        );
+        assert_eq!(
+            reparsed.get("a\u{1}b@v1").and_then(|v| v.as_str()),
+            Some("b3:def")
         );
     }
 }
