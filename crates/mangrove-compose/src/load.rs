@@ -20,6 +20,8 @@ pub struct Composed {
     pub typedefs: Vec<TypeDef>,
     pub unitdefs: Vec<UnitDef>,
     pub schema: Option<String>,
+    /// `schema Base & { … }` narrowing record, if present (§5.5).
+    pub schema_narrow: Option<Type>,
     pub body: Value,
 }
 
@@ -84,6 +86,7 @@ fn compose_rec(path: &Path, visiting: &mut Vec<PathBuf>) -> Result<Composed, Str
         typedefs: doc.typedefs,
         unitdefs: doc.unitdefs,
         schema: doc.schema,
+        schema_narrow: doc.schema_narrow,
         body: acc,
     })
 }

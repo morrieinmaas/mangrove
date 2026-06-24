@@ -52,21 +52,24 @@ fn cmd_hash(path: &str) -> ExitCode {
     // hashes its raw data (M1 behaviour) but may not contain unit literals (D14).
     let to_hash = match &doc.schema {
         Some(name) => {
-            let Some(ty) = env.resolve(name) else {
-                eprintln!("{path}: unknown schema type: {name}");
-                return ExitCode::from(1);
+            let ty = match effective_schema(name, &doc.schema_narrow, &env) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("{path}: {e}");
+                    return ExitCode::from(1);
+                }
             };
             // Only a valid document has a canonical resolved form, so validate
             // before resolving — this also keeps invalid input (e.g. a unit
             // literal in a non-unit field) from ever reaching the encoder.
-            let errors = mangrove_typed::validate(&doc.body, ty, &env);
+            let errors = mangrove_typed::validate(&doc.body, &ty, &env);
             if !errors.is_empty() {
                 for e in &errors {
                     eprintln!("{path}: {e}");
                 }
                 return ExitCode::from(1);
             }
-            match mangrove_typed::resolve(&doc.body, ty, &env) {
+            match mangrove_typed::resolve(&doc.body, &ty, &env) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("{path}: {e}");
@@ -84,6 +87,26 @@ fn cmd_hash(path: &str) -> ExitCode {
     };
     println!("{}", mangrove_canonical::hash(&to_hash));
     ExitCode::SUCCESS
+}
+
+/// The effective schema type: the named type, or — for `schema Base & {…}` — the
+/// narrowed type (checked `New <: Old`, §5.5).
+fn effective_schema(
+    name: &str,
+    narrow: &Option<mangrove_syntax::Type>,
+    env: &mangrove_typed::TypeEnv,
+) -> Result<mangrove_syntax::Type, String> {
+    match narrow {
+        Some(n) => mangrove_compose::narrowed_schema(
+            &mangrove_syntax::Type::Named(name.to_string()),
+            n,
+            env,
+        ),
+        None => env
+            .resolve(name)
+            .cloned()
+            .ok_or_else(|| format!("unknown schema type: {name}")),
+    }
 }
 
 /// Whether a value tree contains an unresolved unit literal (schemaless guard, D14).
@@ -116,15 +139,18 @@ fn cmd_check(path: &str) -> ExitCode {
         println!("ok (no schema)");
         return ExitCode::SUCCESS;
     };
-    let Some(schema_ty) = env.resolve(&schema_name) else {
-        eprintln!("{path}: unknown schema type: {schema_name}");
-        return ExitCode::from(1);
+    let schema_ty = match effective_schema(&schema_name, &doc.schema_narrow, &env) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return ExitCode::from(1);
+        }
     };
     // Advisory @deprecated warnings (never affect the exit code).
-    for warning in mangrove_typed::deprecations(&doc.body, schema_ty, &env) {
+    for warning in mangrove_typed::deprecations(&doc.body, &schema_ty, &env) {
         eprintln!("warning: {warning}");
     }
-    let errors = mangrove_typed::validate(&doc.body, schema_ty, &env);
+    let errors = mangrove_typed::validate(&doc.body, &schema_ty, &env);
     if errors.is_empty() {
         println!("ok");
         ExitCode::SUCCESS

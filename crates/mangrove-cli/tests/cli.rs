@@ -117,6 +117,41 @@ fn composed_overlay_hashes_like_handwritten() {
 }
 
 #[test]
+fn subtype_redefinition_accepts_narrowing_rejects_loosening() {
+    let check = |name: &str, body: &str| {
+        let p = std::env::temp_dir().join(name);
+        std::fs::write(&p, body).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg("check")
+            .arg(&p)
+            .output()
+            .unwrap()
+    };
+    // accept: narrow `replicas: int` to a bounded subrange; value in range → ok
+    let ok = check(
+        "m3a_sub_ok.mang",
+        "type Dep = { replicas: int }\nschema Dep & { replicas: int & >= 1 & <= 10 }\nreplicas: 5\n",
+    );
+    assert!(
+        ok.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    // the narrowed bound is enforced: 50 > 10 → invalid
+    let oob = check(
+        "m3a_sub_oob.mang",
+        "type Dep = { replicas: int }\nschema Dep & { replicas: int & >= 1 & <= 10 }\nreplicas: 50\n",
+    );
+    assert_eq!(oob.status.code(), Some(1));
+    // reject: loosening (int is wider than the base's bounded int) → load error
+    let loosen = check(
+        "m3a_sub_loosen.mang",
+        "type Dep = { replicas: int & <= 10 }\nschema Dep & { replicas: int }\nreplicas: 5\n",
+    );
+    assert_eq!(loosen.status.code(), Some(1));
+}
+
+#[test]
 fn schemaless_unit_literal_errors() {
     let p = std::env::temp_dir().join("m2b_bare.mang");
     std::fs::write(&p, "x: 512Mi\n").unwrap();

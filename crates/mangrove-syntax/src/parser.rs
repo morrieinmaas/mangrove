@@ -105,6 +105,8 @@ pub struct Document {
     pub typedefs: Vec<TypeDef>,
     pub unitdefs: Vec<UnitDef>,
     pub schema: Option<String>,
+    /// Subtype-redefinition narrowing record (`schema Base & { … }`, §5.5).
+    pub schema_narrow: Option<Type>,
     /// Ordered body statements (binds + spreads), for the compose driver.
     pub stmts: Vec<Stmt>,
     /// The folded body of plain bindings (spread-free path; used by `hash`
@@ -195,6 +197,7 @@ impl Parser {
         let mut typedefs = Vec::new();
         let mut unitdefs = Vec::new();
         let mut schema: Option<String> = None;
+        let mut schema_narrow: Option<Type> = None;
         let mut stmts: Vec<Stmt> = Vec::new();
         let mut body = BTreeMap::new();
         self.skip_seps();
@@ -226,6 +229,11 @@ impl Parser {
                 };
                 if schema.is_some() {
                     return Err(self.error("duplicate `schema` statement".into()));
+                }
+                // optional subtype redefinition: `schema Base & { … }` (§5.5)
+                if self.check(&Tok::Amp) {
+                    self.advance();
+                    schema_narrow = Some(self.parse_type_expr(0)?);
                 }
                 schema = Some(name);
             } else if self.check(&Tok::DotDotDot) {
@@ -297,6 +305,7 @@ impl Parser {
             typedefs,
             unitdefs,
             schema,
+            schema_narrow,
             stmts,
             body: Value::Map(body),
         })

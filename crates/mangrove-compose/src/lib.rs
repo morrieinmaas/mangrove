@@ -4,6 +4,8 @@
 
 pub mod load;
 pub mod merge;
+pub mod subtype;
 
 pub use load::{Composed, compose};
 pub use merge::merge;
+pub use subtype::{is_subtype, narrowed_schema};
