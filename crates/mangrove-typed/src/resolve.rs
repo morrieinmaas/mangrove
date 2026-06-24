@@ -35,7 +35,7 @@ fn resolve_at(
         }
         Type::Brand { inner, .. } => resolve_at(value, inner, path, env),
 
-        Type::Record { fields } => {
+        Type::Record { fields, .. } => {
             let Value::Map(m) = value else {
                 return Ok(value.clone());
             };

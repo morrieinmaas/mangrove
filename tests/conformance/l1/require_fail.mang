@@ -1,0 +1,4 @@
+type C = { a: int, b: int, require: a <= b @message("a must be <= b") }
+schema C
+a: 5
+b: 2

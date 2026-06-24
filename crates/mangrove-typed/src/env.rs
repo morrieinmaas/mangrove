@@ -110,7 +110,7 @@ impl TypeEnv {
 fn collect_refs(ty: &Type, out: &mut Vec<String>) {
     match ty {
         Type::Named(n) => out.push(n.clone()),
-        Type::Record { fields } => {
+        Type::Record { fields, .. } => {
             for f in fields {
                 collect_refs(&f.ty, out);
             }
@@ -261,6 +261,7 @@ mod tests {
                             default: None,
                             annotations: vec![],
                         }],
+                        requires: vec![],
                     },
                 ),
                 td("B", Type::Int),

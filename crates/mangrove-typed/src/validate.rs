@@ -5,7 +5,7 @@
 use crate::env::TypeEnv;
 use mangrove_core::Value;
 use mangrove_core::error::ValidationError;
-use mangrove_syntax::{Annotation, Type};
+use mangrove_syntax::{Annotation, Require, Type};
 use regex::Regex;
 use std::collections::HashSet;
 
@@ -30,7 +30,7 @@ fn walk_deprecations(value: &Value, ty: &Type, path: &str, env: &TypeEnv, out: &
             }
         }
         Type::Brand { inner, .. } => walk_deprecations(value, inner, path, env, out),
-        Type::Record { fields } => {
+        Type::Record { fields, .. } => {
             if let Value::Map(m) = value {
                 for f in fields {
                     if let Some(v) = m.get(&f.name) {
@@ -125,7 +125,7 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
             _ => vec![mismatch(path, value, ty)],
         },
 
-        Type::Record { fields } => {
+        Type::Record { fields, requires } => {
             let Value::Map(m) = value else {
                 return vec![mismatch(path, value, ty)];
             };
@@ -155,6 +155,18 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
                         ValidationError::new(child(path, k), render(v), "(no such field)")
                             .with_failed("unknown field"),
                     );
+                }
+            }
+            // Cross-field predicates (§4.7), evaluated against the concrete
+            // record. Only run when the fields themselves validated, so a
+            // require doesn't fire on a missing/ill-typed operand.
+            if errs.is_empty() {
+                for r in requires {
+                    match crate::predicate::eval_pred(&r.pred, m) {
+                        Ok(true) => {}
+                        Ok(false) => errs.push(require_error(path, r)),
+                        Err(_) => errs.push(require_error(path, r)),
+                    }
                 }
             }
             errs
@@ -250,6 +262,13 @@ fn mismatch(path: &str, value: &Value, ty: &Type) -> ValidationError {
     ValidationError::new(path, render(value), render_type(ty))
 }
 
+fn require_error(path: &str, r: &Require) -> ValidationError {
+    let mut e = ValidationError::new(path, "<record>", "a require predicate that holds")
+        .with_failed("require");
+    e.message = r.message.clone();
+    e
+}
+
 pub(crate) fn child(parent: &str, key: &str) -> String {
     if parent.is_empty() {
         key.to_string()
@@ -284,7 +303,7 @@ fn render_type(ty: &Type) -> String {
         Type::LitStr(s) => format!("{s:?}"),
         Type::LitInt(n) => n.to_string(),
         Type::LitBool(b) => b.to_string(),
-        Type::Record { fields } => {
+        Type::Record { fields, .. } => {
             let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
             format!("{{ {} }}", names.join(", "))
         }
@@ -478,6 +497,26 @@ mod tests {
         let warns = super::deprecations(&v, &ty, &env());
         assert_eq!(warns.len(), 1);
         assert!(warns[0].contains("image") && warns[0].contains("image_ref"));
+    }
+
+    #[test]
+    fn require_passes_and_fails_with_message() {
+        let t = "{ a: int, b: int, require: a <= b @message(\"a must be <= b\") }";
+        assert!(
+            validate(
+                &map(&[("a", Value::Int(1.into())), ("b", Value::Int(2.into()))]),
+                &ty(t),
+                &env()
+            )
+            .is_empty()
+        );
+        let e = validate(
+            &map(&[("a", Value::Int(5.into())), ("b", Value::Int(2.into()))]),
+            &ty(t),
+            &env(),
+        );
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].message.as_deref(), Some("a must be <= b"));
     }
 
     #[test]

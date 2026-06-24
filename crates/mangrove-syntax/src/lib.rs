@@ -5,4 +5,4 @@ pub mod parser;
 pub mod ty;
 
 pub use parser::{Document, ParseError, TypeDef, UnitDef, parse, parse_document, parse_type};
-pub use ty::{Annotation, FieldDef, Type};
+pub use ty::{Annotation, CmpOp, FieldDef, Operand, Pred, Require, Type};

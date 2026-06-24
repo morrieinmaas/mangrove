@@ -585,6 +585,7 @@ impl Parser {
             return Ok(Type::Map(Box::new(v)));
         }
         let mut fields = Vec::new();
+        let mut requires = Vec::new();
         self.skip_seps();
         loop {
             if self.check(&Tok::RBrace) {
@@ -593,6 +594,28 @@ impl Parser {
             }
             if self.at_eof() {
                 return Err(self.error("unterminated record type".into()));
+            }
+            // `require: <predicate> [@message(...)]` — a cross-field constraint,
+            // not a field. `require` is reserved as a field name inside records.
+            if matches!(&self.peek().tok, Tok::Bareword(b) if b == "require")
+                && self.next_is(&Tok::Colon)
+            {
+                self.advance(); // 'require'
+                self.expect(&Tok::Colon)?;
+                let pred = self.parse_pred()?;
+                let anns = self.parse_annotations()?;
+                let message = Annotation::find(&anns, "message").map(str::to_string);
+                requires.push(crate::ty::Require { pred, message });
+                let had_sep = self.at_sep();
+                self.skip_seps();
+                if self.check(&Tok::RBrace) {
+                    self.advance();
+                    break;
+                }
+                if !had_sep {
+                    return Err(self.error("expected ',' or newline in record type".into()));
+                }
+                continue;
             }
             let name = match self.peek().tok.clone() {
                 Tok::Bareword(n) => {
@@ -640,7 +663,120 @@ impl Parser {
                 return Err(self.error("expected ',' or newline in record type".into()));
             }
         }
-        Ok(Type::Record { fields })
+        Ok(Type::Record { fields, requires })
+    }
+
+    // ---- require predicate sublanguage (§4.7) ----
+
+    fn parse_pred(&mut self) -> Result<crate::ty::Pred, ParseError> {
+        self.parse_pred_or()
+    }
+
+    fn parse_pred_or(&mut self) -> Result<crate::ty::Pred, ParseError> {
+        let mut lhs = self.parse_pred_and()?;
+        while self.check(&Tok::PipePipe) {
+            self.advance();
+            let rhs = self.parse_pred_and()?;
+            lhs = crate::ty::Pred::Or(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_pred_and(&mut self) -> Result<crate::ty::Pred, ParseError> {
+        let mut lhs = self.parse_pred_not()?;
+        while self.check(&Tok::AmpAmp) {
+            self.advance();
+            let rhs = self.parse_pred_not()?;
+            lhs = crate::ty::Pred::And(Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_pred_not(&mut self) -> Result<crate::ty::Pred, ParseError> {
+        if self.check(&Tok::Bang) {
+            self.advance();
+            Ok(crate::ty::Pred::Not(Box::new(self.parse_pred_not()?)))
+        } else {
+            self.parse_pred_cmp()
+        }
+    }
+
+    fn parse_pred_cmp(&mut self) -> Result<crate::ty::Pred, ParseError> {
+        use crate::ty::{CmpOp, Pred};
+        let lhs = self.parse_operand()?;
+        let op = match self.peek().tok {
+            Tok::EqEq => Some(CmpOp::Eq),
+            Tok::Ne => Some(CmpOp::Ne),
+            Tok::Lt => Some(CmpOp::Lt),
+            Tok::Le => Some(CmpOp::Le),
+            Tok::Gt => Some(CmpOp::Gt),
+            Tok::Ge => Some(CmpOp::Ge),
+            _ => None,
+        };
+        match op {
+            Some(op) => {
+                self.advance();
+                let rhs = self.parse_operand()?;
+                Ok(Pred::Compare { op, lhs, rhs })
+            }
+            None => Ok(Pred::Truthy(lhs)),
+        }
+    }
+
+    fn parse_operand(&mut self) -> Result<crate::ty::Operand, ParseError> {
+        use crate::ty::Operand;
+        match self.peek().tok.clone() {
+            Tok::LParen => {
+                self.advance();
+                let p = self.parse_pred()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Operand::Pred(Box::new(p)))
+            }
+            Tok::Bareword(b) if b == "len" && self.next_is(&Tok::LParen) => {
+                self.advance(); // len
+                self.expect(&Tok::LParen)?;
+                let path = self.parse_path()?;
+                self.expect(&Tok::RParen)?;
+                Ok(Operand::Len(path))
+            }
+            Tok::Bareword(_) => Ok(Operand::Path(self.parse_path()?)),
+            Tok::Int(n) => {
+                self.advance();
+                Ok(Operand::Int(n))
+            }
+            Tok::Decimal(d) => {
+                self.advance();
+                Ok(Operand::Decimal(d))
+            }
+            Tok::Str(s) => {
+                self.advance();
+                Ok(Operand::Str(s))
+            }
+            Tok::Bool(b) => {
+                self.advance();
+                Ok(Operand::Bool(b))
+            }
+            other => Err(self.error(format!("expected a predicate operand, found {other:?}"))),
+        }
+    }
+
+    fn parse_path(&mut self) -> Result<Vec<String>, ParseError> {
+        let mut segs = Vec::new();
+        loop {
+            match self.peek().tok.clone() {
+                Tok::Bareword(n) => {
+                    self.advance();
+                    segs.push(n);
+                }
+                other => return Err(self.error(format!("expected a field name, found {other:?}"))),
+            }
+            if self.check(&Tok::Dot) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(segs)
     }
 
     /// Fold a refinement (after `&`) into `ty`. Enforces refinement-atom
@@ -813,6 +949,21 @@ mod tests {
     }
 
     #[test]
+    fn require_clause_parses() {
+        use crate::ty::Type;
+        let d = parse_document(
+            "type C = { a: int, b: int, require: a <= b @message(\"m\") }\nschema C\n",
+        )
+        .unwrap();
+        let Type::Record { requires, fields } = &d.typedefs[0].ty else {
+            panic!()
+        };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(requires.len(), 1);
+        assert_eq!(requires[0].message.as_deref(), Some("m"));
+    }
+
+    #[test]
     fn annotations_parse_on_typedef_and_field() {
         use crate::ty::Type;
         let d = parse_document(
@@ -826,7 +977,7 @@ mod tests {
             Some("m")
         );
         let r = d.typedefs.iter().find(|t| t.name == "R").unwrap();
-        let Type::Record { fields } = &r.ty else {
+        let Type::Record { fields, .. } = &r.ty else {
             panic!()
         };
         assert_eq!(

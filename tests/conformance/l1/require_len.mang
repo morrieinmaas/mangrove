@@ -1,0 +1,4 @@
+type Listen = { tls: bool, certs: [ str ], require: tls == false || len(certs) >= 1 }
+schema Listen
+tls: true
+certs: [ ]

@@ -1,6 +1,7 @@
 //! L1 semantics: resolve named types and validate values against types.
 
 pub mod env;
+pub mod predicate;
 pub mod resolve;
 pub mod validate;
 

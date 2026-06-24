@@ -33,6 +33,8 @@ pub enum Type {
     // composites
     Record {
         fields: Vec<FieldDef>,
+        /// Cross-field predicates (§4.7), evaluated against concrete values.
+        requires: Vec<Require>,
     },
     Map(Box<Type>),
     List(Box<Type>),
@@ -68,6 +70,53 @@ pub struct FieldDef {
 pub struct Annotation {
     pub name: String,
     pub arg: Option<String>,
+}
+
+/// A cross-field constraint (§4.7): a total predicate over the record's fields,
+/// with an optional `@message`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Require {
+    pub pred: Pred,
+    pub message: Option<String>,
+}
+
+/// The `require` predicate sublanguage (total, decidable; §4.7).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pred {
+    Or(Box<Pred>, Box<Pred>),
+    And(Box<Pred>, Box<Pred>),
+    Not(Box<Pred>),
+    Compare {
+        op: CmpOp,
+        lhs: Operand,
+        rhs: Operand,
+    },
+    /// A bare operand used as a boolean (e.g. a `bool` field, or `(pred)`).
+    Truthy(Operand),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Operand {
+    /// A dotted field path into the record in scope, e.g. `cpu.limit`.
+    Path(Vec<String>),
+    Int(BigInt),
+    Decimal(BigDecimal),
+    Str(String),
+    Bool(bool),
+    /// `len(path)` — element/char count of a list/map/string.
+    Len(Vec<String>),
+    /// A parenthesized sub-predicate used as a value.
+    Pred(Box<Pred>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 impl Annotation {
@@ -135,7 +184,7 @@ mod tests {
 
     #[test]
     fn record_with_optional() {
-        let Type::Record { fields } = pt("{ host: str, port: int, tls?: bool }") else {
+        let Type::Record { fields, .. } = pt("{ host: str, port: int, tls?: bool }") else {
             panic!()
         };
         assert_eq!(fields.len(), 3);
@@ -145,13 +194,19 @@ mod tests {
 
     #[test]
     fn empty_record() {
-        assert_eq!(pt("{}"), Type::Record { fields: vec![] });
+        assert_eq!(
+            pt("{}"),
+            Type::Record {
+                fields: vec![],
+                requires: vec![]
+            }
+        );
     }
 
     #[test]
     fn field_defaults_parse() {
         use mangrove_core::Value;
-        let Type::Record { fields } = pt("{ ns: str | *\"d\", n: int | *1, f?: bool }") else {
+        let Type::Record { fields, .. } = pt("{ ns: str | *\"d\", n: int | *1, f?: bool }") else {
             panic!()
         };
         let ns = fields.iter().find(|f| f.name == "ns").unwrap();
@@ -165,7 +220,7 @@ mod tests {
 
     #[test]
     fn real_union_field_not_confused_with_default() {
-        let Type::Record { fields } = pt("{ a: str | int }") else {
+        let Type::Record { fields, .. } = pt("{ a: str | int }") else {
             panic!()
         };
         assert!(matches!(fields[0].ty, Type::Union(_)));
