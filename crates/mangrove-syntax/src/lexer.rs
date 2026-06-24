@@ -29,6 +29,15 @@ pub enum Tok {
     Le,       // <=
     Gt,       // >
     Lt,       // <
+    // M2c tokens (defaults, annotations, require predicates)
+    Star,     // *
+    At,       // @
+    Dot,      // .
+    EqEq,     // ==
+    Ne,       // !=
+    Bang,     // !
+    AmpAmp,   // &&
+    PipePipe, // ||
     Int(BigInt),
     Decimal(BigDecimal),
     /// A unit literal: `(mantissa, suffix)`, e.g. `512Mi` → `(512, "Mi")`.
@@ -185,19 +194,53 @@ impl Lexer {
                 }
                 '&' => {
                     self.bump();
-                    Tok::Amp
+                    if self.peek() == Some('&') {
+                        self.bump();
+                        Tok::AmpAmp
+                    } else {
+                        Tok::Amp
+                    }
                 }
                 '|' => {
                     self.bump();
-                    Tok::Pipe
+                    if self.peek() == Some('|') {
+                        self.bump();
+                        Tok::PipePipe
+                    } else {
+                        Tok::Pipe
+                    }
                 }
                 '?' => {
                     self.bump();
                     Tok::Question
                 }
+                '*' => {
+                    self.bump();
+                    Tok::Star
+                }
+                '@' => {
+                    self.bump();
+                    Tok::At
+                }
+                '.' => {
+                    self.bump();
+                    Tok::Dot
+                }
+                '!' => {
+                    self.bump();
+                    if self.peek() == Some('=') {
+                        self.bump();
+                        Tok::Ne
+                    } else {
+                        Tok::Bang
+                    }
+                }
                 '=' => {
                     self.bump();
-                    if self.peek() == Some('~') {
+                    if self.peek() == Some('=') {
+                        self.bump();
+                        Tok::EqEq
+                    } else if self.peek() == Some('~') {
                         self.bump();
                         Tok::Match
                     } else {
@@ -755,5 +798,14 @@ mod tests {
         assert_eq!(toks("<="), vec![Tok::Le, Tok::Eof]);
         assert_eq!(toks("="), vec![Tok::Eq, Tok::Eof]);
         assert_eq!(toks(">"), vec![Tok::Gt, Tok::Eof]);
+    }
+
+    #[test]
+    fn m2c_tokens() {
+        use Tok::*;
+        assert_eq!(
+            toks("* @ . == != ! && ||"),
+            vec![Star, At, Dot, EqEq, Ne, Bang, AmpAmp, PipePipe, Eof]
+        );
     }
 }
