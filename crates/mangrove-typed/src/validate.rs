@@ -21,8 +21,14 @@ use std::collections::HashSet;
 /// assert!(!validate(&Value::Str("x".into()), &Type::Int, &env).is_empty());
 /// ```
 pub fn validate(value: &Value, ty: &Type, env: &TypeEnv) -> Vec<ValidationError> {
-    check(value, ty, "", env)
+    check(value, ty, "", env, 0)
 }
+
+/// Bound on validation recursion. Productive recursive types (M8) terminate on a
+/// finite value on their own (input nesting is parser-capped at 128, so real
+/// validation stays well under this); this is a runaway guard so no
+/// type-resolution bug can loop, set low enough to fire before the stack does.
+const MAX_DEPTH: usize = 512;
 
 /// Advisory `@deprecated` messages for every present field whose definition is
 /// `@deprecated` (§4.9). Never errors; used by `mangrove check` for warnings.
@@ -71,7 +77,19 @@ fn walk_deprecations(value: &Value, ty: &Type, path: &str, env: &TypeEnv, out: &
     }
 }
 
-fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationError> {
+fn check(
+    value: &Value,
+    ty: &Type,
+    path: &str,
+    env: &TypeEnv,
+    depth: usize,
+) -> Vec<ValidationError> {
+    if depth >= MAX_DEPTH {
+        return vec![
+            ValidationError::new(path, render(value), "a bounded-depth value")
+                .with_failed("type nesting too deep"),
+        ];
+    }
     match ty {
         Type::Int => kind(value, matches!(value, Value::Int(_)), path, "int"),
         Type::Decimal => kind(value, matches!(value, Value::Decimal(_)), path, "decimal"),
@@ -143,7 +161,7 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
             let known: HashSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
             for f in fields {
                 match m.get(&f.name) {
-                    Some(v) => errs.extend(check(v, &f.ty, &child(path, &f.name), env)),
+                    Some(v) => errs.extend(check(v, &f.ty, &child(path, &f.name), env, depth + 1)),
                     // a defaulted field absent is valid — but the default value
                     // itself must satisfy the field type (caught at validation).
                     None if f.default.is_some() => errs.extend(check(
@@ -151,6 +169,7 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
                         &f.ty,
                         &child(path, &f.name),
                         env,
+                        depth + 1,
                     )),
                     None if f.optional => {}
                     None => errs.push(
@@ -188,7 +207,7 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
             };
             let mut errs = Vec::new();
             for (k, v) in m {
-                errs.extend(check(v, v_ty, &child(path, k), env));
+                errs.extend(check(v, v_ty, &child(path, k), env, depth + 1));
             }
             errs
         }
@@ -199,7 +218,7 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
             };
             let mut errs = Vec::new();
             for (i, x) in xs.iter().enumerate() {
-                errs.extend(check(x, elem, &format!("{path}[{i}]"), env));
+                errs.extend(check(x, elem, &format!("{path}[{i}]"), env, depth + 1));
             }
             errs
         }
@@ -207,7 +226,7 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
         Type::Union(variants) => {
             if variants
                 .iter()
-                .any(|v| check(value, v, path, env).is_empty())
+                .any(|v| check(value, v, path, env, depth + 1).is_empty())
             {
                 vec![]
             } else {
@@ -217,7 +236,7 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
 
         Type::Named(n) => {
             if let Some(t) = env.resolve(n) {
-                let mut sub = check(value, t, path, env);
+                let mut sub = check(value, t, path, env, depth + 1);
                 // A named type's @message overrides the default message on its
                 // own failures (§4.9, §12).
                 if let Some(msg) = env.message(n) {
@@ -240,7 +259,7 @@ fn check(value: &Value, ty: &Type, path: &str, env: &TypeEnv) -> Vec<ValidationE
 
         // §4.6: a brand validates exactly as its structural `inner` — a bare
         // literal into a brand-typed slot is auto-constructed (no ceremony).
-        Type::Brand { inner, .. } => check(value, inner, path, env),
+        Type::Brand { inner, .. } => check(value, inner, path, env, depth + 1),
     }
 }
 
@@ -593,6 +612,77 @@ mod tests {
         let e = validate(&Value::Int(1.into()), &Type::Named("Nope".into()), &env());
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].failed.as_deref(), Some("unknown type"));
+    }
+
+    fn json_env() -> TypeEnv {
+        // Json = str | int | [Json] | { [str]: Json }
+        let json = Type::Union(vec![
+            Type::Str,
+            Type::Int,
+            Type::List(Box::new(Type::Named("Json".into()))),
+            Type::Map(Box::new(Type::Named("Json".into()))),
+        ]);
+        TypeEnv::build(
+            &[mangrove_syntax::TypeDef {
+                name: "Json".into(),
+                ty: json,
+                annotations: vec![],
+            }],
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn recursive_type_validates_nested_value() {
+        let env = json_env();
+        let j = Type::Named("Json".into());
+        // { a: [ 1, "x", { b: 2 } ] } — nested maps/lists/scalars all validate
+        let nested = map(&[(
+            "a",
+            Value::List(vec![
+                Value::Int(1.into()),
+                Value::Str("x".into()),
+                map(&[("b", Value::Int(2.into()))]),
+            ]),
+        )]);
+        assert!(validate(&nested, &j, &env).is_empty());
+        // bool is not a Json variant here → rejected (no coercion)
+        assert!(!validate(&Value::Bool(true), &j, &env).is_empty());
+    }
+
+    #[test]
+    fn validation_depth_is_bounded_not_overflowing() {
+        // `type L = [L]` against a value nested far past the guard returns a clean
+        // error rather than recursing unboundedly. Run on a generous stack (the
+        // guard at MAX_DEPTH is sized for the 8 MB main thread, not the 2 MB
+        // default test thread).
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let env = TypeEnv::build(
+                    &[mangrove_syntax::TypeDef {
+                        name: "L".into(),
+                        ty: Type::List(Box::new(Type::Named("L".into()))),
+                        annotations: vec![],
+                    }],
+                    &[],
+                )
+                .unwrap();
+                let mut v = Value::List(vec![]);
+                for _ in 0..1200 {
+                    v = Value::List(vec![v]);
+                }
+                let e = validate(&v, &Type::Named("L".into()), &env);
+                assert!(
+                    e.iter()
+                        .any(|x| x.failed.as_deref() == Some("type nesting too deep")),
+                    "expected a depth-guard error"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

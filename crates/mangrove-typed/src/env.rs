@@ -1,6 +1,10 @@
 //! The type environment: named `type` definitions resolved for validation.
-//! Building one rejects duplicate names, unknown references, and any recursive
-//! (`Named`) cycle — recursion is forbidden by the totality axiom (§2.6).
+//! Building one rejects duplicate names, unknown references, and *non-productive*
+//! recursive cycles (M8/D51) — a cycle reachable without crossing a
+//! value-consuming constructor (a union/brand/alias chain like `T = T`), which
+//! would loop with no value to shrink. *Productive* recursion (guarded by a
+//! record/list/map, e.g. an arbitrary-JSON union) is allowed; it terminates on a
+//! finite value. Recursion stays forbidden only for `fn`/evaluation (§6.2).
 
 use bigdecimal::BigDecimal;
 use mangrove_syntax::{Annotation, FieldDef, Type, TypeDef, UnitDef};
@@ -76,15 +80,25 @@ impl TypeEnv {
         // acyclic chain `A0 -> A1 -> … -> An` cannot overflow the call stack.
         let mut adj: HashMap<String, Vec<String>> = HashMap::new();
         for (name, ty) in &types {
-            let mut refs = Vec::new();
-            collect_refs(ty, &mut refs);
-            for r in &refs {
+            // Every referenced name must resolve (use ALL refs).
+            let mut all_refs = Vec::new();
+            collect_refs(ty, &mut all_refs);
+            for r in &all_refs {
                 if !types.contains_key(r) && !units.contains_key(r) {
                     return Err(format!("unknown type: {r}"));
                 }
             }
-            let type_refs: Vec<String> =
-                refs.into_iter().filter(|r| types.contains_key(r)).collect();
+            // Only *unguarded* references (not under a record field / list / map)
+            // can form a non-productive cycle. Productive recursion — a cycle that
+            // passes through a value-consuming constructor — is allowed and
+            // terminates on a finite value (M8/D51); so the cycle graph uses only
+            // unguarded references.
+            let mut unguarded = Vec::new();
+            collect_unguarded_refs(ty, &mut unguarded);
+            let type_refs: Vec<String> = unguarded
+                .into_iter()
+                .filter(|r| types.contains_key(r))
+                .collect();
             adj.insert(name.clone(), type_refs);
         }
         detect_cycle(&adj)?;
@@ -167,6 +181,26 @@ fn qualify(ty: &Type, alias: &str, local: &HashSet<&str>) -> Type {
     }
 }
 
+/// Collect only the *unguarded* `Named` references — those reachable without
+/// crossing a value-consuming constructor (record field, list element, map
+/// value). Union variants, brand inners, and direct aliases are unguarded; a
+/// cycle among these is non-productive (would loop with no value consumed) and is
+/// rejected, while recursion through a record/list/map is productive (M8/D51).
+fn collect_unguarded_refs(ty: &Type, out: &mut Vec<String>) {
+    match ty {
+        Type::Named(n) => out.push(n.clone()),
+        Type::Union(variants) => {
+            for v in variants {
+                collect_unguarded_refs(v, out);
+            }
+        }
+        Type::Brand { inner, .. } => collect_unguarded_refs(inner, out),
+        // Record / Map / List are guarded — do not descend (recursion through
+        // them is productive and allowed).
+        _ => {}
+    }
+}
+
 /// Collect the names of every `Named` reference inside `ty`. Recurses over type
 /// *structure* only (bounded by the parser's nesting cap), never across the
 /// name-reference graph — that traversal is iterative (see `detect_cycle`).
@@ -212,7 +246,10 @@ fn detect_cycle(adj: &HashMap<String, Vec<String>>) -> Result<(), String> {
                 let child = children[idx].as_str();
                 match color.get(child) {
                     Some(Color::Gray) => {
-                        return Err(format!("recursive type definition involving {child}"));
+                        return Err(format!(
+                            "non-productive recursive type involving `{child}` \
+                             (recursion must be guarded by a record, list, or map)"
+                        ));
                     }
                     Some(Color::Black) => {}
                     None => {
@@ -287,10 +324,74 @@ mod tests {
     }
 
     #[test]
-    fn cycle_through_container_errors() {
+    fn productive_cycle_through_container_is_allowed() {
+        // `type A = [A]` recurses through a list (a value-consuming constructor),
+        // so it terminates on a finite value — productive, allowed (M8/D51).
         assert!(
             TypeEnv::build(
                 &[td("A", Type::List(Box::new(Type::Named("A".into()))))],
+                &[]
+            )
+            .is_ok()
+        );
+    }
+
+    fn field(name: &str, ty: Type) -> mangrove_syntax::FieldDef {
+        mangrove_syntax::FieldDef {
+            name: name.into(),
+            optional: false,
+            ty,
+            default: None,
+            annotations: vec![],
+        }
+    }
+
+    #[test]
+    fn productive_recursion_is_allowed() {
+        // a recursive `Json` union (cycle through list + map) — the arbitrary-JSON type
+        let json = Type::Union(vec![
+            Type::Str,
+            Type::Int,
+            Type::List(Box::new(Type::Named("Json".into()))),
+            Type::Map(Box::new(Type::Named("Json".into()))),
+        ]);
+        assert!(TypeEnv::build(&[td("Json", json)], &[]).is_ok());
+        // a recursive tree (cycle through a record field's list)
+        let tree = Type::Record {
+            fields: vec![
+                field("v", Type::Int),
+                field("kids", Type::List(Box::new(Type::Named("Tree".into())))),
+            ],
+            requires: vec![],
+        };
+        assert!(TypeEnv::build(&[td("Tree", tree)], &[]).is_ok());
+    }
+
+    #[test]
+    fn non_productive_recursion_is_rejected() {
+        // direct alias
+        assert!(TypeEnv::build(&[td("T", Type::Named("T".into()))], &[]).is_err());
+        // through a union only (no value consumed)
+        assert!(
+            TypeEnv::build(
+                &[td(
+                    "T",
+                    Type::Union(vec![Type::Int, Type::Named("T".into())])
+                )],
+                &[]
+            )
+            .is_err()
+        );
+        // through a brand only
+        assert!(
+            TypeEnv::build(
+                &[td(
+                    "T",
+                    Type::Brand {
+                        name: "T".into(),
+                        inner: Box::new(Type::Named("T".into())),
+                    },
+                )],
                 &[]
             )
             .is_err()

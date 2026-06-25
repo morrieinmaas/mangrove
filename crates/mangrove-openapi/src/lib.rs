@@ -2,15 +2,16 @@
 //! `components.schemas`) spec — e.g. the Kubernetes API, so manifests can be
 //! typed against the real API.
 //!
-//! Honest limits (Mangrove is deliberately strict):
-//! - **No top type.** A free-form object (`additionalProperties: true`, or an
-//!   object with neither `properties` nor a typed `additionalProperties`) cannot
-//!   be represented precisely; it is modeled as the loose `OpaqueObject` (a
-//!   `{ [str]: str }`) and a warning is emitted. Such fields will not accept
-//!   arbitrary nested JSON.
-//! - **No recursion.** A definition that (transitively) refers to itself can't
-//!   exist under Mangrove's totality axiom; references that close a cycle are
-//!   replaced with `OpaqueObject` and a warning is emitted.
+//! Notes (Mangrove is deliberately strict):
+//! - **Free-form objects** (`additionalProperties: true`, or an object with no
+//!   `properties` and no typed `additionalProperties`) map to a recursive
+//!   `Json = str | int | decimal | bool | [Json] | { [str]: Json }` (M8). This
+//!   accepts arbitrary nested JSON — except `null`, which Mangrove has no value
+//!   for (§2.4), so a free-form value containing JSON null is rejected.
+//! - **Recursive schemas** (e.g. CRD `JSONSchemaProps`) are emitted faithfully
+//!   when the recursion is *productive* (guarded by a record/list/map — which it
+//!   essentially always is in OpenAPI, via `properties`/`items`). A rare
+//!   *non-productive* cycle is modeled as `Json` with a warning.
 //!
 //! Target a `root` to generate just the closure you need (recommended).
 
@@ -54,8 +55,8 @@ pub fn generate(spec_json: &str, root: Option<&str>) -> Result<Generated, String
         let mut ns: Vec<&str> = in_cycle.iter().copied().collect();
         ns.sort();
         warnings.push(format!(
-            "{} recursive definition(s) (not representable under Mangrove's no-recursion axiom); \
-             cycle-closing references modeled as `OpaqueObject`: {}",
+            "{} non-productively-recursive definition(s) (recursion not guarded by a \
+             record/list/map, so not representable); modeled as `Json`: {}",
             in_cycle.len(),
             ns.join(", ")
         ));
@@ -75,7 +76,7 @@ pub fn generate(spec_json: &str, root: Option<&str>) -> Result<Generated, String
     // `type X = …` (which `TypeEnv` would reject as a duplicate). `$ref`s resolve
     // through this same map, so references stay consistent.
     let mut type_names: BTreeMap<String, String> = BTreeMap::new();
-    let mut used: BTreeSet<String> = ["OpaqueObject".to_string()].into_iter().collect();
+    let mut used: BTreeSet<String> = ["Json".to_string()].into_iter().collect();
     for orig in &present {
         let base = sanitize(orig);
         let mut n = base.clone();
@@ -104,10 +105,10 @@ pub fn generate(spec_json: &str, root: Option<&str>) -> Result<Generated, String
 
     let mut types = String::new();
     if used_opaque {
-        types.push_str(
-            "# free-form / recursive values modeled loosely — see warnings\n\
-             type OpaqueObject = { [str]: str }\n",
-        );
+        // Arbitrary JSON, as a productive recursive type (M8). No `null` member —
+        // Mangrove has no null (§2.4), so a free-form value containing JSON null
+        // is rejected, consistent with the language.
+        types.push_str("type Json = str | int | decimal | bool | [ Json ] | { [str]: Json }\n");
     }
     types.push_str(&body);
     Ok(Generated { types, warnings })
@@ -169,18 +170,39 @@ fn reachable(root: &str, defs: &Map<String, J>) -> Vec<String> {
     seen.into_iter().collect()
 }
 
-/// The subset of `selected` definitions that participate in a `$ref` cycle.
+/// The *unguarded* references of a schema — those reachable without descending
+/// into a value-consuming position (`properties`/`items`/`additionalProperties`).
+/// `$ref` directly, or under `allOf`/`oneOf`/`anyOf`, is unguarded; mirrors
+/// Mangrove's productivity rule (M8) so only non-productive cycles are broken.
+fn collect_unguarded_refs(schema: &J, out: &mut Vec<String>) {
+    if let J::Object(m) = schema {
+        if let Some(r) = m.get("$ref").and_then(J::as_str) {
+            out.push(ref_name(r).to_string());
+        }
+        for key in ["allOf", "oneOf", "anyOf"] {
+            if let Some(J::Array(arr)) = m.get(key) {
+                for s in arr {
+                    collect_unguarded_refs(s, out);
+                }
+            }
+        }
+        // properties / items / additionalProperties are guarded — not descended.
+    }
+}
+
+/// The subset of `selected` definitions in a *non-productive* `$ref` cycle (one
+/// reachable without crossing a record/list/map). Productive recursion is
+/// representable in Mangrove (M8) and emitted faithfully; only these break.
 fn cycle_defs<'a>(selected: &BTreeSet<&'a str>, defs: &Map<String, J>) -> BTreeSet<&'a str> {
     let mut out = BTreeSet::new();
     for &name in selected {
-        // A node is in a cycle iff it can reach itself.
+        // A node is non-productively recursive iff it reaches itself via unguarded refs.
         let mut refs = Vec::new();
         if let Some(s) = defs.get(name) {
-            collect_refs(s, &mut refs);
+            collect_unguarded_refs(s, &mut refs);
         }
-        let start: Vec<String> = refs;
         let mut seen = BTreeSet::new();
-        let mut queue: VecDeque<String> = start.into_iter().collect();
+        let mut queue: VecDeque<String> = refs.into_iter().collect();
         while let Some(n) = queue.pop_front() {
             if n == name {
                 out.insert(name);
@@ -191,7 +213,7 @@ fn cycle_defs<'a>(selected: &BTreeSet<&'a str>, defs: &Map<String, J>) -> BTreeS
             }
             if let Some(s) = defs.get(&n) {
                 let mut r = Vec::new();
-                collect_refs(s, &mut r);
+                collect_unguarded_refs(s, &mut r);
                 queue.extend(r);
             }
         }
@@ -258,7 +280,7 @@ fn render(
 ) -> String {
     let opaque = |used: &mut bool| {
         *used = true;
-        "OpaqueObject".to_string()
+        "Json".to_string()
     };
 
     if let Some(r) = schema.get("$ref").and_then(J::as_str) {
@@ -378,9 +400,9 @@ fn render_record(
         fields.push(format!("{}{opt}: {ty}", field_key(pname)));
     }
     if fields.is_empty() {
-        // an object typed only by `properties: {}` — treat as opaque
+        // an object typed only by `properties: {}` — arbitrary JSON
         *used_opaque = true;
-        return "OpaqueObject".to_string();
+        return "Json".to_string();
     }
     format!("{{ {} }}", fields.join(", "))
 }
@@ -439,7 +461,9 @@ mod tests {
     }
 
     #[test]
-    fn recursion_is_broken_to_opaque_with_warning() {
+    fn productive_recursive_schema_emitted_faithfully() {
+        // `next` is under `properties` (guarded), so the recursion is productive —
+        // emitted faithfully, no warning, no `Json` fallback (M8).
         let spec = r##"{ "definitions": {
           "Node": { "type": "object", "required": ["v"], "properties": {
             "v": { "type": "integer" },
@@ -447,10 +471,20 @@ mod tests {
           }}
         }}"##;
         let g = generate(spec, Some("Node")).unwrap();
-        assert_eq!(g.warnings.len(), 1);
-        assert!(g.warnings[0].contains("recursive"));
-        assert!(g.types.contains("OpaqueObject")); // the self-ref was broken
-        assert!(g.types.contains("type Node ="));
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+        assert!(g.types.contains("next?: Node"), "{}", g.types);
+        assert!(!g.types.contains("Json"), "{}", g.types);
+    }
+
+    #[test]
+    fn non_productive_recursion_uses_json_with_warning() {
+        // A top-level `allOf` self-reference is unguarded → non-productive → `Json`.
+        let spec = r##"{ "definitions": {
+          "T": { "allOf": [ { "$ref": "#/definitions/T" } ] }
+        }}"##;
+        let g = generate(spec, Some("T")).unwrap();
+        assert_eq!(g.warnings.len(), 1, "{:?}", g.warnings);
+        assert!(g.types.contains("type T = Json"), "{}", g.types);
     }
 
     #[test]
@@ -489,7 +523,7 @@ mod tests {
         let spec = r##"{ "definitions": { "A": { "type": "object", "required": ["b"],
           "properties": { "b": { "$ref": "#/definitions/Missing" } } } } }"##;
         let g = generate(spec, Some("A")).unwrap();
-        assert!(g.types.contains("b: OpaqueObject"), "{}", g.types);
+        assert!(g.types.contains("b: Json"), "{}", g.types);
         assert!(!g.types.contains("type Missing"));
     }
 

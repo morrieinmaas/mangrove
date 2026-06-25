@@ -62,7 +62,37 @@ fn generated_types_reject_a_bad_manifest() {
 }
 
 #[test]
-fn recursive_definition_warns_but_succeeds() {
+fn free_form_object_becomes_json_and_validates_nested() {
+    // `additionalProperties: true` → a `Json` field that accepts arbitrary nesting (M8).
+    let dir = std::env::temp_dir().join(format!("openapi_ff_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = dir.join("ff.json");
+    std::fs::write(
+        &spec,
+        r##"{ "definitions": { "M": { "type": "object", "required": ["data"],
+          "properties": { "data": { "type": "object", "additionalProperties": true } } } } }"##,
+    )
+    .unwrap();
+    let out = mangrove(&["gen-openapi", spec.to_str().unwrap(), "--root", "M"]);
+    assert!(out.status.success());
+    let mut doc = String::from_utf8(out.stdout).unwrap();
+    assert!(doc.contains("data: Json"), "{doc}");
+    assert!(doc.contains("type Json ="), "{doc}");
+    doc.push_str("schema M\ndata: { a: 1, b: [ true, \"x\", { c: 2 } ] }\n");
+    let p = dir.join("m.mang");
+    std::fs::write(&p, doc).unwrap();
+    let chk = mangrove(&["check", p.to_str().unwrap()]);
+    assert!(
+        chk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&chk.stderr)
+    );
+}
+
+#[test]
+fn recursive_definition_emitted_faithfully_and_validates_nesting() {
+    // `next` under `properties` is *productive* recursion (M8) — emitted faithfully
+    // (no warning); a nested value validates against the recursive type.
     let dir = std::env::temp_dir().join(format!("openapi_rec_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let spec = dir.join("rec.json");
@@ -75,14 +105,16 @@ fn recursive_definition_warns_but_succeeds() {
     let out = mangrove(&["gen-openapi", spec.to_str().unwrap(), "--root", "Node"]);
     assert!(out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("recursive"),
-        "expected a recursion warning: {stderr}"
-    );
-    // the emitted types are acyclic (the self-ref was opaque'd) and parse
+    assert!(stderr.is_empty(), "expected no warning, got: {stderr}");
     let mut doc = String::from_utf8(out.stdout).unwrap();
-    doc.push_str("schema Node\nv: 1\nnext: {}\n");
+    // a 3-deep recursive value validates against the recursive type
+    doc.push_str("schema Node\nv: 1\nnext: { v: 2, next: { v: 3 } }\n");
     let p = dir.join("node.mang");
     std::fs::write(&p, doc).unwrap();
-    assert!(mangrove(&["check", p.to_str().unwrap()]).status.success());
+    let chk = mangrove(&["check", p.to_str().unwrap()]);
+    assert!(
+        chk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&chk.stderr)
+    );
 }

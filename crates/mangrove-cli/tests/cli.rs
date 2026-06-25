@@ -92,6 +92,38 @@ fn zero_arg_module_call_resolves() {
 }
 
 #[test]
+fn recursive_schema_validates_a_tree() {
+    // M8: a productive recursive type (`children: [Tree]`) checks a nested tree.
+    let good = run_check(
+        "m8_tree_ok.mang",
+        "type Tree = { value: int, children: [ Tree ] }\nschema Tree\n\
+         value: 1\nchildren: [ { value: 2, children: [] }, { value: 3, children: [ { value: 4, children: [] } ] } ]\n",
+    );
+    assert!(
+        good.status.success(),
+        "{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    // a wrong leaf type is still caught through the recursion
+    let bad = run_check(
+        "m8_tree_bad.mang",
+        "type Tree = { value: int, children: [ Tree ] }\nschema Tree\n\
+         value: 1\nchildren: [ { value: \"x\", children: [] } ]\n",
+    );
+    assert_eq!(bad.status.code(), Some(1));
+}
+
+#[test]
+fn non_productive_recursive_type_is_rejected() {
+    // `type T = T | int` recurses with no value consumed → schema error (M8/D51).
+    let out = run_check(
+        "m8_nonproductive.mang",
+        "type T = T | int\nschema T\nx: 1\n",
+    );
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn check_valid_document_exits_0() {
     let out = run_check(
         "m2a_ok.mang",
