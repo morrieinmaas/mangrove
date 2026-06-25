@@ -686,6 +686,73 @@ impl Parser {
         Ok((key, value))
     }
 
+    /// `match <name> { <pat>: <value>, … }` (§6.1). A pattern is a literal value
+    /// (a bareword is a string literal) or `_` (wildcard → `None`).
+    fn parse_match(&mut self, depth: usize) -> Result<Value, ParseError> {
+        if depth >= MAX_DEPTH {
+            return Err(self.error("nesting too deep".into()));
+        }
+        self.advance(); // 'match'
+        let scrutinee = match self.peek().tok.clone() {
+            Tok::Bareword(n) => {
+                self.advance();
+                Value::Ref(n)
+            }
+            other => {
+                return Err(self.error(format!("expected a name to match on, found {other:?}")));
+            }
+        };
+        self.expect(&Tok::LBrace)?;
+        let mut arms: Vec<(Option<Value>, Value)> = Vec::new();
+        self.skip_seps();
+        while !self.check(&Tok::RBrace) {
+            if self.at_eof() {
+                return Err(self.error("unterminated `match`".into()));
+            }
+            let pat = match self.peek().tok.clone() {
+                Tok::Bareword(b) if b == "_" => {
+                    self.advance();
+                    None
+                }
+                Tok::Bareword(b) => {
+                    self.advance();
+                    Some(Value::Str(b))
+                }
+                Tok::Str(s) => {
+                    self.advance();
+                    Some(Value::Str(s))
+                }
+                Tok::Int(n) => {
+                    self.advance();
+                    Some(Value::Int(n))
+                }
+                Tok::Bool(x) => {
+                    self.advance();
+                    Some(Value::Bool(x))
+                }
+                other => {
+                    return Err(self.error(format!("expected a match pattern, found {other:?}")));
+                }
+            };
+            self.expect(&Tok::Colon)?;
+            let val = self.parse_value(depth + 1)?;
+            arms.push((pat, val));
+            let had_sep = self.at_sep();
+            self.skip_seps();
+            if !had_sep && !self.check(&Tok::RBrace) {
+                return Err(self.error("expected ',' or newline between match arms".into()));
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        if arms.is_empty() {
+            return Err(self.error("`match` needs at least one arm".into()));
+        }
+        Ok(Value::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+        })
+    }
+
     fn parse_value(&mut self, depth: usize) -> Result<Value, ParseError> {
         match self.peek().tok.clone() {
             Tok::Int(n) => {
@@ -717,6 +784,8 @@ impl Parser {
                 self.advance();
                 Ok(Value::Unset)
             }
+            // `match scrutinee { pat: val, … }` (§6.1), reduced by eval (M4c).
+            Tok::Bareword(b) if b == "match" => self.parse_match(depth),
             // Any other bare identifier in value position is an L3 reference to a
             // param or sibling binding (§6.1), reduced by the eval stage (M4a).
             Tok::Bareword(name) => {

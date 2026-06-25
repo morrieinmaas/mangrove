@@ -60,6 +60,10 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
         Value::Interp(_) => {
             panic!("unresolved interpolation reached the CBOR encoder — eval first")
         }
+        // ponytail: guard — a `match` is reduced to the chosen arm by eval.
+        Value::Match { .. } => {
+            panic!("unresolved `match` reached the CBOR encoder — eval first")
+        }
     }
 }
 

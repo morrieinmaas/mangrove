@@ -33,6 +33,13 @@ pub enum Value {
     /// literal text and `${name}` holes. Reduced to a `Str` by the eval stage
     /// (M4b); a transient marker that must never reach the CBOR encoder.
     Interp(Vec<StrPart>),
+    /// An L3 `match` expression (§6.1): a scrutinee and ordered arms. Each arm's
+    /// pattern is a literal value, or `None` for the `_` wildcard. Reduced to the
+    /// chosen arm's value by the eval stage (M4c); a transient marker.
+    Match {
+        scrutinee: Box<Value>,
+        arms: Vec<(Option<Value>, Value)>,
+    },
 }
 
 /// One piece of an interpolated string (§6.3): literal text or a `$name`/`${name}`

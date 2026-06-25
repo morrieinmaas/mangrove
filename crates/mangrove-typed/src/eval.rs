@@ -8,8 +8,17 @@ use crate::env::TypeEnv;
 use crate::validate::validate;
 use mangrove_core::error::ValidationError;
 use mangrove_core::{StrPart, Value};
-use mangrove_syntax::Param;
+use mangrove_syntax::{Param, Type};
 use std::collections::BTreeMap;
+
+/// Eval context: the value scope (params + sibling bindings), the params' declared
+/// types (for `match` exhaustiveness, D37), and the type environment (to resolve
+/// a named param type to its union).
+struct Ctx<'a> {
+    scope: BTreeMap<String, Value>,
+    ptypes: BTreeMap<String, Type>,
+    types: &'a TypeEnv,
+}
 
 /// Bound on reference-chain depth — a ref resolving to a ref … guards against a
 /// cyclic binding (`a: b`, `b: a`) overflowing the stack, like every other
@@ -33,9 +42,11 @@ pub fn eval(
     types: &TypeEnv,
 ) -> Result<Value, Box<ValidationError>> {
     let mut scope: BTreeMap<String, Value> = BTreeMap::new();
+    let mut ptypes: BTreeMap<String, Type> = BTreeMap::new();
 
     // Params first (they take precedence over sibling bindings, D36).
     for p in params {
+        ptypes.insert(p.name.clone(), p.ty.clone());
         match &p.default {
             // Optional: bind the default. Validate a literal default against its
             // declared type so `params { n: int = "x" }` fails at the param, not
@@ -67,28 +78,23 @@ pub fn eval(
         }
     }
 
-    reduce(body, &scope, 0)
+    let cx = Ctx {
+        scope,
+        ptypes,
+        types,
+    };
+    reduce(body, &cx, 0)
 }
 
-fn reduce(
-    v: &Value,
-    scope: &BTreeMap<String, Value>,
-    depth: usize,
-) -> Result<Value, Box<ValidationError>> {
+fn reduce(v: &Value, cx: &Ctx, depth: usize) -> Result<Value, Box<ValidationError>> {
     if depth >= MAX_DEPTH {
         return Err(err("", "a reference cycle", "an acyclic reference"));
     }
     match v {
         Value::Ref(name) => {
-            let target = scope.get(name).ok_or_else(|| {
-                err(
-                    "",
-                    format!("reference `{name}`"),
-                    "a param or sibling binding",
-                )
-            })?;
+            let target = lookup(cx, name)?;
             // Resolve transitively so a binding that is itself a reference works.
-            reduce(target, scope, depth + 1)
+            reduce(target, cx, depth + 1)
         }
         Value::Interp(parts) => {
             let mut s = String::new();
@@ -96,33 +102,110 @@ fn reduce(
                 match part {
                     StrPart::Lit(t) => s.push_str(t),
                     StrPart::Ref(name) => {
-                        let target = scope.get(name).ok_or_else(|| {
-                            err(
-                                "",
-                                format!("reference `{name}`"),
-                                "a param or sibling binding",
-                            )
-                        })?;
-                        let v = reduce(target, scope, depth + 1)?;
+                        let target = lookup(cx, name)?;
+                        let v = reduce(target, cx, depth + 1)?;
                         s.push_str(&render_scalar(&v)?);
                     }
                 }
             }
             Ok(Value::Str(s))
         }
+        Value::Match { scrutinee, arms } => {
+            check_match_exhaustive(scrutinee, arms, cx)?;
+            let sval = reduce(scrutinee, cx, depth + 1)?;
+            for (pat, val) in arms {
+                let matched = match pat {
+                    None => true,              // `_` wildcard
+                    Some(lit) => *lit == sval, // literal pattern
+                };
+                if matched {
+                    return reduce(val, cx, depth + 1);
+                }
+            }
+            Err(err(
+                "",
+                format!(
+                    "match scrutinee {}",
+                    render_scalar(&sval).unwrap_or_else(|_| "value".into())
+                ),
+                "a value covered by a match arm",
+            ))
+        }
         Value::List(xs) => Ok(Value::List(
             xs.iter()
-                .map(|x| reduce(x, scope, depth + 1))
+                .map(|x| reduce(x, cx, depth + 1))
                 .collect::<Result<_, _>>()?,
         )),
         Value::Map(m) => {
             let mut out = BTreeMap::new();
             for (k, val) in m {
-                out.insert(k.clone(), reduce(val, scope, depth + 1)?);
+                out.insert(k.clone(), reduce(val, cx, depth + 1)?);
             }
             Ok(Value::Map(out))
         }
         other => Ok(other.clone()),
+    }
+}
+
+/// Look up a name in the value scope.
+fn lookup<'a>(cx: &'a Ctx, name: &str) -> Result<&'a Value, Box<ValidationError>> {
+    cx.scope.get(name).ok_or_else(|| {
+        err(
+            "",
+            format!("reference `{name}`"),
+            "a param or sibling binding",
+        )
+    })
+}
+
+/// A `match` is total (D37): exhaustive if it has a `_` arm, or if the scrutinee
+/// is a param whose type is a finite literal union that the arms fully cover.
+fn check_match_exhaustive(
+    scrutinee: &Value,
+    arms: &[(Option<Value>, Value)],
+    cx: &Ctx,
+) -> Result<(), Box<ValidationError>> {
+    if arms.iter().any(|(p, _)| p.is_none()) {
+        return Ok(()); // has a `_` wildcard
+    }
+    if let Value::Ref(name) = scrutinee
+        && let Some(ty) = cx.ptypes.get(name)
+        && let Some(members) = literal_union_members(ty, cx.types)
+    {
+        let covered: Vec<&Value> = arms.iter().filter_map(|(p, _)| p.as_ref()).collect();
+        let missing: Vec<&Value> = members.iter().filter(|m| !covered.contains(m)).collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        return Err(err(
+            "",
+            format!("a match missing {} arm(s)", missing.len()),
+            "an arm for every union member (or a `_` arm)",
+        ));
+    }
+    Err(err(
+        "",
+        "a non-exhaustive match",
+        "an exhaustive match (add a `_` arm)",
+    ))
+}
+
+/// The literal members of a finite literal union (resolving a named type), or
+/// `None` if `ty` is not such a union.
+fn literal_union_members(ty: &Type, env: &TypeEnv) -> Option<Vec<Value>> {
+    match ty {
+        Type::Named(n) => env.resolve(n).and_then(|t| literal_union_members(t, env)),
+        Type::Union(variants) => variants.iter().map(literal_value).collect(),
+        _ => None,
+    }
+}
+
+fn literal_value(ty: &Type) -> Option<Value> {
+    match ty {
+        Type::LitStr(s) => Some(Value::Str(s.clone())),
+        Type::LitInt(n) => Some(Value::Int(n.clone())),
+        Type::LitBool(b) => Some(Value::Bool(*b)),
+        _ => None,
     }
 }
 
@@ -147,8 +230,7 @@ fn render_scalar(v: &Value) -> Result<String, Box<ValidationError>> {
 /// can skip a default that needs reduction first).
 fn contains_ref(v: &Value) -> bool {
     match v {
-        Value::Ref(_) => true,
-        Value::Interp(_) => true,
+        Value::Ref(_) | Value::Interp(_) | Value::Match { .. } => true,
         Value::List(xs) => xs.iter().any(contains_ref),
         Value::Map(m) => m.values().any(contains_ref),
         _ => false,
@@ -254,6 +336,84 @@ mod tests {
         m.insert("a".into(), Value::List(vec![]));
         m.insert("s".into(), Value::Interp(vec![StrPart::Ref("a".into())]));
         assert!(eval(&Value::Map(m), &[], &types()).is_err());
+    }
+
+    fn matchv(scrutinee: &str, arms: Vec<(Option<Value>, Value)>) -> Value {
+        Value::Match {
+            scrutinee: Box::new(Value::Ref(scrutinee.into())),
+            arms,
+        }
+    }
+
+    #[test]
+    fn match_selects_arm_union_exhaustive_without_wildcard() {
+        let union = Type::Union(vec![
+            Type::LitStr("dev".into()),
+            Type::LitStr("staging".into()),
+            Type::LitStr("prod".into()),
+        ]);
+        let params = vec![Param {
+            name: "env".into(),
+            ty: union,
+            default: Some(Value::Str("prod".into())),
+        }];
+        let arms = vec![
+            (Some(Value::Str("dev".into())), int(1)),
+            (Some(Value::Str("staging".into())), int(2)),
+            (Some(Value::Str("prod".into())), int(6)),
+        ];
+        let mut m = BTreeMap::new();
+        m.insert("replicas".into(), matchv("env", arms));
+        let out = eval(&Value::Map(m), &params, &types()).unwrap();
+        let Value::Map(o) = out else { panic!() };
+        assert_eq!(o.get("replicas"), Some(&int(6)));
+    }
+
+    #[test]
+    fn wildcard_makes_match_exhaustive() {
+        let mut m = BTreeMap::new();
+        m.insert("x".into(), Value::Str("zzz".into()));
+        m.insert(
+            "y".into(),
+            matchv(
+                "x",
+                vec![(Some(Value::Str("a".into())), int(1)), (None, int(0))],
+            ),
+        );
+        let out = eval(&Value::Map(m), &[], &types()).unwrap();
+        let Value::Map(o) = out else { panic!() };
+        assert_eq!(o.get("y"), Some(&int(0))); // fell through to `_`
+    }
+
+    #[test]
+    fn non_exhaustive_match_without_wildcard_errors() {
+        // scrutinee is a sibling binding (no declared union) and there is no `_`.
+        let mut m = BTreeMap::new();
+        m.insert("x".into(), Value::Str("a".into()));
+        m.insert(
+            "y".into(),
+            matchv("x", vec![(Some(Value::Str("a".into())), int(1))]),
+        );
+        assert!(eval(&Value::Map(m), &[], &types()).is_err());
+    }
+
+    #[test]
+    fn match_missing_union_member_errors() {
+        let union = Type::Union(vec![
+            Type::LitStr("dev".into()),
+            Type::LitStr("prod".into()),
+        ]);
+        let params = vec![Param {
+            name: "env".into(),
+            ty: union,
+            default: Some(Value::Str("dev".into())),
+        }];
+        let mut m = BTreeMap::new();
+        m.insert(
+            "r".into(),
+            matchv("env", vec![(Some(Value::Str("dev".into())), int(1))]), // missing "prod"
+        );
+        assert!(eval(&Value::Map(m), &params, &types()).is_err());
     }
 
     #[test]

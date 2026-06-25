@@ -217,6 +217,43 @@ fn param_default_reference_hashes_like_literal() {
 }
 
 #[test]
+fn match_hashes_like_literal() {
+    // §6.1: replicas: match env { dev: 1, staging: 2, prod: 6 } with env="prod".
+    let schema = "type D = { replicas: int }\nschema D\n";
+    let templ = std::env::temp_dir().join("m4c_templ.mang");
+    let lit = std::env::temp_dir().join("m4c_lit.mang");
+    std::fs::write(
+        &templ,
+        format!(
+            "params {{ env: \"dev\" | \"staging\" | \"prod\" = \"prod\" }}\n{schema}\
+             replicas: match env {{ dev: 1, staging: 2, prod: 6 }}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(&lit, format!("{schema}replicas: 6\n")).unwrap();
+    let h = |p: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg("hash")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert_eq!(h(&templ), h(&lit));
+}
+
+#[test]
+fn nonexhaustive_match_fails_check() {
+    // No `_` and the scrutinee union isn't fully covered → eval error (D37).
+    let out = run_check(
+        "m4c_nonex.mang",
+        "params { env: \"dev\" | \"prod\" = \"dev\" }\ntype D = { r: int }\nschema D\nr: match env { dev: 1 }\n",
+    );
+    assert_eq!(out.status.code(), Some(1));
+}
+
+#[test]
 fn interpolation_hashes_like_literal() {
     // §6.3: "api:${v}" with v="1.0" evaluates to the same value as "api:1.0".
     let schema = "type D = { image: str }\nschema D\n";
