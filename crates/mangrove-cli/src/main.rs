@@ -86,7 +86,8 @@ fn cmd_update(path: &str) -> ExitCode {
 fn evaluate(path: &str) -> Result<mangrove_core::Value, String> {
     // compose errors already carry the offending file's path — don't double-prefix.
     let doc = mangrove_compose::compose(std::path::Path::new(path))?;
-    let env = mangrove_typed::TypeEnv::build(&doc.typedefs, &doc.unitdefs)
+    let imports = type_imports(&doc.modules);
+    let env = mangrove_typed::TypeEnv::build_with_imports(&doc.typedefs, &doc.unitdefs, &imports)
         .map_err(|m| format!("{path}: schema error: {m}"))?;
     // L3 eval: reduce params/references/calls to plain values (D35).
     let modules = build_modules(&doc.modules).map_err(|e| format!("{path}: {e}"))?;
@@ -226,6 +227,21 @@ fn effective_schema(
     }
 }
 
+/// The `use`d modules' type/unit definitions, for cross-file type imports (M6a):
+/// each becomes `alias.Name` in the importer's `TypeEnv`.
+fn type_imports(
+    modules: &std::collections::BTreeMap<String, mangrove_compose::Composed>,
+) -> Vec<(
+    &str,
+    &[mangrove_syntax::TypeDef],
+    &[mangrove_syntax::UnitDef],
+)> {
+    modules
+        .iter()
+        .map(|(a, c)| (a.as_str(), c.typedefs.as_slice(), c.unitdefs.as_slice()))
+        .collect()
+}
+
 /// Build the eval module map (alias → callable module) from a composed document's
 /// `use` aliases (§6.1, M4d.2). Recurses so a module that calls a helper module
 /// carries that helper (B1), and computes each module's effective schema so its
@@ -275,13 +291,15 @@ fn cmd_check(path: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let env = match mangrove_typed::TypeEnv::build(&doc.typedefs, &doc.unitdefs) {
-        Ok(e) => e,
-        Err(msg) => {
-            eprintln!("{path}: schema error: {msg}");
-            return ExitCode::from(1);
-        }
-    };
+    let imports = type_imports(&doc.modules);
+    let env =
+        match mangrove_typed::TypeEnv::build_with_imports(&doc.typedefs, &doc.unitdefs, &imports) {
+            Ok(e) => e,
+            Err(msg) => {
+                eprintln!("{path}: schema error: {msg}");
+                return ExitCode::from(1);
+            }
+        };
     // L3 eval: reduce params/references/calls before validating (D35).
     let modules = match build_modules(&doc.modules) {
         Ok(m) => m,

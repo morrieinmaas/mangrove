@@ -3,9 +3,9 @@
 //! (`Named`) cycle — recursion is forbidden by the totality axiom (§2.6).
 
 use bigdecimal::BigDecimal;
-use mangrove_syntax::{Annotation, Type, TypeDef, UnitDef};
+use mangrove_syntax::{Annotation, FieldDef, Type, TypeDef, UnitDef};
 use num_bigint::BigInt;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub struct TypeEnv {
     types: HashMap<String, Type>,
@@ -19,6 +19,18 @@ impl TypeEnv {
     /// Errors on a duplicate name, an unknown referenced type, or a `Named`
     /// cycle.
     pub fn build(typedefs: &[TypeDef], unitdefs: &[UnitDef]) -> Result<TypeEnv, String> {
+        Self::build_with_imports(typedefs, unitdefs, &[])
+    }
+
+    /// Build an environment that also exposes a `use`d module's `type`/`unit`
+    /// definitions under qualified names `alias.Name` (cross-file type imports,
+    /// M6a / D48). Each imported type's internal references are rewritten into the
+    /// `alias.` namespace so it resolves self-consistently in the importer's env.
+    pub fn build_with_imports(
+        typedefs: &[TypeDef],
+        unitdefs: &[UnitDef],
+        imports: &[(&str, &[TypeDef], &[UnitDef])],
+    ) -> Result<TypeEnv, String> {
         let mut types = HashMap::new();
         let mut messages = HashMap::new();
         for td in typedefs {
@@ -36,6 +48,27 @@ impl TypeEnv {
                 return Err(format!("duplicate type/unit definition: {}", u.name));
             }
             units.insert(u.name.clone(), u.members.clone());
+        }
+        for (alias, tds, uds) in imports {
+            // names the module defines — references to these get the `alias.` prefix
+            let local: HashSet<&str> = tds
+                .iter()
+                .map(|t| t.name.as_str())
+                .chain(uds.iter().map(|u| u.name.as_str()))
+                .collect();
+            for td in *tds {
+                let qname = format!("{alias}.{}", td.name);
+                if types.contains_key(&qname) {
+                    return Err(format!("duplicate imported type: {qname}"));
+                }
+                types.insert(qname.clone(), qualify(&td.ty, alias, &local));
+                if let Some(msg) = Annotation::find(&td.annotations, "message") {
+                    messages.insert(qname, msg.to_string());
+                }
+            }
+            for u in *uds {
+                units.insert(format!("{alias}.{}", u.name), u.members.clone());
+            }
         }
         // Build the type-reference graph (a Named may also point at a unit type,
         // which is a valid leaf and never part of a cycle), reject unknown
@@ -101,6 +134,36 @@ impl TypeEnv {
         let product = mantissa.clone() * BigDecimal::from(base);
         mangrove_core::exact_bigint(&product)
             .ok_or_else(|| format!("`{mantissa}{suffix}` is not an exact integer in the base unit"))
+    }
+}
+
+/// Rewrite a `use`d module's type so its internal references to names the module
+/// *defines* (`local`) carry the `alias.` prefix — making it self-consistent in
+/// the importer's env (M6a). Built-ins and references to other namespaces are
+/// left unchanged. Bounded by the parser's structural nesting cap.
+fn qualify(ty: &Type, alias: &str, local: &HashSet<&str>) -> Type {
+    match ty {
+        Type::Named(n) if local.contains(n.as_str()) => Type::Named(format!("{alias}.{n}")),
+        Type::Record { fields, requires } => Type::Record {
+            fields: fields
+                .iter()
+                .map(|f| FieldDef {
+                    ty: qualify(&f.ty, alias, local),
+                    ..f.clone()
+                })
+                .collect(),
+            requires: requires.clone(),
+        },
+        Type::List(inner) => Type::List(Box::new(qualify(inner, alias, local))),
+        Type::Map(inner) => Type::Map(Box::new(qualify(inner, alias, local))),
+        Type::Brand { name, inner } => Type::Brand {
+            name: name.clone(),
+            inner: Box::new(qualify(inner, alias, local)),
+        },
+        Type::Union(variants) => {
+            Type::Union(variants.iter().map(|v| qualify(v, alias, local)).collect())
+        }
+        other => other.clone(),
     }
 }
 
@@ -279,6 +342,48 @@ mod tests {
             .collect();
         defs.push(td(&format!("A{n}"), Type::Int));
         assert!(TypeEnv::build(&defs, &[]).is_ok());
+    }
+
+    #[test]
+    fn imported_types_are_qualified_and_self_consistent() {
+        // Module defines Container -> Probe; imported under alias `k`, Container's
+        // inner `Probe` ref is rewritten to `k.Probe` so it resolves.
+        let probe = td(
+            "Probe",
+            Type::Record {
+                fields: vec![FieldDef {
+                    name: "port".into(),
+                    optional: false,
+                    ty: Type::Int,
+                    default: None,
+                    annotations: vec![],
+                }],
+                requires: vec![],
+            },
+        );
+        let container = td(
+            "Container",
+            Type::Record {
+                fields: vec![FieldDef {
+                    name: "probe".into(),
+                    optional: false,
+                    ty: Type::Named("Probe".into()),
+                    default: None,
+                    annotations: vec![],
+                }],
+                requires: vec![],
+            },
+        );
+        let tds = [probe, container];
+        let uds: [UnitDef; 0] = [];
+        let mods = [("k", tds.as_slice(), uds.as_slice())];
+        let env = TypeEnv::build_with_imports(&[], &[], &mods).unwrap();
+        // Container's inner Probe ref was rewritten to k.Probe and resolves.
+        let Some(Type::Record { fields, .. }) = env.resolve("k.Container") else {
+            panic!("k.Container missing")
+        };
+        assert_eq!(fields[0].ty, Type::Named("k.Probe".into()));
+        assert!(env.resolve("k.Probe").is_some());
     }
 
     #[test]

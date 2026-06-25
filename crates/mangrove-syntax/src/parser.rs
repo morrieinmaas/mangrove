@@ -252,7 +252,7 @@ impl Parser {
                 fns.push(self.parse_fndef()?);
             } else if self.is_keyword_stmt("schema") {
                 self.advance(); // 'schema'
-                let name = match self.peek().tok.clone() {
+                let mut name = match self.peek().tok.clone() {
                     Tok::Bareword(n) => {
                         self.advance();
                         n
@@ -261,6 +261,15 @@ impl Parser {
                         return Err(self.error(format!("expected a schema name, found {other:?}")));
                     }
                 };
+                // qualified `schema alias.Type` (imported schema type, M6a)
+                if self.check(&Tok::Dot)
+                    && let Some(Tok::Bareword(member)) =
+                        self.tokens.get(self.pos + 1).map(|t| t.tok.clone())
+                {
+                    self.advance(); // `.`
+                    self.advance(); // member
+                    name = format!("{name}.{member}");
+                }
                 if schema.is_some() {
                     return Err(self.error("duplicate `schema` statement".into()));
                 }
@@ -1021,6 +1030,15 @@ impl Parser {
         match self.peek().tok.clone() {
             Tok::Bareword(name) => {
                 self.advance();
+                // Qualified `alias.Type` — a type imported from a `use`d module (M6a).
+                if self.check(&Tok::Dot)
+                    && let Some(Tok::Bareword(member)) =
+                        self.tokens.get(self.pos + 1).map(|t| t.tok.clone())
+                {
+                    self.advance(); // `.`
+                    self.advance(); // member
+                    return Ok(Type::Named(format!("{name}.{member}")));
+                }
                 Ok(match name.as_str() {
                     "int" => Type::Int,
                     "decimal" => Type::Decimal,
