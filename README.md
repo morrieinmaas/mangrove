@@ -67,7 +67,17 @@ mangrove check  <file.mang>            # validate against the bound schema
 mangrove update <file.mang>            # resolve + pin namespaced imports into mangrove.lock
 mangrove import <file.yaml|.toml>      # convert YAML/TOML to a schemaless Mangrove document
 mangrove export <file.mang> --to yaml  # evaluate and emit YAML/TOML
+mangrove gen-openapi <spec.json> --root <Def>   # OpenAPI (e.g. the k8s API) → Mangrove types
 ```
+
+## Kubernetes
+
+Mangrove works as the authoring layer for Kubernetes manifests — write typed,
+content-addressed `.mang`, evaluate to YAML, feed it to the cluster. A
+`kubectl-mangrove` plugin, a Kustomize/kpt KRM function, and a container image
+are in [`k8s/`](k8s/); generate Mangrove types for the real k8s API with
+`mangrove gen-openapi` (point it at `kubectl get --raw /openapi/v2`). See
+[`k8s/README.md`](k8s/README.md).
 
 ## Example
 

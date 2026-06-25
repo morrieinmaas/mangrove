@@ -41,6 +41,18 @@ fn main() -> ExitCode {
             }
             None => usage(),
         },
+        Some("gen-openapi") => match args.get(2) {
+            // `gen-openapi <spec.json> [--root <Definition>]`
+            Some(path) => {
+                let root = if args.get(3).map(String::as_str) == Some("--root") {
+                    args.get(4).map(String::as_str)
+                } else {
+                    None
+                };
+                cmd_gen_openapi(path, root)
+            }
+            None => usage(),
+        },
         _ => usage(),
     }
 }
@@ -48,9 +60,35 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
     eprintln!(
         "usage: mangrove [--version | hash <file> | check <file> | update <file> \
-         | import <file.yaml|.toml> | export <file.mang> [--to yaml|toml]]"
+         | import <file.yaml|.toml> | export <file.mang> [--to yaml|toml] \
+         | gen-openapi <spec.json> [--root <Definition>]]"
     );
     ExitCode::from(2)
+}
+
+/// `mangrove gen-openapi <spec.json> [--root <Def>]` — emit Mangrove `type`s for
+/// an OpenAPI spec (e.g. the Kubernetes API). Warnings go to stderr, types to stdout.
+fn cmd_gen_openapi(path: &str, root: Option<&str>) -> ExitCode {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match mangrove_openapi::generate(&text, root) {
+        Ok(g) => {
+            for w in &g.warnings {
+                eprintln!("warning: {w}");
+            }
+            print!("{}", g.types);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// `mangrove update <file>` — resolve every reachable namespaced `use`, hash each

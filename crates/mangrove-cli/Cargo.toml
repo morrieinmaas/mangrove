@@ -18,6 +18,7 @@ mangrove-typed = { path = "../mangrove-typed" }
 mangrove-compose = { path = "../mangrove-compose" }
 mangrove-resolve = { path = "../mangrove-resolve" }
 mangrove-convert = { path = "../mangrove-convert" }
+mangrove-openapi = { path = "../mangrove-openapi" }
 
 [lints]
 workspace = true
