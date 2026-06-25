@@ -34,6 +34,9 @@ pub struct Composed {
     pub fns: Vec<FnDef>,
     /// Direct `use` aliases → their composed module, for module calls (§6.1, M4d.2).
     pub modules: BTreeMap<String, Composed>,
+    /// Version-pinned packages (§5.6, M6b): `"alias@version"` → that version's
+    /// composed module, for per-type pins `k.Probe @"v4.8"`.
+    pub pinned: BTreeMap<String, Composed>,
     pub body: Value,
 }
 
@@ -109,6 +112,35 @@ fn compose_rec(
         }
         modules.insert(u.alias.clone(), base);
     }
+    // Per-type version pins (§5.6, M6b): for each `alias@version` referenced in a
+    // type, fetch that version of the alias's package (verified like any import).
+    let mut pinned: BTreeMap<String, Composed> = BTreeMap::new();
+    for (alias, version) in collect_pin_refs(&doc) {
+        let key = format!("{alias}@{version}");
+        if pinned.contains_key(&key) {
+            continue;
+        }
+        let u = doc.uses.iter().find(|u| u.alias == alias).ok_or_else(|| {
+            format!("type pin `{alias}@{version}` references unknown alias `{alias}`")
+        })?;
+        let (ns, _tag) = u.path.rsplit_once('@').ok_or_else(|| {
+            format!(
+                "cannot version-pin local import `{}` (pins need a namespaced `use`)",
+                u.path
+            )
+        })?;
+        let pinned_ref = format!("{ns}@{version}");
+        let resolved = resolvers.resolve_path(&pinned_ref)?;
+        let composed = compose_rec(
+            &resolved,
+            visiting,
+            resolvers,
+            lock,
+            true,
+            Some(&pinned_ref),
+        )?;
+        pinned.insert(key, composed);
+    }
     visiting.pop();
 
     // Fold the body statements left-to-right.
@@ -144,6 +176,7 @@ fn compose_rec(
         params: doc.params,
         fns: doc.fns,
         modules,
+        pinned,
         body: acc,
     })
 }
@@ -201,8 +234,71 @@ fn collect_rec(
             collect_rec(&p, resolvers, visiting, out, true)?;
         }
     }
+    // Version-pinned packages (§5.6, M6b): record each pinned ref so `update`
+    // writes the lock entry `check`/`hash` will verify against.
+    for (alias, version) in collect_pin_refs(&doc) {
+        let Some(u) = doc.uses.iter().find(|u| u.alias == alias) else {
+            return Err(format!("type pin references unknown alias `{alias}`"));
+        };
+        let Some((ns, _)) = u.path.rsplit_once('@') else {
+            return Err(format!("cannot version-pin local import `{}`", u.path));
+        };
+        let pinned_ref = format!("{ns}@{version}");
+        if out.contains_key(&pinned_ref) {
+            continue;
+        }
+        let p = resolvers.resolve_path(&pinned_ref)?;
+        let bytes = std::fs::read(&p)
+            .map_err(|e| format!("resolving pin `{pinned_ref}`: {}: {e}", p.display()))?;
+        out.insert(pinned_ref.clone(), mangrove_resolve::source_hash(&bytes));
+        collect_rec(&p, resolvers, visiting, out, true)?;
+    }
     visiting.pop();
     Ok(())
+}
+
+/// Collect the distinct `(alias, version)` version-pins referenced in a document's
+/// types (§5.6, M6b). A pin is encoded by the parser as a qualified name
+/// `alias@version.member`; a plain `alias.member` (no `@`) is not a pin.
+fn collect_pin_refs(doc: &Document) -> std::collections::BTreeSet<(String, String)> {
+    let mut names: Vec<String> = Vec::new();
+    for td in &doc.typedefs {
+        collect_named(&td.ty, &mut names);
+    }
+    if let Some(n) = &doc.schema_narrow {
+        collect_named(n, &mut names);
+    }
+    let mut out = std::collections::BTreeSet::new();
+    for n in names {
+        if let Some((alias, rest)) = n.split_once('@')
+            && let Some((version, _member)) = rest.rsplit_once('.')
+        {
+            out.insert((alias.to_string(), version.to_string()));
+        }
+    }
+    out
+}
+
+/// Push every `Named` reference inside `ty` into `out` (structure-recursive,
+/// bounded by the parser's nesting cap).
+fn collect_named(ty: &Type, out: &mut Vec<String>) {
+    match ty {
+        Type::Named(n) => out.push(n.clone()),
+        Type::Record { fields, .. } => {
+            for f in fields {
+                collect_named(&f.ty, out);
+            }
+        }
+        Type::Map(inner) | Type::List(inner) | Type::Brand { inner, .. } => {
+            collect_named(inner, out)
+        }
+        Type::Union(variants) => {
+            for v in variants {
+                collect_named(v, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// `key += [ … ]` — append a list to the inherited list (D22).

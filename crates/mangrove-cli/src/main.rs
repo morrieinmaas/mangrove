@@ -86,7 +86,7 @@ fn cmd_update(path: &str) -> ExitCode {
 fn evaluate(path: &str) -> Result<mangrove_core::Value, String> {
     // compose errors already carry the offending file's path — don't double-prefix.
     let doc = mangrove_compose::compose(std::path::Path::new(path))?;
-    let imports = type_imports(&doc.modules);
+    let imports = type_imports(&doc);
     let env = mangrove_typed::TypeEnv::build_with_imports(&doc.typedefs, &doc.unitdefs, &imports)
         .map_err(|m| format!("{path}: schema error: {m}"))?;
     // L3 eval: reduce params/references/calls to plain values (D35).
@@ -227,18 +227,20 @@ fn effective_schema(
     }
 }
 
-/// The `use`d modules' type/unit definitions, for cross-file type imports (M6a):
-/// each becomes `alias.Name` in the importer's `TypeEnv`.
+/// The type/unit definitions a document imports: each `use`d module under
+/// `alias.Name` (M6a), and each version-pinned package under `alias@version.Name`
+/// (§5.6, M6b). The composed doc already keyed `pinned` as `alias@version`.
 fn type_imports(
-    modules: &std::collections::BTreeMap<String, mangrove_compose::Composed>,
+    doc: &mangrove_compose::Composed,
 ) -> Vec<(
     &str,
     &[mangrove_syntax::TypeDef],
     &[mangrove_syntax::UnitDef],
 )> {
-    modules
+    doc.modules
         .iter()
-        .map(|(a, c)| (a.as_str(), c.typedefs.as_slice(), c.unitdefs.as_slice()))
+        .chain(doc.pinned.iter())
+        .map(|(q, c)| (q.as_str(), c.typedefs.as_slice(), c.unitdefs.as_slice()))
         .collect()
 }
 
@@ -291,7 +293,7 @@ fn cmd_check(path: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let imports = type_imports(&doc.modules);
+    let imports = type_imports(&doc);
     let env =
         match mangrove_typed::TypeEnv::build_with_imports(&doc.typedefs, &doc.unitdefs, &imports) {
             Ok(e) => e,

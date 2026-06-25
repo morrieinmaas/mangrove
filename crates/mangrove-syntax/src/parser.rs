@@ -1037,6 +1037,24 @@ impl Parser {
                 {
                     self.advance(); // `.`
                     self.advance(); // member
+                    // Optional per-type version pin `@"<ref>"` (§5.6, M6b). The
+                    // version is quoted — a bare `v4.8`/`b3:…` can't lex (`.`/`:`).
+                    // Encoded into the qualified key as `alias@<ref>.member`.
+                    if self.check(&Tok::At) {
+                        self.advance(); // `@`
+                        let version = match self.peek().tok.clone() {
+                            Tok::Str(v) => {
+                                self.advance();
+                                v
+                            }
+                            other => {
+                                return Err(self.error(format!(
+                                    "expected a quoted version after `@`, found {other:?}"
+                                )));
+                            }
+                        };
+                        return Ok(Type::Named(format!("{name}@{version}.{member}")));
+                    }
                     return Ok(Type::Named(format!("{name}.{member}")));
                 }
                 Ok(match name.as_str() {
