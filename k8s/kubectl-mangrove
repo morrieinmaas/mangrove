@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# kubectl plugin: render a Mangrove document to Kubernetes YAML, and apply/diff it.
+# Install: put this file on $PATH as `kubectl-mangrove` (chmod +x), with the
+# `mangrove` binary also on $PATH. Then: `kubectl mangrove render deploy.mang`.
+#
+# A Mangrove document evaluates to one value; emit several resources with a
+# Kubernetes `List` (kind: List, items: [...]) — kubectl apply accepts it.
+set -euo pipefail
+
+usage() {
+  echo "usage: kubectl mangrove {render|apply|diff} <file.mang> [kubectl args...]" >&2
+}
+
+cmd="${1:-}"
+[ "$#" -gt 0 ] && shift || true
+
+case "$cmd" in
+  render)
+    [ "$#" -ge 1 ] || { usage; exit 2; }
+    exec mangrove export "$1" --to yaml
+    ;;
+  apply)
+    [ "$#" -ge 1 ] || { usage; exit 2; }
+    file="$1"; shift
+    mangrove export "$file" --to yaml | kubectl apply -f - "$@"
+    ;;
+  diff)
+    [ "$#" -ge 1 ] || { usage; exit 2; }
+    file="$1"; shift
+    mangrove export "$file" --to yaml | kubectl diff -f - "$@"
+    ;;
+  "" | -h | --help)
+    usage
+    ;;
+  *)
+    echo "unknown subcommand: $cmd" >&2
+    usage
+    exit 2
+    ;;
+esac
