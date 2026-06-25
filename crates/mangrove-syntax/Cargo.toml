@@ -12,5 +12,8 @@ num-bigint = { workspace = true }
 bigdecimal = { workspace = true }
 rowan = { workspace = true }
 
+[dev-dependencies]
+mangrove-canonical = { path = "../mangrove-canonical" }
+
 [lints]
 workspace = true

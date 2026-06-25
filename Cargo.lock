@@ -276,6 +276,7 @@ name = "mangrove-syntax"
 version = "0.1.0"
 dependencies = [
  "bigdecimal",
+ "mangrove-canonical",
  "mangrove-core",
  "num-bigint",
  "rowan",

@@ -14,4 +14,5 @@ mod parse;
 mod tests;
 
 pub use kind::{MangroveLang, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};
+pub use lower::lower;
 pub use parse::{Parse, parse_cst};

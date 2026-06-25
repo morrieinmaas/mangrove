@@ -1,6 +1,28 @@
 #[allow(unused_imports)]
 use super::{kind::*, lex::*, lower::*, parse::*};
 
+/// The regression net: CST path and the legacy parser must agree on the canonical
+/// hash for every input the legacy parser accepts. (Equal values hash equal.)
+fn assert_hash_equivalent(src: &str) {
+    let legacy = super::super::parse(src); // Result<Value, ParseError>
+    let cst = super::lower::lower(&super::parse::parse_cst(src).syntax()).map(|d| d.body);
+    match (legacy, cst) {
+        (Ok(lv), Ok(cv)) => assert_eq!(
+            mangrove_canonical::hash(&lv),
+            mangrove_canonical::hash(&cv),
+            "hash mismatch for {src:?}"
+        ),
+        (Err(_), Err(_)) => {} // both reject — fine
+        (l, r) => panic!("legacy vs cst disagree for {src:?}: {l:?} / {r:?}"),
+    }
+}
+
+#[test]
+fn oracle_simple_bindings() {
+    assert_hash_equivalent("port: 8443\n");
+    assert_hash_equivalent("a: true\nb: \"x\"\n");
+}
+
 #[test]
 fn parses_a_simple_binding_into_a_lossless_tree() {
     let src = "port: 8443\n";
