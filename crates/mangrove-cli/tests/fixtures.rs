@@ -50,6 +50,23 @@ fn pyproject_checks_and_hash_is_stable() {
 }
 
 #[test]
+fn templated_k8s_checks_and_hash_is_stable() {
+    // L3 showcase: params + match (per-env replicas) + interpolation + units.
+    let p = examples_dir().join("k8s-templated.mang");
+    let chk = run("check", &p);
+    assert!(
+        chk.status.success(),
+        "{}",
+        String::from_utf8_lossy(&chk.stderr)
+    );
+    let hash = run("hash", &p);
+    assert_eq!(
+        String::from_utf8(hash.stdout).unwrap().trim(),
+        "b3:6cf957239dcb33de53ce4ea0dcdbc2a03059920b41d2def0745bec53e3a35644"
+    );
+}
+
+#[test]
 fn k8s_out_of_range_replicas_fails() {
     // The replicas refinement (1..=100) is enforced on the real fixture.
     let src = std::fs::read_to_string(examples_dir().join("k8s-deployment.mang")).unwrap();

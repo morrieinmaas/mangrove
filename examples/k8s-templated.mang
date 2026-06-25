@@ -1,0 +1,49 @@
+# A templated Kubernetes Deployment (L3 showcase): one module, per-environment
+# replicas via `match`, image tag via interpolation, memory via a unit type.
+# `check`/`hash` use the param defaults (env = prod).
+
+unit Mem : int { B = 1, Ki = 1024B, Mi = 1024Ki }
+
+params {
+  env:     "dev" | "staging" | "prod" = "prod"
+  version: str = "1.21.0"
+}
+
+type Labels = { app: str, env: str }
+type Port = { containerPort: int & >= 1 & <= 65535, name: str }
+type ResourceReqs = { memory: Mem, cpu: decimal }
+type Container = {
+  name: str,
+  image: str,
+  ports: [ Port ] @key(name),
+  resources: { requests: ResourceReqs },
+}
+type Spec = {
+  replicas: int & >= 1 & <= 100,
+  containers: [ Container ] @key(name),
+}
+type Deployment = {
+  apiVersion: "apps/v1",
+  kind: "Deployment",
+  metadata: { name: str, labels: Labels },
+  spec: Spec,
+}
+schema Deployment
+
+apiVersion: "apps/v1"
+kind: "Deployment"
+metadata: {
+  name: "api-gateway"
+  labels: { app: "api-gateway", env: env }
+}
+spec: {
+  replicas: match env { dev: 1, staging: 2, prod: 6 }
+  containers: [
+    {
+      name: "api"
+      image: "registry.example.eu/api:${version}"
+      ports: [ { containerPort: 8443, name: "https" } ]
+      resources: { requests: { memory: 256Mi, cpu: 0.25 } }
+    }
+  ]
+}

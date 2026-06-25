@@ -26,6 +26,44 @@ fn examples(name: &str) -> std::path::PathBuf {
         .join(name)
 }
 
+/// Full cycle on a real file: import → mangrove → hash → export → re-import →
+/// mangrove → hash; the two hashes must match (value preserved, D43). `label`
+/// keeps temp files unique so tests can run in parallel.
+fn assert_real_round_trip(label: &str, rel: &str, fmt: &str, ext: &str) {
+    let src = examples(rel);
+    let pid = std::process::id();
+    let mang1 = stdout(&mangrove(&["import", src.to_str().unwrap()]));
+    let m1 = std::env::temp_dir().join(format!("rt_{label}_{pid}_1.mang"));
+    std::fs::write(&m1, &mang1).unwrap();
+    let h1 = stdout(&mangrove(&["hash", m1.to_str().unwrap()]));
+
+    let exported = stdout(&mangrove(&["export", m1.to_str().unwrap(), "--to", fmt]));
+    let f2 = std::env::temp_dir().join(format!("rt_{label}_{pid}_2.{ext}"));
+    std::fs::write(&f2, &exported).unwrap();
+
+    let mang2 = stdout(&mangrove(&["import", f2.to_str().unwrap()]));
+    let m2 = std::env::temp_dir().join(format!("rt_{label}_{pid}_2.mang"));
+    std::fs::write(&m2, &mang2).unwrap();
+    let h2 = stdout(&mangrove(&["hash", m2.to_str().unwrap()]));
+
+    assert_eq!(h1, h2, "round-trip of {rel} via {fmt} changed the value");
+}
+
+#[test]
+fn real_k8s_deployment_yaml_round_trips() {
+    assert_real_round_trip("k8s", "real-world/deployment.yaml", "yaml", "yaml");
+}
+
+#[test]
+fn real_ci_workflow_yaml_round_trips() {
+    assert_real_round_trip("ci", "real-world/ci.yaml", "yaml", "yaml");
+}
+
+#[test]
+fn real_pyproject_toml_round_trips() {
+    assert_real_round_trip("pyproj", "real-world/pyproject.toml", "toml", "toml");
+}
+
 /// export <fixture> --to <fmt> → import the result → hash; equals hash(<fixture>).
 fn assert_round_trip(fixture: &str, fmt: &str, ext: &str) {
     let src = examples(fixture);
