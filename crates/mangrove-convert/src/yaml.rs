@@ -15,6 +15,13 @@ use yaml_rust2::{YamlEmitter, YamlLoader};
 const MAX_DEPTH: usize = 128;
 
 /// Parse a single YAML document into a `Value` (schemaless L0 data, D42).
+///
+/// ```
+/// let v = mangrove_convert::yaml::import("name: api\nport: 8443\n").unwrap();
+/// assert!(matches!(v, mangrove_core::Value::Map(_)));
+/// // YAML null is rejected — Mangrove has no null (§2.4).
+/// assert!(mangrove_convert::yaml::import("x: null\n").is_err());
+/// ```
 pub fn import(s: &str) -> Result<Value, String> {
     let docs = YamlLoader::load_from_str(s).map_err(|e| format!("YAML parse error: {e}"))?;
     match docs.as_slice() {

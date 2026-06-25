@@ -10,6 +10,12 @@ pub fn canonical_cbor(value: &Value) -> Vec<u8> {
 
 /// The content address: `"b3:"` followed by the 64-char lowercase hex of the
 /// BLAKE3-256 digest of the canonical CBOR bytes.
+///
+/// ```
+/// use mangrove_core::Value;
+/// let h = mangrove_canonical::hash(&Value::Bool(true));
+/// assert!(h.starts_with("b3:") && h.len() == 3 + 64);
+/// ```
 pub fn hash(value: &Value) -> String {
     let digest = blake3::hash(&canonical_cbor(value));
     format!("b3:{}", digest.to_hex())

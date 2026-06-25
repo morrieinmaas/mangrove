@@ -19,6 +19,16 @@ const MAX_DEPTH: usize = 128;
 /// Render a (schemaless) `Value` as Mangrove document text. The root must be a map
 /// (D2). Strings are escaped so a literal `$` cannot become interpolation on
 /// re-parse, and keys that are not simple identifiers are quoted.
+///
+/// ```
+/// use mangrove_convert::to_mangrove;
+/// use mangrove_core::Value;
+/// use std::collections::BTreeMap;
+///
+/// let mut m = BTreeMap::new();
+/// m.insert("port".to_string(), Value::Int(8443.into()));
+/// assert_eq!(to_mangrove(&Value::Map(m)).unwrap(), "port: 8443\n");
+/// ```
 pub fn to_mangrove(v: &Value) -> Result<String, String> {
     let Value::Map(m) = v else {
         return Err("a Mangrove document root must be a map".into());

@@ -7,6 +7,39 @@ and **templating** (L3), on top of a supply-chain layer for verified imports. Ev
 reduces to a single canonical value with a stable BLAKE3 content hash, so two documents that
 *mean* the same thing hash the same.
 
+> **Status:** v0.1.0 — an experimental, solo, spec-complete implementation. Not used in
+> production yet. The ideas (below) are the point; the polish (LSP, formatter, docs site) is not there.
+
+## Why
+
+Configuration today is mostly untyped text that tools interpret by convention. The pain is familiar:
+
+- **YAML** has no types and a surprising value grammar (`no` → `false`, sexagesimal, `null` everywhere). A typo is a silent wrong value, not an error.
+- **Helm / Kustomize** template *text*, so a mis-indented value silently corrupts structure, and "is this the same config?" has no answer.
+- **Drift & trust:** two configs that produce the same result can look different (and vice-versa), and an imported chart/base can change underneath you with nothing to detect it.
+
+Mangrove takes three positions in response:
+
+1. **The schema is the only type authority — no inference.** There is exactly one canonical form for a value, so equality is decidable and a diff is meaningful.
+2. **Config is a value, addressed by content.** Every document reduces to a deterministic CBOR encoding hashed to `b3:<hex>`. Two documents are "the same config" iff they hash the same — across composition, templating, and format conversion.
+3. **Imports are supply-chain-verified.** A namespaced import is pinned in a committed `mangrove.lock` and hash-verified before evaluation, fail-closed; each package anchors its own lock. Templating operates on **values, not text**, so it can never corrupt structure.
+
+## How it compares
+
+| | typed | one canonical form | content hash | **verified imports / lockfile** | templating |
+|---|:--:|:--:|:--:|:--:|:--:|
+| YAML / Helm | ✗ | ✗ | ✗ | ✗ | text |
+| Jsonnet | ✗ | ✗ | ✗ | ✗ | values |
+| Dhall | ✓ | ✓ | ✓ (semantic) | imports hashed, no lockfile | values |
+| CUE | ✓ (lattice/inference) | ✗ | ✗ | ✗ | unify |
+| Nickel | ✓ (gradual) | ✗ | ✗ | ✗ | values |
+| Pkl / KCL | ✓ | ✗ | ✗ | ✗ | values |
+| **Mangrove** | ✓ (no inference) | **✓** | **✓ (BLAKE3)** | **✓ committed lock, fail-closed, per-package** | values |
+
+The closest neighbour is **Dhall** (typed, total, semantic hashing). Mangrove differs in two deliberate ways: **no type inference** (the schema is the sole authority — one canonical form, simpler errors, no lattice to reason about), and a **package-manager-style supply chain** (a committed lockfile, hash-verify-before-eval that fails closed, local + git backends, per-package anchoring) rather than per-import frozen hashes only. The supply-chain integrity story is the part no other config language really leans into — and it's the reason Mangrove exists.
+
+See the [language specification](mangrove-spec.md) and the [design RFC](mangrove-rfc.md) for the full rationale.
+
 ## Design axioms
 
 - **No surface type inference** — the schema is the sole type authority, enabling one canonical form.
