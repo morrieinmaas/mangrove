@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.2.0
+
+Cross-file types, recursive types, and Kubernetes interop — each milestone
+test-first and adversarially reviewed.
+
+### Language
+- **Cross-file type imports (§5.6):** a `use`d module's types are referenceable
+  as `schema k.Deployment` / `field: k.Probe` (imported types' internal
+  references are namespace-rewritten so they resolve self-consistently).
+- **Per-type version pins (§5.6):** `k.Probe @"v1"` validates a slot against a
+  different fetched version of the package, recorded in the lockfile.
+- **Productive recursive types:** recursion is allowed when guarded by a
+  record/list/map (it terminates on a finite value), so arbitrary JSON
+  (`Json = str | int | decimal | bool | [Json] | { [str]: Json }`) and
+  self-recursive schemas are expressible. Non-productive cycles (`T = T`) are
+  rejected; `fn`/evaluation stays non-recursive. Validation is depth-guarded.
+- **Text-block interpolation:** `"""…${v}…"""` interpolates (raw `r"""` opts out).
+
+### Supply chain
+- **Per-package resolver/lock anchoring:** each package resolves and verifies its
+  own dependencies against its own `.mangrove/` + lock (supersedes the global
+  model); fail-closed at every level, fully backward-compatible.
+
+### Kubernetes & interop
+- **`mangrove gen-openapi`:** generate Mangrove types from an OpenAPI v2/v3 spec
+  (the k8s API). Free-form objects → the recursive `Json` type; recursive schemas
+  emitted faithfully; closure-from-`--root`.
+- **k8s tooling:** a `kubectl-mangrove` plugin (`render`/`apply`/`diff`), a
+  Kustomize/kpt KRM function, and a container image (see `k8s/`).
+
+### Quality
+- Test coverage raised to ~90% (line); doctests on every library crate.
+
 ## v0.1.0
 
 First release: the complete Mangrove language (spec §1–§6) plus the supply-chain

@@ -24,10 +24,15 @@ pub fn validate(value: &Value, ty: &Type, env: &TypeEnv) -> Vec<ValidationError>
     check(value, ty, "", env, 0)
 }
 
-/// Bound on validation recursion. Productive recursive types (M8) terminate on a
-/// finite value on their own (input nesting is parser-capped at 128, so real
-/// validation stays well under this); this is a runaway guard so no
-/// type-resolution bug can loop, set low enough to fire before the stack does.
+/// Bound on validation recursion. It counts every type node crossed (value
+/// descent *and* name resolution), so it's a function of value depth × the
+/// type-graph fan-out per level — not value depth alone. Realistic recursive
+/// types stay well under it (e.g. arbitrary-JSON, multiplier ~3, tops out near
+/// 375 at the parser's 128 nesting cap). A *pathologically* long alias chain
+/// (`A=B=…`, dozens deep) could inflate the multiplier enough to reject a shallow
+/// value — contrived, not seen in real schemas. The guard's job is termination:
+/// it fires before the 8 MB main-thread stack does, turning a runaway into a
+/// clean error instead of a crash.
 const MAX_DEPTH: usize = 512;
 
 /// Advisory `@deprecated` messages for every present field whose definition is
@@ -224,14 +229,25 @@ fn check(
         }
 
         Type::Union(variants) => {
-            if variants
-                .iter()
-                .any(|v| check(value, v, path, env, depth + 1).is_empty())
-            {
-                vec![]
-            } else {
-                vec![mismatch(path, value, ty).with_failed("no matching variant")]
+            // If an arm hits the depth guard, surface that real cause rather than
+            // the generic "no matching variant" (which would otherwise mask it).
+            let mut too_deep = None;
+            for v in variants {
+                let errs = check(value, v, path, env, depth + 1);
+                if errs.is_empty() {
+                    return vec![];
+                }
+                if too_deep.is_none()
+                    && errs
+                        .iter()
+                        .any(|e| e.failed.as_deref() == Some("type nesting too deep"))
+                {
+                    too_deep = Some(errs);
+                }
             }
+            too_deep.unwrap_or_else(|| {
+                vec![mismatch(path, value, ty).with_failed("no matching variant")]
+            })
         }
 
         Type::Named(n) => {
@@ -678,6 +694,31 @@ mod tests {
                     e.iter()
                         .any(|x| x.failed.as_deref() == Some("type nesting too deep")),
                     "expected a depth-guard error"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn over_deep_union_surfaces_depth_error() {
+        // A too-deep value against a recursive *union* (Json) must report the real
+        // cause ("type nesting too deep"), not the generic "no matching variant".
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let env = json_env();
+                let mut v = Value::Int(1.into());
+                for _ in 0..400 {
+                    v = map(&[("k", v)]);
+                }
+                let e = validate(&v, &Type::Named("Json".into()), &env);
+                assert!(
+                    e.iter()
+                        .any(|x| x.failed.as_deref() == Some("type nesting too deep")),
+                    "expected a depth error, got {:?}",
+                    e.iter().map(|x| x.failed.clone()).collect::<Vec<_>>()
                 );
             })
             .unwrap()

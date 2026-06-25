@@ -37,7 +37,7 @@ A conforming implementation **may** target a subset of layers (e.g. an L0/L1 rea
 3. **One canonical form.** Every document has exactly one normalized byte representation, hashed with BLAKE3. Two documents with identical semantic content have identical hashes.
 4. **No null.** A key is *present-with-a-value* or *absent*. There are exactly two states, never three.
 5. **Arbitrary precision.** Integers are arbitrary precision; non-integers are decimal. IEEE-754 floats never enter the model.
-6. **Totality.** All computation (templates, functions, predicates) is total and decidable: no recursion, no user-defined Turing-complete functions, guaranteed termination.
+6. **Totality.** All *computation* (templates, functions, predicates) is total and decidable: no recursion in evaluation, no user-defined Turing-complete functions, guaranteed termination. *Type definitions* may be recursive when the recursion is **productive** — every cycle passes through a value-consuming constructor (a record field, list element, or map value), so validating it against a finite value terminates (this is what lets an arbitrary-JSON type `Json = str | int | decimal | bool | [Json] | { [str]: Json }` exist). Non-productive type cycles (`type T = T`, unions/aliases that loop with no value consumed) are rejected, and `fn`/evaluation stays strictly non-recursive.
 7. **Explicit over implicit.** Composition, merging, and overriding are never inferred from structure; they are named operations or follow one stated rule.
 
 ---

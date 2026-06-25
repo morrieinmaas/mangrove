@@ -53,7 +53,16 @@ pub fn narrowed_schema(base: &Type, narrow: &Type, env: &TypeEnv) -> Result<Type
         fields: base_fields.clone(),
         requires,
     };
-    is_subtype(&new_type, &base_type, env)?;
+    // A recursive type isn't narrowable (no value to shrink — subtyping is
+    // type-vs-type); the depth guard catches it. Report that cleanly rather than
+    // leaking a deep accumulated field path (M8/D53).
+    is_subtype(&new_type, &base_type, env).map_err(|e| {
+        if e.contains("too deep") {
+            "cannot narrow a recursive type (recursive types are not narrowable, §5.5/D53)".into()
+        } else {
+            e
+        }
+    })?;
     Ok(new_type)
 }
 
