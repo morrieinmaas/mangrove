@@ -25,12 +25,31 @@ fn main() -> ExitCode {
             Some(path) => cmd_update(path),
             None => usage(),
         },
+        Some("import") => match args.get(2) {
+            Some(path) => cmd_import(path),
+            None => usage(),
+        },
+        Some("export") => match args.get(2) {
+            // `export <file> [--to <fmt>]`
+            Some(path) => {
+                let to = if args.get(3).map(String::as_str) == Some("--to") {
+                    args.get(4).map(String::as_str)
+                } else {
+                    None
+                };
+                cmd_export(path, to)
+            }
+            None => usage(),
+        },
         _ => usage(),
     }
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: mangrove [--version | hash <file> | check <file> | update <file>]");
+    eprintln!(
+        "usage: mangrove [--version | hash <file> | check <file> | update <file> \
+         | import <file.yaml|.toml> | export <file.mang> [--to yaml|toml]]"
+    );
     ExitCode::from(2)
 }
 
@@ -61,78 +80,128 @@ fn cmd_update(path: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_hash(path: &str) -> ExitCode {
-    // Compose first (resolve local `use` + spread + unset → one merged value),
-    // then resolve/hash as before. A spread-free document composes to itself.
-    let doc = match mangrove_compose::compose(std::path::Path::new(path)) {
-        Ok(c) => c,
-        Err(msg) => {
-            eprintln!("{path}: {msg}");
-            return ExitCode::from(1);
-        }
-    };
-    let env = match mangrove_typed::TypeEnv::build(&doc.typedefs, &doc.unitdefs) {
-        Ok(e) => e,
-        Err(msg) => {
-            eprintln!("{path}: schema error: {msg}");
-            return ExitCode::from(1);
-        }
-    };
-    // L3 eval: reduce params/references/calls to plain values before hashing (D35).
-    let modules = match build_modules(&doc.modules) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("{path}: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    let body = match mangrove_typed::eval(&doc.body, &doc.params, &doc.fns, &env, &modules) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("{path}: {e}");
-            return ExitCode::from(1);
-        }
-    };
-    // The content address is the schema-RESOLVED canonical form (D12): a bound
-    // schema resolves unit literals to base integers; a schemaless document
-    // hashes its raw data (M1 behaviour) but may not contain unit literals (D14).
-    let to_hash = match &doc.schema {
+/// Compose → eval → (validate + resolve against the schema) → the canonical value
+/// (D12). The shared pipeline behind `hash` and `export`. Errors are pre-formatted
+/// (already prefixed with the path where useful) for the caller to print.
+fn evaluate(path: &str) -> Result<mangrove_core::Value, String> {
+    let doc = mangrove_compose::compose(std::path::Path::new(path))
+        .map_err(|m| format!("{path}: {m}"))?;
+    let env = mangrove_typed::TypeEnv::build(&doc.typedefs, &doc.unitdefs)
+        .map_err(|m| format!("{path}: schema error: {m}"))?;
+    // L3 eval: reduce params/references/calls to plain values (D35).
+    let modules = build_modules(&doc.modules).map_err(|e| format!("{path}: {e}"))?;
+    let body = mangrove_typed::eval(&doc.body, &doc.params, &doc.fns, &env, &modules)
+        .map_err(|e| format!("{path}: {e}"))?;
+    match &doc.schema {
         Some(name) => {
-            let ty = match effective_schema(name, &doc.schema_narrow, &env) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("{path}: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            // Only a valid document has a canonical resolved form, so validate
-            // before resolving — this also keeps invalid input (e.g. a unit
-            // literal in a non-unit field) from ever reaching the encoder.
+            let ty = effective_schema(name, &doc.schema_narrow, &env)
+                .map_err(|e| format!("{path}: {e}"))?;
+            // Validate before resolving — the canonical resolved form exists only
+            // for a valid document, and this keeps invalid input out of the encoder.
             let errors = mangrove_typed::validate(&body, &ty, &env);
             if !errors.is_empty() {
-                for e in &errors {
-                    eprintln!("{path}: {e}");
-                }
-                return ExitCode::from(1);
+                return Err(errors
+                    .iter()
+                    .map(|e| format!("{path}: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"));
             }
-            match mangrove_typed::resolve(&body, &ty, &env) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("{path}: {e}");
-                    return ExitCode::from(1);
-                }
-            }
+            mangrove_typed::resolve(&body, &ty, &env).map_err(|e| format!("{path}: {e}"))
         }
         None => {
             if contains_unit(&body) {
-                eprintln!("{path}: a unit literal requires a schema");
-                return ExitCode::from(1);
+                return Err(format!("{path}: a unit literal requires a schema"));
             }
-            body
+            Ok(body)
+        }
+    }
+}
+
+fn cmd_hash(path: &str) -> ExitCode {
+    match evaluate(path) {
+        Ok(v) => {
+            println!("{}", mangrove_canonical::hash(&v));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `mangrove import <file.yaml|.toml>` — parse a YAML/TOML file into plain data and
+/// print it as a schemaless Mangrove document (D42). Format is chosen by extension.
+fn cmd_import(path: &str) -> ExitCode {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return ExitCode::from(1);
         }
     };
-    println!("{}", mangrove_canonical::hash(&to_hash));
-    ExitCode::SUCCESS
+    let value = match format_of(path) {
+        Some(Format::Yaml) => mangrove_convert::yaml::import(&text),
+        Some(Format::Toml) => mangrove_convert::toml::import(&text),
+        None => Err(format!(
+            "{path}: unknown format (expected .yaml/.yml/.toml)"
+        )),
+    };
+    match value.and_then(|v| mangrove_convert::to_mangrove(&v)) {
+        Ok(doc) => {
+            print!("{doc}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `mangrove export <file.mang> --to yaml|toml` — evaluate a document and print its
+/// canonical value in the target format (D46). Defaults to YAML.
+fn cmd_export(path: &str, to: Option<&str>) -> ExitCode {
+    let value = match evaluate(path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let out = match to {
+        None | Some("yaml") => mangrove_convert::yaml::export(&value),
+        Some("toml") => mangrove_convert::toml::export(&value),
+        Some(other) => Err(format!(
+            "unknown target format `{other}` (expected yaml or toml)"
+        )),
+    };
+    match out {
+        Ok(s) => {
+            print!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+enum Format {
+    Yaml,
+    Toml,
+}
+
+fn format_of(path: &str) -> Option<Format> {
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+    {
+        Some("yaml") | Some("yml") => Some(Format::Yaml),
+        Some("toml") => Some(Format::Toml),
+        _ => None,
+    }
 }
 
 /// The effective schema type: the named type, or — for `schema Base & {…}` — the

@@ -17,6 +17,7 @@ mangrove-canonical = { path = "../mangrove-canonical" }
 mangrove-typed = { path = "../mangrove-typed" }
 mangrove-compose = { path = "../mangrove-compose" }
 mangrove-resolve = { path = "../mangrove-resolve" }
+mangrove-convert = { path = "../mangrove-convert" }
 
 [lints]
 workspace = true

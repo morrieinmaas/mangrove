@@ -16,6 +16,7 @@ bigdecimal = "0.4"
 blake3 = "1"
 regex = "1"
 toml = "0.8"
+yaml-rust2 = "0.10"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
