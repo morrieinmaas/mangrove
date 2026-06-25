@@ -104,6 +104,9 @@ fn compose_rec(
             let resolved = resolvers.resolve_path(&u.path)?;
             compose_rec(&resolved, visiting, resolvers, lock, true, Some(&u.path))?
         };
+        if modules.contains_key(&u.alias) {
+            return Err(format!("duplicate `use` alias `{}`", u.alias));
+        }
         modules.insert(u.alias.clone(), base);
     }
     visiting.pop();

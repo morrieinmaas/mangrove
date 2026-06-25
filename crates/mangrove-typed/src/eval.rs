@@ -18,6 +18,12 @@ pub struct Module {
     pub fns: Vec<FnDef>,
     pub body: Value,
     pub types: TypeEnv,
+    /// The module's own effective schema type, if it declares one — used to
+    /// validate + resolve (units → base int) the instantiated body (B2).
+    pub schema: Option<Type>,
+    /// The module's own `use` aliases, so a module that calls a helper module
+    /// resolves it (B1). Recursive: a helper may itself call helpers.
+    pub modules: BTreeMap<String, Module>,
 }
 
 /// Eval context: the value scope (params + sibling bindings), the params' declared
@@ -175,13 +181,19 @@ fn reduce_call(
     cx: &Ctx,
     depth: usize,
 ) -> Result<Value, Box<ValidationError>> {
-    let f = cx.fns.iter().find(|f| f.name == name).ok_or_else(|| {
-        err(
+    let Some(f) = cx.fns.iter().find(|f| f.name == name) else {
+        // Empty parens (`w()`) can't be disambiguated syntactically, so they parse
+        // as a positional call; if the name is a module alias, it's a zero-arg
+        // module call (S3). A non-empty positional call on a module is an error.
+        if args.is_empty() && cx.modules.contains_key(name) {
+            return reduce_module_call(name, &[], cx, depth);
+        }
+        return Err(err(
             "",
             format!("call to unknown function `{name}`"),
             "a schema-defined `fn`",
-        )
-    })?;
+        ));
+    };
     if args.len() != f.params.len() {
         return Err(err(
             "",
@@ -253,6 +265,12 @@ fn reduce_module_call(
             }
             v.clone()
         } else if let Some(d) = &p.default {
+            // Validate a literal default against its type, like the root eval (NIT 4b).
+            if !contains_ref(d)
+                && let Some(e) = validate(d, &p.ty, &m.types).into_iter().next()
+            {
+                return Err(err(format!("{alias}({})", p.name), e.got, e.expected));
+            }
             d.clone()
         } else {
             return Err(err(
@@ -274,9 +292,21 @@ fn reduce_module_call(
         ptypes: cptypes,
         types: &m.types,
         fns: &m.fns,
-        modules: cx.modules,
+        modules: &m.modules, // the callee resolves ITS OWN helper modules (B1)
     };
-    reduce(&m.body, &ccx, depth + 1)
+    let reduced = reduce(&m.body, &ccx, depth + 1)?;
+    // Validate + resolve the instantiated body against the callee's own schema, so
+    // unit literals become base ints and defaults materialize — exactly the root
+    // hash pipeline, scoped to the callee (B2). Without a schema, return as-is.
+    match &m.schema {
+        Some(sty) => {
+            if let Some(e) = validate(&reduced, sty, &m.types).into_iter().next() {
+                return Err(Box::new(e));
+            }
+            crate::resolve::resolve(&reduced, sty, &m.types)
+        }
+        None => Ok(reduced),
+    }
 }
 
 /// Look up a name in the value scope.
@@ -695,6 +725,8 @@ mod tests {
             fns: vec![],
             body: Value::Map(BTreeMap::from([("stage".into(), Value::Ref("env".into()))])),
             types: types(),
+            schema: None,
+            modules: BTreeMap::new(),
         };
         let mods = BTreeMap::from([("webapp".into(), module)]);
         let mut m = BTreeMap::new();
@@ -727,6 +759,8 @@ mod tests {
             fns: vec![],
             body: Value::Map(BTreeMap::new()),
             types: types(),
+            schema: None,
+            modules: BTreeMap::new(),
         };
         let mods = BTreeMap::from([("w".into(), module)]);
         let mut m = BTreeMap::new();
@@ -747,6 +781,8 @@ mod tests {
             fns: vec![],
             body: Value::Map(BTreeMap::new()),
             types: types(),
+            schema: None,
+            modules: BTreeMap::new(),
         };
         let mods = BTreeMap::from([("w".into(), module)]);
         let mut m = BTreeMap::new();

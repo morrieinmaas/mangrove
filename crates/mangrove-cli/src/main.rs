@@ -155,14 +155,20 @@ fn effective_schema(
     }
 }
 
-/// Build the eval module map (alias → callable module) from the composed
-/// document's direct `use` aliases (§6.1, M4d.2).
+/// Build the eval module map (alias → callable module) from a composed document's
+/// `use` aliases (§6.1, M4d.2). Recurses so a module that calls a helper module
+/// carries that helper (B1), and computes each module's effective schema so its
+/// instantiated body gets validated + unit-resolved (B2).
 fn build_modules(
     modules: &std::collections::BTreeMap<String, mangrove_compose::Composed>,
 ) -> Result<std::collections::BTreeMap<String, mangrove_typed::Module>, String> {
     let mut out = std::collections::BTreeMap::new();
     for (alias, c) in modules {
         let types = mangrove_typed::TypeEnv::build(&c.typedefs, &c.unitdefs)?;
+        let schema = match &c.schema {
+            Some(name) => Some(effective_schema(name, &c.schema_narrow, &types)?),
+            None => None,
+        };
         out.insert(
             alias.clone(),
             mangrove_typed::Module {
@@ -170,6 +176,8 @@ fn build_modules(
                 fns: c.fns.clone(),
                 body: c.body.clone(),
                 types,
+                schema,
+                modules: build_modules(&c.modules)?,
             },
         );
     }

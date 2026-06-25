@@ -10,6 +10,87 @@ fn run_check(name: &str, contents: &str) -> std::process::Output {
         .expect("run")
 }
 
+fn hashf(p: &std::path::Path) -> String {
+    let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+        .arg("hash")
+        .arg(p)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8(o.stdout).unwrap()
+}
+
+#[test]
+fn nested_module_call_resolves() {
+    // B1 regression: a module that calls a helper module must compose.
+    let dir = std::env::temp_dir().join(format!("m4d2_nest_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("inner.mang"), "params { v: str }\nlabel: v\n").unwrap();
+    std::fs::write(
+        dir.join("outer.mang"),
+        "use \"./inner.mang\" as inner\nparams { name: str }\nwrapped: inner(v: name)\n",
+    )
+    .unwrap();
+    let types = "type I = { label: str }\ntype W = { wrapped: I }\ntype R = { emit: W }\n";
+    std::fs::write(
+        dir.join("root.mang"),
+        format!("use \"./outer.mang\" as outer\n{types}schema R\nemit: outer(name: \"api\")\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("hand.mang"),
+        format!("{types}schema R\nemit: {{ wrapped: {{ label: \"api\" }} }}\n"),
+    )
+    .unwrap();
+    assert_eq!(hashf(&dir.join("root.mang")), hashf(&dir.join("hand.mang")));
+}
+
+#[test]
+fn module_with_units_resolves_and_hashes_like_literal() {
+    // B2 regression: a module body's unit literal resolves against the module's
+    // own schema (512Mi → 536870912) before instantiation.
+    let dir = std::env::temp_dir().join(format!("m4d2_unit_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mod.mang"),
+        "unit Bytes : int { B = 1, Ki = 1024B, Mi = 1024Ki }\n\
+         type M = { size: Bytes }\nschema M\nparams { dummy: int = 0 }\nsize: 512Mi\n",
+    )
+    .unwrap();
+    let types = "type R = { emit: { size: int } }\n";
+    std::fs::write(
+        dir.join("root.mang"),
+        format!("use \"./mod.mang\" as webapp\n{types}schema R\nemit: webapp(dummy: 0)\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("hand.mang"),
+        format!("{types}schema R\nemit: {{ size: 536870912 }}\n"),
+    )
+    .unwrap();
+    assert_eq!(hashf(&dir.join("root.mang")), hashf(&dir.join("hand.mang")));
+}
+
+#[test]
+fn zero_arg_module_call_resolves() {
+    // S3 regression: w() (all params defaulted) must instantiate the module.
+    let dir = std::env::temp_dir().join(format!("m4d2_zero_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("mod.mang"), "params { r: int = 5 }\nout: r\n").unwrap();
+    let types = "type R = { emit: { out: int } }\n";
+    std::fs::write(
+        dir.join("root.mang"),
+        format!("use \"./mod.mang\" as w\n{types}schema R\nemit: w()\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("hand.mang"),
+        format!("{types}schema R\nemit: {{ out: 5 }}\n"),
+    )
+    .unwrap();
+    assert_eq!(hashf(&dir.join("root.mang")), hashf(&dir.join("hand.mang")));
+}
+
 #[test]
 fn check_valid_document_exits_0() {
     let out = run_check(
