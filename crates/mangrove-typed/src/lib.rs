@@ -7,6 +7,6 @@ pub mod resolve;
 pub mod validate;
 
 pub use env::TypeEnv;
-pub use eval::eval;
+pub use eval::{Module, eval};
 pub use resolve::resolve;
 pub use validate::{deprecations, validate};

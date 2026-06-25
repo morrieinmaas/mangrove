@@ -822,15 +822,22 @@ impl Parser {
         })
     }
 
-    /// `name(arg, …)` — a positional call to a schema-defined function (§6.2).
+    /// `name(arg, …)` — a call. Positional args → a schema-defined function call
+    /// (§6.2, `Value::Call`); `name: value` named args → a module call (§6.1,
+    /// `Value::ModuleCall`). Mixing the two forms is an error.
     fn parse_call(&mut self, name: String, depth: usize) -> Result<Value, ParseError> {
         if depth >= MAX_DEPTH {
             return Err(self.error("nesting too deep".into()));
         }
         self.advance(); // name
         self.expect(&Tok::LParen)?;
-        let mut args: Vec<Value> = Vec::new();
         self.skip_seps();
+        // A named-arg call begins `ident :` — that decides fn-call vs module-call.
+        let named = matches!(&self.peek().tok, Tok::Bareword(_)) && self.next_is(&Tok::Colon);
+        if named {
+            return self.parse_module_call(name, depth);
+        }
+        let mut args: Vec<Value> = Vec::new();
         while !self.check(&Tok::RParen) {
             if self.at_eof() {
                 return Err(self.error("unterminated call argument list".into()));
@@ -845,6 +852,42 @@ impl Parser {
         }
         self.expect(&Tok::RParen)?;
         Ok(Value::Call { name, args })
+    }
+
+    /// The named-arg tail of a call: `alias(name: value, …)` → a module call.
+    fn parse_module_call(&mut self, alias: String, depth: usize) -> Result<Value, ParseError> {
+        let mut args: Vec<(String, Value)> = Vec::new();
+        while !self.check(&Tok::RParen) {
+            if self.at_eof() {
+                return Err(self.error("unterminated module call argument list".into()));
+            }
+            let argname = match self.peek().tok.clone() {
+                Tok::Bareword(n) => {
+                    self.advance();
+                    n
+                }
+                other => {
+                    return Err(self.error(format!(
+                        "expected a named argument (`name: value`), found {other:?}"
+                    )));
+                }
+            };
+            if args.iter().any(|(n, _)| n == &argname) {
+                return Err(self.error(format!("duplicate argument {argname:?}")));
+            }
+            self.expect(&Tok::Colon)?;
+            let val = self.parse_value(depth + 1)?;
+            args.push((argname, val));
+            if self.check(&Tok::Comma) {
+                self.advance();
+                self.skip_seps();
+            } else {
+                self.skip_seps();
+                break;
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(Value::ModuleCall { alias, args })
     }
 
     fn parse_value(&mut self, depth: usize) -> Result<Value, ParseError> {

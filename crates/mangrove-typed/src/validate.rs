@@ -292,6 +292,7 @@ pub(crate) fn render(v: &Value) -> String {
         Value::Interp(_) => "<interpolated string>".into(),
         Value::Match { .. } => "<match>".into(),
         Value::Call { name, .. } => format!("{name}(…)"),
+        Value::ModuleCall { alias, .. } => format!("{alias}(…)"),
     }
 }
 

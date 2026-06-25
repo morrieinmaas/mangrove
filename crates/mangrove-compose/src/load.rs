@@ -32,6 +32,8 @@ pub struct Composed {
     pub params: Vec<Param>,
     /// L3 schema-defined functions of the root document (§6.2).
     pub fns: Vec<FnDef>,
+    /// Direct `use` aliases → their composed module, for module calls (§6.1, M4d.2).
+    pub modules: BTreeMap<String, Composed>,
     pub body: Value,
 }
 
@@ -82,7 +84,9 @@ fn compose_rec(
 
     visiting.push(canon.clone());
     let dir = canon.parent().unwrap_or_else(|| Path::new("."));
-    let mut bases: BTreeMap<String, Value> = BTreeMap::new();
+    // alias → the full sub-`Composed`: its `.body` feeds a spread (`...alias`),
+    // and the whole module feeds a module call (`alias(args)`, M4d.2).
+    let mut modules: BTreeMap<String, Composed> = BTreeMap::new();
     for u in &doc.uses {
         let base = if u.path.starts_with("./") || u.path.starts_with("../") {
             // Local import. Inside a remote subtree it is unpinnable → refuse it,
@@ -100,7 +104,7 @@ fn compose_rec(
             let resolved = resolvers.resolve_path(&u.path)?;
             compose_rec(&resolved, visiting, resolvers, lock, true, Some(&u.path))?
         };
-        bases.insert(u.alias.clone(), base.body);
+        modules.insert(u.alias.clone(), base);
     }
     visiting.pop();
 
@@ -109,10 +113,10 @@ fn compose_rec(
     for stmt in &doc.stmts {
         match stmt {
             Stmt::Spread(alias) => {
-                let base = bases
+                let base = modules
                     .get(alias)
                     .ok_or_else(|| format!("unknown spread alias `{alias}`"))?;
-                acc = merge(acc, base.clone());
+                acc = merge(acc, base.body.clone());
             }
             Stmt::Bind(k, v) => {
                 let mut one = BTreeMap::new();
@@ -136,6 +140,7 @@ fn compose_rec(
         schema_narrow: doc.schema_narrow,
         params: doc.params,
         fns: doc.fns,
+        modules,
         body: acc,
     })
 }

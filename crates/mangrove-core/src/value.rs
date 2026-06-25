@@ -47,6 +47,13 @@ pub enum Value {
         name: String,
         args: Vec<Value>,
     },
+    /// An L3 module call (`webapp(name: "x", env: "prod")`, §6.1): instantiate the
+    /// `use`d module bound to `alias` with the given named args. Reduced to the
+    /// module's evaluated body by the eval stage (M4d.2); a transient marker.
+    ModuleCall {
+        alias: String,
+        args: Vec<(String, Value)>,
+    },
 }
 
 /// One piece of an interpolated string (§6.3): literal text or a `$name`/`${name}`

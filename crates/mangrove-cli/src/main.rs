@@ -78,8 +78,15 @@ fn cmd_hash(path: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // L3 eval: reduce params/references to plain values before hashing (D35).
-    let body = match mangrove_typed::eval(&doc.body, &doc.params, &doc.fns, &env) {
+    // L3 eval: reduce params/references/calls to plain values before hashing (D35).
+    let modules = match build_modules(&doc.modules) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let body = match mangrove_typed::eval(&doc.body, &doc.params, &doc.fns, &env, &modules) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{path}: {e}");
@@ -148,6 +155,27 @@ fn effective_schema(
     }
 }
 
+/// Build the eval module map (alias → callable module) from the composed
+/// document's direct `use` aliases (§6.1, M4d.2).
+fn build_modules(
+    modules: &std::collections::BTreeMap<String, mangrove_compose::Composed>,
+) -> Result<std::collections::BTreeMap<String, mangrove_typed::Module>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for (alias, c) in modules {
+        let types = mangrove_typed::TypeEnv::build(&c.typedefs, &c.unitdefs)?;
+        out.insert(
+            alias.clone(),
+            mangrove_typed::Module {
+                params: c.params.clone(),
+                fns: c.fns.clone(),
+                body: c.body.clone(),
+                types,
+            },
+        );
+    }
+    Ok(out)
+}
+
 /// Whether a value tree contains an unresolved unit literal (schemaless guard, D14).
 fn contains_unit(v: &mangrove_core::Value) -> bool {
     use mangrove_core::Value;
@@ -174,8 +202,15 @@ fn cmd_check(path: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // L3 eval: reduce params/references before validating (D35).
-    let body = match mangrove_typed::eval(&doc.body, &doc.params, &doc.fns, &env) {
+    // L3 eval: reduce params/references/calls before validating (D35).
+    let modules = match build_modules(&doc.modules) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let body = match mangrove_typed::eval(&doc.body, &doc.params, &doc.fns, &env, &modules) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{path}: {e}");

@@ -246,6 +246,42 @@ fn scale_equivalent_decimal_interpolations_hash_equal() {
 }
 
 #[test]
+fn module_call_hashes_like_literal() {
+    // §6.1: emit: webapp(env: "prod") instantiates a parameterized module and
+    // must hash like the hand-written value the module produces for env="prod".
+    let dir = std::env::temp_dir().join(format!("m4d2_cli_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("module.mang"),
+        "params { env: \"dev\" | \"staging\" | \"prod\" }\n\
+         name: \"api\"\nreplicas: match env { dev: 1, staging: 2, prod: 6 }\n",
+    )
+    .unwrap();
+    let types = "type Inner = { name: str, replicas: int }\ntype D = { emit: Inner }\n";
+    std::fs::write(
+        dir.join("root.mang"),
+        format!("use \"./module.mang\" as webapp\n{types}schema D\nemit: webapp(env: \"prod\")\n"),
+    )
+    .unwrap();
+    let hand = dir.join("hand.mang");
+    std::fs::write(
+        &hand,
+        format!("{types}schema D\nemit: {{ name: \"api\", replicas: 6 }}\n"),
+    )
+    .unwrap();
+    let h = |p: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg("hash")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert_eq!(h(&dir.join("root.mang")), h(&hand));
+}
+
+#[test]
 fn fn_call_hashes_like_literal() {
     // §6.2: port(8443) is sugar for { number: 8443, name: "http" }.
     let types = "type Port = { number: int, name: str }\ntype D = { p: Port }\n";
