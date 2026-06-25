@@ -35,6 +35,11 @@ pub struct Lockfile {
 }
 
 /// `"b3:" + BLAKE3(bytes)` — the content address of imported *source bytes* (§5.2).
+///
+/// ```
+/// let h = mangrove_resolve::source_hash(b"name: \"x\"\n");
+/// assert!(h.starts_with("b3:") && h.len() == 3 + 64);
+/// ```
 pub fn source_hash(bytes: &[u8]) -> String {
     format!("b3:{}", blake3::hash(bytes).to_hex())
 }

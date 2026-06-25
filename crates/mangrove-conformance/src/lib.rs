@@ -10,6 +10,12 @@ use std::path::{Path, PathBuf};
 
 /// Returns the `(input.mang, input.expected)` vector pairs in `dir`, sorted by
 /// input path. Panics if a `.mang` file has no sibling `.expected`.
+///
+/// ```
+/// let dir = std::env::temp_dir().join("mangrove_conformance_doctest");
+/// std::fs::create_dir_all(&dir).unwrap();
+/// assert!(mangrove_conformance::vector_pairs(&dir).is_empty());
+/// ```
 pub fn vector_pairs(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut pairs = Vec::new();
     let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));

@@ -11,6 +11,12 @@ use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive};
 
 /// Encode a value to its canonical CBOR byte representation.
+///
+/// ```
+/// use mangrove_core::Value;
+/// // canonical CBOR of `true` is the single byte 0xf5
+/// assert_eq!(mangrove_cbor::encode(&Value::Bool(true)), vec![0xf5]);
+/// ```
 pub fn encode(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     encode_into(value, &mut out);

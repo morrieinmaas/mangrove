@@ -43,6 +43,13 @@ pub struct Composed {
 /// Compose the document at `path`, resolving local `use`s, spreads, and — via
 /// the resolver + lockfile (`.mangrove/resolvers.toml`, `mangrove.lock`) —
 /// namespaced `use`s (hash-verified before evaluation, §5.2).
+///
+/// ```
+/// let p = std::env::temp_dir().join("mangrove_compose_doctest.mang");
+/// std::fs::write(&p, "name: \"x\"\nport: 8443\n").unwrap();
+/// let composed = mangrove_compose::compose(&p).unwrap();
+/// assert!(matches!(composed.body, mangrove_core::Value::Map(_)));
+/// ```
 pub fn compose(path: &Path) -> Result<Composed, String> {
     // The root document is never verified (no importer) and anchors its own
     // resolvers/lock by upward search (pkg_root = None).

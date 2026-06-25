@@ -183,4 +183,128 @@ mod tests {
         let t = "{ a: int, require: a <= b }"; // b not a field
         assert!(check(t, &[("a", Value::Int(1.into()))]).is_err());
     }
+
+    fn i(n: i64) -> Value {
+        Value::Int(n.into())
+    }
+
+    #[test]
+    fn every_comparison_operator() {
+        let cmp = |op: &str, a: i64, b: i64| {
+            let t = format!("{{ a: int, b: int, require: a {op} b }}");
+            check(&t, &[("a", i(a)), ("b", i(b))])
+        };
+        assert_eq!(cmp("==", 1, 1), Ok(true));
+        assert_eq!(cmp("==", 1, 2), Ok(false));
+        assert_eq!(cmp("!=", 1, 2), Ok(true));
+        assert_eq!(cmp("!=", 2, 2), Ok(false));
+        assert_eq!(cmp("<", 1, 2), Ok(true));
+        assert_eq!(cmp("<=", 2, 2), Ok(true));
+        assert_eq!(cmp(">", 3, 2), Ok(true));
+        assert_eq!(cmp(">=", 2, 2), Ok(true));
+    }
+
+    #[test]
+    fn and_not_truthy() {
+        assert_eq!(
+            check(
+                "{ a: int, b: int, c: int, require: a < b && b < c }",
+                &[("a", i(1)), ("b", i(2)), ("c", i(3))]
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            check(
+                "{ a: int, b: int, require: !(a == b) }",
+                &[("a", i(1)), ("b", i(2))]
+            ),
+            Ok(true)
+        );
+        // a bare boolean field is a truthy predicate
+        assert_eq!(
+            check(
+                "{ flag: bool, require: flag }",
+                &[("flag", Value::Bool(true))]
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            check(
+                "{ flag: bool, require: flag }",
+                &[("flag", Value::Bool(false))]
+            ),
+            Ok(false)
+        );
+        // truthy on a non-bool → error, not panic
+        assert!(check("{ a: int, require: a }", &[("a", i(1))]).is_err());
+    }
+
+    #[test]
+    fn string_bool_and_decimal_operands() {
+        assert_eq!(
+            check(
+                "{ s: str, require: s == \"x\" }",
+                &[("s", Value::Str("x".into()))]
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            check(
+                "{ b: bool, require: b == true }",
+                &[("b", Value::Bool(true))]
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            check(
+                "{ r: decimal, require: r >= 0.5 }",
+                &[("r", Value::Decimal("0.5".parse().unwrap()))]
+            ),
+            Ok(true)
+        );
+        // cross-kind equality is false, not an error
+        assert_eq!(
+            check(
+                "{ a: int, s: str, require: a == s }",
+                &[("a", i(1)), ("s", Value::Str("1".into()))]
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn len_on_map_string_and_non_container() {
+        let mut m = BTreeMap::new();
+        m.insert("k".to_string(), i(1));
+        assert_eq!(
+            check(
+                "{ m: { k: int }, require: len(m) >= 1 }",
+                &[("m", Value::Map(m))]
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            check(
+                "{ s: str, require: len(s) == 3 }",
+                &[("s", Value::Str("abc".into()))]
+            ),
+            Ok(true)
+        );
+        assert!(check("{ a: int, require: len(a) >= 1 }", &[("a", i(1))]).is_err());
+    }
+
+    #[test]
+    fn nested_field_path() {
+        let mut inner = BTreeMap::new();
+        inner.insert("x".to_string(), i(5));
+        assert_eq!(
+            check(
+                "{ inner: { x: int }, require: inner.x >= 1 }",
+                &[("inner", Value::Map(inner))]
+            ),
+            Ok(true)
+        );
+        // a path that descends into a non-record errors
+        assert!(check("{ a: int, require: a.x >= 1 }", &[("a", i(1))]).is_err());
+    }
 }

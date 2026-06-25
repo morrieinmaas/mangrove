@@ -7,6 +7,13 @@ use std::cmp::Ordering;
 /// Returns `Some(n)` if `d` is an exact integer, else `None`.
 /// Used to enforce "fractional unit literals are legal iff exact in the base
 /// unit" (§4.5): `0.5btc` resolves, `0.5sat` does not.
+///
+/// ```
+/// use std::str::FromStr;
+/// use bigdecimal::BigDecimal;
+/// assert_eq!(mangrove_core::exact_bigint(&BigDecimal::from_str("42.0").unwrap()), Some(42.into()));
+/// assert_eq!(mangrove_core::exact_bigint(&BigDecimal::from_str("4.2").unwrap()), None);
+/// ```
 pub fn exact_bigint(d: &BigDecimal) -> Option<BigInt> {
     // `d == digits * 10^(-scale)`
     let (digits, scale) = d.as_bigint_and_exponent();

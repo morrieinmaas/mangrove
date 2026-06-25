@@ -259,13 +259,20 @@ fn sub(new: &Type, old: &Type, env: &TypeEnv, depth: usize) -> Result<(), String
 
 #[cfg(test)]
 mod tests {
-    use super::is_subtype;
-    use mangrove_syntax::parse_type;
+    use super::{is_subtype, narrowed_schema};
+    use mangrove_syntax::{Type, TypeDef, UnitDef, parse_type};
     use mangrove_typed::TypeEnv;
 
+    fn env0() -> TypeEnv {
+        TypeEnv::build(&[], &[]).unwrap()
+    }
     fn ok(new: &str, old: &str) -> bool {
-        let env = TypeEnv::build(&[], &[]).unwrap();
-        is_subtype(&parse_type(new).unwrap(), &parse_type(old).unwrap(), &env).is_ok()
+        is_subtype(
+            &parse_type(new).unwrap(),
+            &parse_type(old).unwrap(),
+            &env0(),
+        )
+        .is_ok()
     }
 
     #[test]
@@ -303,5 +310,75 @@ mod tests {
     fn loosening_is_rejected() {
         assert!(!ok("str", "int")); // unrelated
         assert!(!ok("int", "int & >= 1")); // int wider than refined
+    }
+
+    #[test]
+    fn decimal_interval_containment() {
+        assert!(ok("decimal & >= 0.0 & <= 1.0", "decimal")); // refined <: decimal
+        assert!(ok("decimal & >= 0.5", "decimal & >= 0.0")); // contained
+        assert!(!ok("decimal", "decimal & <= 1.0")); // wider than bounded
+        assert!(!ok("decimal & <= 2.0", "decimal & <= 1.0")); // 2.0 not <= 1.0
+    }
+
+    #[test]
+    fn literals_unions_and_bytes() {
+        assert!(ok("\"x\"", "str")); // LitStr <: str
+        assert!(ok("5", "int & >= 1 & <= 10")); // LitInt within the range
+        assert!(!ok("5", "int & >= 6")); // LitInt out of range
+        assert!(ok("bytes", "bytes")); // exact primitive
+        assert!(ok("\"a\" | \"b\"", "str")); // union-on-new: every variant <: str
+    }
+
+    #[test]
+    fn map_and_record_to_map() {
+        let env = env0();
+        let map_int = Type::Map(Box::new(Type::Int));
+        // record <: map: every field's type <: the map's value type
+        let rec = parse_type("{ a: int & >= 0, b: int }").unwrap();
+        assert!(is_subtype(&rec, &map_int, &env).is_ok());
+        // map <: map is covariant in the value type
+        let narrow = Type::Map(Box::new(parse_type("int & >= 0").unwrap()));
+        assert!(is_subtype(&narrow, &map_int, &env).is_ok());
+        // a field whose type isn't <: the map value is rejected
+        assert!(is_subtype(&parse_type("{ a: str }").unwrap(), &map_int, &env).is_err());
+    }
+
+    #[test]
+    fn named_and_unit_resolution() {
+        let types = [TypeDef {
+            name: "Pos".into(),
+            ty: parse_type("int & >= 1").unwrap(),
+            annotations: vec![],
+        }];
+        let units = [UnitDef {
+            name: "Bytes".into(),
+            members: vec![("B".into(), 1.into())],
+        }];
+        let env = TypeEnv::build(&types, &units).unwrap();
+        assert!(is_subtype(&Type::Named("Pos".into()), &Type::Int, &env).is_ok()); // named refinement <: int
+        assert!(is_subtype(&Type::Named("Bytes".into()), &Type::Int, &env).is_ok()); // unit resolves to int
+        assert!(is_subtype(&Type::Named("Nope".into()), &Type::Int, &env).is_err()); // unknown name
+    }
+
+    #[test]
+    fn deep_nesting_errors_not_overflows() {
+        let mut t = Type::Int;
+        for _ in 0..200 {
+            t = Type::List(Box::new(t));
+        }
+        assert!(is_subtype(&t, &t, &env0()).is_err()); // hits MAX_DEPTH cleanly
+    }
+
+    #[test]
+    fn narrowed_schema_builds_and_rejects() {
+        let env = env0();
+        let base = parse_type("{ a: int, b: str }").unwrap();
+        // narrowing field `a` is accepted, and the field actually narrows
+        assert!(narrowed_schema(&base, &parse_type("{ a: int & >= 0 }").unwrap(), &env).is_ok());
+        // adding a field the base lacks is rejected
+        assert!(narrowed_schema(&base, &parse_type("{ c: int }").unwrap(), &env).is_err());
+        // a non-record base, or a non-record narrowing, both error
+        assert!(narrowed_schema(&Type::Int, &parse_type("{ a: int }").unwrap(), &env).is_err());
+        assert!(narrowed_schema(&base, &Type::Int, &env).is_err());
     }
 }

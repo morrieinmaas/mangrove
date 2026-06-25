@@ -14,6 +14,12 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// Parse a single type expression (test/embedding entrypoint).
+///
+/// ```
+/// // a refinement and a record both parse
+/// assert!(mangrove_syntax::parse_type("int & >= 1 & <= 65535").is_ok());
+/// assert!(mangrove_syntax::parse_type("{ host: str, port: int }").is_ok());
+/// ```
 pub fn parse_type(src: &str) -> Result<Type, ParseError> {
     let tokens = lex(src).map_err(|e| ParseError {
         message: e.message,

@@ -10,6 +10,16 @@ use regex::Regex;
 use std::collections::HashSet;
 
 /// Validate `value` against `ty`. An empty Vec means valid.
+///
+/// ```
+/// use mangrove_core::Value;
+/// use mangrove_syntax::Type;
+/// use mangrove_typed::{TypeEnv, validate};
+///
+/// let env = TypeEnv::build(&[], &[]).unwrap();
+/// assert!(validate(&Value::Int(5.into()), &Type::Int, &env).is_empty());
+/// assert!(!validate(&Value::Str("x".into()), &Type::Int, &env).is_empty());
+/// ```
 pub fn validate(value: &Value, ty: &Type, env: &TypeEnv) -> Vec<ValidationError> {
     check(value, ty, "", env)
 }
@@ -536,5 +546,60 @@ mod tests {
         // default 0 violates >= 1
         let v = map(&[]);
         assert_eq!(validate(&v, &ty("{ n: int & >= 1 | *0 }"), &env()).len(), 1);
+    }
+
+    fn d(s: &str) -> Value {
+        Value::Decimal(s.parse().unwrap())
+    }
+
+    #[test]
+    fn decimal_range_bounds_and_kind() {
+        assert!(errs(d("0.5"), "decimal & >= 0.0 & <= 1.0").is_empty());
+        assert_eq!(errs(d("-0.1"), "decimal & >= 0.0").len(), 1); // below min
+        assert_eq!(errs(d("2.0"), "decimal & <= 1.0").len(), 1); // above max
+        assert_eq!(errs(Value::Int(1.into()), "decimal & >= 0.0").len(), 1); // wrong kind
+    }
+
+    #[test]
+    fn literal_type_mismatches() {
+        assert!(errs(Value::Int(1.into()), "1").is_empty());
+        assert!(errs(Value::Bool(true), "true").is_empty());
+        assert_eq!(errs(Value::Int(2.into()), "1").len(), 1); // LitInt miss
+        assert_eq!(errs(Value::Bool(false), "true").len(), 1); // LitBool miss
+        assert_eq!(errs(Value::Str("y".into()), "\"x\"").len(), 1); // LitStr miss
+    }
+
+    #[test]
+    fn container_kind_mismatches() {
+        assert_eq!(errs(Value::Int(1.into()), "{ a: int }").len(), 1); // record vs non-map
+        assert_eq!(errs(Value::Int(1.into()), "[ int ]").len(), 1); // list vs non-list
+        assert_eq!(errs(Value::Int(1.into()), "{ [str]: int }").len(), 1); // map vs non-map
+    }
+
+    #[test]
+    fn unit_type_accepts_bare_int_rejects_other_kinds() {
+        let env = bytes_env();
+        // a bare base-unit integer is accepted into a unit-typed slot (§4.5)
+        assert!(validate(&Value::Int(42.into()), &Type::Named("Bytes".into()), &env).is_empty());
+        // any other kind is a mismatch
+        assert_eq!(
+            validate(&Value::Str("x".into()), &Type::Named("Bytes".into()), &env).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unknown_named_type_errors() {
+        let e = validate(&Value::Int(1.into()), &Type::Named("Nope".into()), &env());
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].failed.as_deref(), Some("unknown type"));
+    }
+
+    #[test]
+    fn invalid_schema_regex_errors() {
+        // `[` is an unclosed character class — invalid regex compiled at validate time
+        let e = errs(Value::Str("x".into()), "str & =~ \"[\"");
+        assert_eq!(e.len(), 1);
+        assert!(e[0].failed.as_deref().unwrap().contains("valid regex"));
     }
 }
