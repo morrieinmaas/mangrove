@@ -40,3 +40,23 @@ This is a localized change to the compose driver; the resolver/lockfile types (`
 
 - Cross-file *type* imports from a dep's own deps (nested type imports) — M6 is one level; this stays.
 - A workspace-wide lock override flag — not needed; per-package is the model.
+
+---
+
+## Post-review note (M7)
+
+The M7 adversarial review came back clean: no unverified bytes reach eval, no
+wrong-lock substitution, no consumer-config leak (verified for both backends,
+including the git checkout physically nested under the consumer's
+`.mangrove/cache/`), fail-closed at every level, read-once/no-TOCTOU preserved,
+and all existing tests unchanged.
+
+One containment nuance (by design, not a finding): a dependency's *own*
+`resolvers.toml` may set `remote`/`git` to a path outside its own subtree (e.g.
+`../..`), and those values are not path-confined. But every file so read is still
+hash-gated by that package's own lock — a stale/wrong pin fails closed
+(`integrity check failed`). So a dependency can neither introduce unpinned content
+nor read bytes whose hash it does not already pin. This is the same trust model as
+pre-M7 (the root's resolvers could always point `remote` anywhere); D50 only
+localizes it per package. Hard subtree-confinement of `remote`/`git` values would
+be a new constraint beyond D27's promise, not a weakening of it.
