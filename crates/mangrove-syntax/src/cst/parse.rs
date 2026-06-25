@@ -44,7 +44,7 @@ impl<'a> Parser<'a> {
         while i < self.toks.len() && self.toks[i].kind.is_trivia() {
             i += 1;
         }
-        self.toks[i].kind
+        self.toks.get(i).map_or(SyntaxKind::EOF, |t| t.kind)
     }
 
     /// Push all pending trivia onto the tree, then return.
@@ -86,10 +86,10 @@ fn rowan_kind(k: SyntaxKind) -> rowan::SyntaxKind {
 
 pub fn parse_cst(src: &str) -> Parse {
     let mut p = Parser::new(src);
-    p.start(SyntaxKind::DOCUMENT);
+    p.builder.start_node(rowan_kind(SyntaxKind::DOCUMENT));
     parse_document(&mut p);
     p.eat_trivia(); // trailing trivia before EOF stays in the tree
-    p.finish();
+    p.builder.finish_node();
     Parse {
         green: p.builder.finish(),
         errors: p.errors,

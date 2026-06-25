@@ -11,6 +11,23 @@ fn parses_a_simple_binding_into_a_lossless_tree() {
     assert_eq!(node.kind(), SyntaxKind::DOCUMENT);
 }
 
+#[test]
+fn parses_with_leading_trivia_losslessly() {
+    for src in [
+        "  port: 8443\n",       // leading whitespace
+        "# lead\nport: 8443\n", // leading comment
+        "\n\nport: 8443\n",     // leading blank lines
+    ] {
+        let node = super::parse::parse_cst(src).syntax();
+        assert_eq!(
+            node.text().to_string(),
+            src,
+            "tree must be lossless for {src:?}"
+        );
+        assert_eq!(node.kind(), SyntaxKind::DOCUMENT);
+    }
+}
+
 use super::kind::SyntaxKind;
 
 #[test]
