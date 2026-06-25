@@ -44,12 +44,14 @@ fn main() -> ExitCode {
         Some("gen-openapi") => match args.get(2) {
             // `gen-openapi <spec.json> [--root <Definition>]`
             Some(path) => {
-                let root = if args.get(3).map(String::as_str) == Some("--root") {
-                    args.get(4).map(String::as_str)
+                if args.get(3).map(String::as_str) == Some("--root") {
+                    match args.get(4) {
+                        Some(root) => cmd_gen_openapi(path, Some(root)),
+                        None => usage(), // bare `--root` with no value
+                    }
                 } else {
-                    None
-                };
-                cmd_gen_openapi(path, root)
+                    cmd_gen_openapi(path, None)
+                }
             }
             None => usage(),
         },

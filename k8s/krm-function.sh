@@ -9,23 +9,28 @@
 #   source: |
 #     <inline Mangrove document>
 #
-# Requires `mangrove` and `yq` on PATH (both present in the container image).
+# Requires `mangrove` and mikefarah `yq` (v4) on PATH — both in the container image.
 set -euo pipefail
 
-input="$(cat)"
-src="$(printf '%s' "$input" | yq e '.functionConfig.source // ""' -)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+cat > "$tmp/in.yaml"
+
+src="$(yq '.functionConfig.source // ""' "$tmp/in.yaml")"
 if [ -z "$src" ]; then
   # nothing to render — pass the stream through unchanged
-  printf '%s' "$input"
+  cat "$tmp/in.yaml"
   exit 0
 fi
 
-tmp="$(mktemp -t mangrove-krm.XXXXXX.mang)"
-trap 'rm -f "$tmp"' EXIT
-printf '%s' "$src" > "$tmp"
-rendered="$(mangrove export "$tmp" --to yaml)"
+printf '%s' "$src" > "$tmp/doc.mang"
+mangrove export "$tmp/doc.mang" --to yaml > "$tmp/rendered.yaml"   # set -e aborts if render fails
 
-# Append the rendered resource(s) to the ResourceList's items. A Mangrove `List`
-# (kind: List) is flattened into individual items; any other doc is one item.
-printf '%s' "$input" | yq e ".items += [$(printf '%s' "$rendered" | yq e -o=json '
-  if .kind == "List" then .items[] else . end' - | yq e -o=json -)]" -
+# Normalise the rendered output into a sequence of resources: a Kubernetes `List`
+# is flattened to its items; any other document is a single-element sequence.
+# `eval-all` handles a multi-document render; `load()` merges as data (no string
+# interpolation into the yq program — avoids breakage/injection).
+yq ea '[ (select(.kind == "List") | .items[]), select(.kind != "List") ]' \
+  "$tmp/rendered.yaml" > "$tmp/seq.yaml"
+
+yq '.items += load("'"$tmp"'/seq.yaml")' "$tmp/in.yaml"

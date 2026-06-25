@@ -15,7 +15,7 @@
 //! Target a `root` to generate just the closure you need (recommended).
 
 use serde_json::{Map, Value as J};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The generated Mangrove source plus any advisory warnings.
 pub struct Generated {
@@ -61,19 +61,45 @@ pub fn generate(spec_json: &str, root: Option<&str>) -> Result<Generated, String
         ));
     }
 
+    // Only definitions actually present in the spec are emitted; a dangling
+    // `$ref` resolves to no emitted type (→ opaque), never an index panic.
+    let mut present: Vec<&str> = selected
+        .iter()
+        .copied()
+        .filter(|n| defs.contains_key(*n))
+        .collect();
+    present.sort();
+
+    // Assign a unique, collision-resolved Mangrove name to each emitted def, so
+    // two definitions that sanitize to the same identifier don't both emit
+    // `type X = …` (which `TypeEnv` would reject as a duplicate). `$ref`s resolve
+    // through this same map, so references stay consistent.
+    let mut type_names: BTreeMap<String, String> = BTreeMap::new();
+    let mut used: BTreeSet<String> = ["OpaqueObject".to_string()].into_iter().collect();
+    for orig in &present {
+        let base = sanitize(orig);
+        let mut n = base.clone();
+        let mut i = 2;
+        while used.contains(&n) {
+            n = format!("{base}_{i}");
+            i += 1;
+        }
+        used.insert(n.clone());
+        type_names.insert((*orig).to_string(), n);
+    }
+
     let mut used_opaque = false;
     let mut body = String::new();
-    let mut sorted: Vec<&str> = selected.iter().copied().collect();
-    sorted.sort();
-    for name in sorted {
+    for orig in &present {
         let ty = render(
-            &defs[name],
+            &defs[*orig],
             defs,
             &in_cycle,
+            &type_names,
             &mut used_opaque,
             &mut warnings,
         );
-        body.push_str(&format!("type {} = {}\n", sanitize(name), ty));
+        body.push_str(&format!("type {} = {}\n", type_names[*orig], ty));
     }
 
     let mut types = String::new();
@@ -189,7 +215,27 @@ fn sanitize(name: &str) -> String {
     s
 }
 
-/// Render a field key: a bare identifier, else a quoted string key.
+/// Emit a Mangrove string literal. Unlike Rust's `{:?}`, this also escapes `$`,
+/// which Mangrove interpolates inside `"…"` — so e.g. a property named `$ref` or
+/// an enum value `${HOME}` round-trips as a literal instead of a parse error.
+fn mstr(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '$' => out.push_str("\\$"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Render a field key: a bare identifier, else a quoted (Mangrove-escaped) key.
 fn field_key(name: &str) -> String {
     let simple = !name.is_empty()
         && name
@@ -199,17 +245,14 @@ fn field_key(name: &str) -> String {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
-    if simple {
-        name.to_string()
-    } else {
-        format!("{name:?}")
-    }
+    if simple { name.to_string() } else { mstr(name) }
 }
 
 fn render(
     schema: &J,
     defs: &Map<String, J>,
     in_cycle: &BTreeSet<&str>,
+    type_names: &BTreeMap<String, String>,
     used_opaque: &mut bool,
     warnings: &mut Vec<String>,
 ) -> String {
@@ -220,10 +263,37 @@ fn render(
 
     if let Some(r) = schema.get("$ref").and_then(J::as_str) {
         let target = ref_name(r);
-        if in_cycle.contains(target) {
-            return opaque(used_opaque);
+        // Resolve through the emitted-name map; a cycle-closing or dangling ref
+        // becomes opaque (so the output is always acyclic and builds).
+        return match type_names.get(target) {
+            Some(n) if !in_cycle.contains(target) => n.clone(),
+            _ => opaque(used_opaque),
+        };
+    }
+    // `allOf` is an intersection: representable only when it wraps a single schema
+    // (the common k8s `allOf: [{$ref}]` + description). Multiple → opaque.
+    if let Some(J::Array(arr)) = schema.get("allOf") {
+        return match arr.as_slice() {
+            [one] => render(one, defs, in_cycle, type_names, used_opaque, warnings),
+            _ => opaque(used_opaque),
+        };
+    }
+    // `oneOf`/`anyOf` → a Mangrove union of the (non-null) members.
+    for key in ["oneOf", "anyOf"] {
+        if let Some(J::Array(arr)) = schema.get(key) {
+            let mut seen = BTreeSet::new();
+            let parts: Vec<String> = arr
+                .iter()
+                .filter(|m| m.get("type").and_then(J::as_str) != Some("null"))
+                .map(|m| render(m, defs, in_cycle, type_names, used_opaque, warnings))
+                .filter(|p| seen.insert(p.clone()))
+                .collect();
+            return if parts.is_empty() {
+                opaque(used_opaque)
+            } else {
+                parts.join(" | ")
+            };
         }
-        return sanitize(target);
     }
     // Kubernetes int-or-string quantities.
     if schema.get("format").and_then(J::as_str) == Some("int-or-string") {
@@ -231,15 +301,28 @@ fn render(
     }
     // An object with declared properties → a record.
     if schema.get("properties").and_then(J::as_object).is_some() {
-        return render_record(schema, defs, in_cycle, used_opaque, warnings);
+        return render_record(schema, defs, in_cycle, type_names, used_opaque, warnings);
     }
-    match schema.get("type").and_then(J::as_str) {
+    // `type` may be a string or, in OpenAPI v3, an array like ["string","null"].
+    // Mangrove has no null, so the non-null member governs (nullability is carried
+    // by the field's optionality, not a null value).
+    let type_str: Option<String> = match schema.get("type") {
+        Some(J::String(s)) => Some(s.clone()),
+        Some(J::Array(a)) => a
+            .iter()
+            .filter_map(J::as_str)
+            .find(|s| *s != "null")
+            .map(String::from),
+        _ => None,
+    };
+    match type_str.as_deref() {
         Some("object") => match schema.get("additionalProperties") {
             Some(J::Object(_)) => {
                 let v = render(
                     &schema["additionalProperties"],
                     defs,
                     in_cycle,
+                    type_names,
                     used_opaque,
                     warnings,
                 );
@@ -250,17 +333,13 @@ fn render(
         Some("array") => match schema.get("items") {
             Some(items) => format!(
                 "[ {} ]",
-                render(items, defs, in_cycle, used_opaque, warnings)
+                render(items, defs, in_cycle, type_names, used_opaque, warnings)
             ),
             None => format!("[ {} ]", opaque(used_opaque)),
         },
         Some("string") => {
             if let Some(J::Array(en)) = schema.get("enum") {
-                let lits: Vec<String> = en
-                    .iter()
-                    .filter_map(J::as_str)
-                    .map(|s| format!("{s:?}"))
-                    .collect();
+                let lits: Vec<String> = en.iter().filter_map(J::as_str).map(mstr).collect();
                 if !lits.is_empty() {
                     return lits.join(" | ");
                 }
@@ -278,6 +357,7 @@ fn render_record(
     schema: &J,
     defs: &Map<String, J>,
     in_cycle: &BTreeSet<&str>,
+    type_names: &BTreeMap<String, String>,
     used_opaque: &mut bool,
     warnings: &mut Vec<String>,
 ) -> String {
@@ -294,7 +374,7 @@ fn render_record(
         } else {
             "?"
         };
-        let ty = render(pschema, defs, in_cycle, used_opaque, warnings);
+        let ty = render(pschema, defs, in_cycle, type_names, used_opaque, warnings);
         fields.push(format!("{}{opt}: {ty}", field_key(pname)));
     }
     if fields.is_empty() {
@@ -386,5 +466,69 @@ mod tests {
     #[test]
     fn unknown_root_errors() {
         assert!(generate(SPEC, Some("Nope")).is_err());
+    }
+
+    // ---- regression tests for the review findings ----
+
+    #[test]
+    fn dollar_in_keys_and_enums_is_escaped() {
+        // `$ref` key and `${HOME}` enum must emit LITERAL strings (Mangrove
+        // interpolates `$…` inside "…"), not parse-breaking interpolations.
+        let spec = r##"{ "definitions": { "E": { "type": "object", "required": [],
+          "properties": {
+            "$ref": { "type": "string" },
+            "mode": { "type": "string", "enum": ["a$b", "${HOME}"] } } } } }"##;
+        let g = generate(spec, Some("E")).unwrap();
+        assert!(g.types.contains("\"\\$ref\"?: str"), "{}", g.types);
+        assert!(g.types.contains("\"a\\$b\""), "{}", g.types);
+        assert!(g.types.contains("\"\\${HOME}\""), "{}", g.types);
+    }
+
+    #[test]
+    fn dangling_ref_is_opaque_not_a_panic() {
+        let spec = r##"{ "definitions": { "A": { "type": "object", "required": ["b"],
+          "properties": { "b": { "$ref": "#/definitions/Missing" } } } } }"##;
+        let g = generate(spec, Some("A")).unwrap();
+        assert!(g.types.contains("b: OpaqueObject"), "{}", g.types);
+        assert!(!g.types.contains("type Missing"));
+    }
+
+    #[test]
+    fn sanitize_collisions_get_unique_names() {
+        let spec = r##"{ "definitions": {
+          "a.b": { "type": "object", "required": ["x"], "properties": { "x": { "type": "integer" } } },
+          "a_b": { "type": "object", "required": ["y"], "properties": { "y": { "type": "string" } } }
+        } }"##;
+        let g = generate(spec, None).unwrap();
+        // both emit, under distinct names (no duplicate `type a_b`)
+        assert_eq!(g.types.matches("type a_b ").count(), 1, "{}", g.types);
+        assert!(g.types.contains("type a_b_2 ="), "{}", g.types);
+    }
+
+    #[test]
+    fn allof_wrapped_ref_resolves_to_the_ref() {
+        let spec = r##"{ "definitions": {
+          "Meta": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } },
+          "Dep": { "type": "object", "required": ["metadata"], "properties": {
+            "metadata": { "description": "wrapped", "allOf": [ { "$ref": "#/definitions/Meta" } ] } } }
+        } }"##;
+        let g = generate(spec, Some("Dep")).unwrap();
+        assert!(g.types.contains("metadata: Meta"), "{}", g.types); // not OpaqueObject
+    }
+
+    #[test]
+    fn v3_nullable_array_type_uses_the_non_null_member() {
+        let spec = r##"{ "definitions": { "N": { "type": "object", "required": ["s"],
+          "properties": { "s": { "type": ["string", "null"] } } } } }"##;
+        let g = generate(spec, Some("N")).unwrap();
+        assert!(g.types.contains("s: str"), "{}", g.types); // not OpaqueObject
+    }
+
+    #[test]
+    fn oneof_becomes_a_union() {
+        let spec = r##"{ "definitions": { "U": { "type": "object", "required": ["v"],
+          "properties": { "v": { "oneOf": [ { "type": "integer" }, { "type": "string" } ] } } } } }"##;
+        let g = generate(spec, Some("U")).unwrap();
+        assert!(g.types.contains("v: int | str"), "{}", g.types);
     }
 }
