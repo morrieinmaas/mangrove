@@ -10,7 +10,7 @@ repository.workspace = true
 mangrove-core = { path = "../mangrove-core" }
 num-bigint = { workspace = true }
 bigdecimal = { workspace = true }
-rowan = "0.16"
+rowan = { workspace = true }
 
 [lints]
 workspace = true
