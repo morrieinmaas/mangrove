@@ -72,6 +72,23 @@ fn imported_yaml_is_valid_mangrove() {
 }
 
 #[test]
+fn boolean_key_round_trips() {
+    // TOML `true = 1` is a legal key; import → mangrove → hash must succeed (the
+    // rendered key is quoted so it doesn't lex as a Bool token).
+    let t = std::env::temp_dir().join("m5_boolkey.toml");
+    std::fs::write(&t, "true = 1\nfalse = 2\n").unwrap();
+    let mang = stdout(&mangrove(&["import", t.to_str().unwrap()]));
+    let p = std::env::temp_dir().join("m5_boolkey.mang");
+    std::fs::write(&p, mang).unwrap();
+    let out = mangrove(&["hash", p.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "rendered doc did not re-parse: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn yaml_null_is_rejected() {
     let y = std::env::temp_dir().join("m5_null.yaml");
     std::fs::write(&y, "a: null\n").unwrap();

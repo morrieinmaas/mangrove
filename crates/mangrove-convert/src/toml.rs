@@ -12,10 +12,13 @@ use num_traits::ToPrimitive;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
+/// Bound on nesting depth (matches the parser) — guards both directions.
+const MAX_DEPTH: usize = 128;
+
 /// Parse a TOML document into a `Value` (schemaless L0 data, D42).
 pub fn import(s: &str) -> Result<Value, String> {
     let table: ::toml::Table = s.parse().map_err(|e| format!("TOML parse error: {e}"))?;
-    toml_table_to_value(&table, "")
+    toml_table_to_value(&table, "", 0)
 }
 
 /// Serialize a `Value` (post-eval, no markers) as TOML. The root must be a map.
@@ -23,11 +26,14 @@ pub fn export(v: &Value) -> Result<String, String> {
     let Value::Map(_) = v else {
         return Err("a TOML document root must be a map".into());
     };
-    let tv = value_to_toml(v)?;
+    let tv = value_to_toml(v, 0)?;
     ::toml::to_string(&tv).map_err(|e| format!("TOML emit error: {e}"))
 }
 
-fn toml_table_to_value(t: &::toml::Table, path: &str) -> Result<Value, String> {
+fn toml_table_to_value(t: &::toml::Table, path: &str, depth: usize) -> Result<Value, String> {
+    if depth >= MAX_DEPTH {
+        return Err(format!("{path}: nesting too deep"));
+    }
     let mut m = BTreeMap::new();
     for (k, v) in t {
         let child = if path.is_empty() {
@@ -35,13 +41,16 @@ fn toml_table_to_value(t: &::toml::Table, path: &str) -> Result<Value, String> {
         } else {
             format!("{path}.{k}")
         };
-        m.insert(k.clone(), toml_to_value(v, &child)?);
+        m.insert(k.clone(), toml_to_value(v, &child, depth + 1)?);
     }
     Ok(Value::Map(m))
 }
 
-fn toml_to_value(v: &::toml::Value, path: &str) -> Result<Value, String> {
+fn toml_to_value(v: &::toml::Value, path: &str, depth: usize) -> Result<Value, String> {
     use ::toml::Value as T;
+    if depth >= MAX_DEPTH {
+        return Err(format!("{path}: nesting too deep"));
+    }
     Ok(match v {
         T::Integer(i) => Value::Int(BigInt::from(*i)),
         // Route through the shortest round-trip text, not the raw f64 bits.
@@ -55,16 +64,19 @@ fn toml_to_value(v: &::toml::Value, path: &str) -> Result<Value, String> {
         T::Array(a) => {
             let mut out = Vec::with_capacity(a.len());
             for (i, item) in a.iter().enumerate() {
-                out.push(toml_to_value(item, &format!("{path}[{i}]"))?);
+                out.push(toml_to_value(item, &format!("{path}[{i}]"), depth + 1)?);
             }
             Value::List(out)
         }
-        T::Table(t) => toml_table_to_value(t, path)?,
+        T::Table(t) => toml_table_to_value(t, path, depth + 1)?,
     })
 }
 
-fn value_to_toml(v: &Value) -> Result<::toml::Value, String> {
+fn value_to_toml(v: &Value, depth: usize) -> Result<::toml::Value, String> {
     use ::toml::Value as T;
+    if depth >= MAX_DEPTH {
+        return Err("nesting too deep".into());
+    }
     Ok(match v {
         Value::Int(n) => match n.to_i64() {
             Some(i) => T::Integer(i),
@@ -79,11 +91,15 @@ fn value_to_toml(v: &Value) -> Result<::toml::Value, String> {
         }
         Value::Str(s) => T::String(s.clone()),
         Value::Bool(b) => T::Boolean(*b),
-        Value::List(xs) => T::Array(xs.iter().map(value_to_toml).collect::<Result<_, _>>()?),
+        Value::List(xs) => T::Array(
+            xs.iter()
+                .map(|x| value_to_toml(x, depth + 1))
+                .collect::<Result<_, _>>()?,
+        ),
         Value::Map(m) => {
             let mut t = ::toml::Table::new();
             for (k, val) in m {
-                t.insert(k.clone(), value_to_toml(val)?);
+                t.insert(k.clone(), value_to_toml(val, depth + 1)?);
             }
             T::Table(t)
         }

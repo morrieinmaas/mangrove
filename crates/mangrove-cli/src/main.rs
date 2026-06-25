@@ -197,6 +197,8 @@ fn format_of(path: &str) -> Option<Format> {
     match std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
     {
         Some("yaml") | Some("yml") => Some(Format::Yaml),
         Some("toml") => Some(Format::Toml),
