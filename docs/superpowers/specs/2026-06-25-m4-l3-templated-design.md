@@ -41,3 +41,23 @@ Each slice is hermetic and TDD. Eval has its own unit tests (expr × env → val
 - Per-type pins (§5.6) still pending cross-file type imports.
 - Recursion in fns (§6.2 says non-recursive — enforced, not supported).
 - Overloading (§6.4 — explicitly not supported).
+
+---
+
+## Post-roadmap addition — text-block interpolation (D47)
+
+The capstone review came back clean (no integration defects; the canonical-form
+guarantee holds across every feature combination). Text-block (`"""…"""`)
+interpolation, deferred in M4b, is now implemented:
+
+- A **non-raw** text block interpolates `$name`/`${name}` after dedent, using the
+  same `$`-rule as plain strings (a `$` before anything but `{`/an identifier is
+  literal). A **raw** text block (`r"""…"""`) is literal — there are no escapes in
+  a text block, so a literal `$` adjacent to an identifier needs a raw block.
+- Implemented as a post-dedent scan (`lexer::interpolate`) producing the same
+  `StrPart` parts as a plain interpolated string, so the parser/eval path is
+  unchanged. `lex_text_block` takes an `is_raw` flag (raw text blocks skip it).
+
+Also from the capstone review (cosmetic): the deep-nesting eval error no longer
+mislabels an acyclic-but-deep expression as "a reference cycle", and compose
+errors are no longer double-prefixed with the file path.

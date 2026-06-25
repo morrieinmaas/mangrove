@@ -84,8 +84,8 @@ fn cmd_update(path: &str) -> ExitCode {
 /// (D12). The shared pipeline behind `hash` and `export`. Errors are pre-formatted
 /// (already prefixed with the path where useful) for the caller to print.
 fn evaluate(path: &str) -> Result<mangrove_core::Value, String> {
-    let doc = mangrove_compose::compose(std::path::Path::new(path))
-        .map_err(|m| format!("{path}: {m}"))?;
+    // compose errors already carry the offending file's path — don't double-prefix.
+    let doc = mangrove_compose::compose(std::path::Path::new(path))?;
     let env = mangrove_typed::TypeEnv::build(&doc.typedefs, &doc.unitdefs)
         .map_err(|m| format!("{path}: schema error: {m}"))?;
     // L3 eval: reduce params/references/calls to plain values (D35).
@@ -270,7 +270,8 @@ fn cmd_check(path: &str) -> ExitCode {
     let doc = match mangrove_compose::compose(std::path::Path::new(path)) {
         Ok(c) => c,
         Err(msg) => {
-            eprintln!("{path}: {msg}");
+            // compose errors already carry the file path.
+            eprintln!("{msg}");
             return ExitCode::from(1);
         }
     };

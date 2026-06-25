@@ -311,7 +311,7 @@ impl Lexer {
                     // Text blocks carry no escapes either way, so both route to the
                     // same literal text-block lexer.
                     if self.starts_with("\"\"\"") {
-                        self.lex_text_block(line, col)?
+                        self.lex_text_block(line, col, true)?
                     } else {
                         self.lex_raw_string(line, col)?
                     }
@@ -427,7 +427,7 @@ impl Lexer {
 
     fn lex_string_or_block(&mut self, line: usize, col: usize) -> Result<Tok, LexError> {
         if self.peek_at(1) == Some('"') && self.peek_at(2) == Some('"') {
-            self.lex_text_block(line, col)
+            self.lex_text_block(line, col, false)
         } else {
             self.lex_plain_string(line, col)
         }
@@ -604,7 +604,7 @@ impl Lexer {
         }
     }
 
-    fn lex_text_block(&mut self, line: usize, col: usize) -> Result<Tok, LexError> {
+    fn lex_text_block(&mut self, line: usize, col: usize, is_raw: bool) -> Result<Tok, LexError> {
         self.bump();
         self.bump();
         self.bump(); // consume opening """
@@ -634,7 +634,15 @@ impl Lexer {
                 self.bump();
                 self.bump();
                 self.bump();
-                return Ok(Tok::Str(dedent(&raw, margin)));
+                let body = dedent(&raw, margin);
+                // A non-raw text block interpolates `$name`/`${name}` (§6.3); a raw
+                // one (`r"""`) is literal. No `\$` escape here — use `r"""` for a
+                // literal `$`.
+                return Ok(if is_raw {
+                    Tok::Str(body)
+                } else {
+                    interpolate(body)
+                });
             }
             let c = self.peek().unwrap();
             raw.push(c);
@@ -672,6 +680,74 @@ impl Lexer {
             line,
             col,
         }
+    }
+}
+
+/// Split the final text of a non-raw text block into interpolation parts (§6.3),
+/// using the same `$`-rule as plain strings: `$name`/`${name}` open a hole, a `$`
+/// before anything else is literal. There are no escapes in a text block, so a
+/// literal `$` adjacent to an identifier needs a raw block (`r"""`). No holes →
+/// a plain `Str`.
+fn interpolate(text: String) -> Tok {
+    use mangrove_core::StrPart;
+    let chars: Vec<char> = text.chars().collect();
+    let is_start = |c: char| c == '_' || c.is_ascii_alphabetic();
+    let is_cont = |c: char| c == '_' || c.is_ascii_alphanumeric();
+    let mut parts: Vec<StrPart> = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' {
+            // bare `$name`
+            if let Some(&c) = chars.get(i + 1)
+                && is_start(c)
+            {
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && is_cont(chars[j]) {
+                    j += 1;
+                }
+                if !cur.is_empty() {
+                    parts.push(StrPart::Lit(std::mem::take(&mut cur)));
+                }
+                parts.push(StrPart::Ref(chars[start..j].iter().collect()));
+                i = j;
+                continue;
+            }
+            // braced `${name}`
+            if chars.get(i + 1) == Some(&'{')
+                && let Some(&c) = chars.get(i + 2)
+                && is_start(c)
+            {
+                let start = i + 2;
+                let mut j = start;
+                while j < chars.len() && is_cont(chars[j]) {
+                    j += 1;
+                }
+                if chars.get(j) == Some(&'}') {
+                    if !cur.is_empty() {
+                        parts.push(StrPart::Lit(std::mem::take(&mut cur)));
+                    }
+                    parts.push(StrPart::Ref(chars[start..j].iter().collect()));
+                    i = j + 1;
+                    continue;
+                }
+            }
+            // a `$` that opens nothing is literal
+            cur.push('$');
+            i += 1;
+            continue;
+        }
+        cur.push(chars[i]);
+        i += 1;
+    }
+    if parts.is_empty() {
+        Tok::Str(cur)
+    } else {
+        if !cur.is_empty() {
+            parts.push(StrPart::Lit(cur));
+        }
+        Tok::InterpStr(parts)
     }
 }
 
@@ -822,6 +898,23 @@ mod tests {
     #[test]
     fn raw_string_no_escapes() {
         assert_eq!(toks(r#"a: r"\n""#).get(2), Some(&Tok::Str("\\n".into())));
+    }
+
+    #[test]
+    fn text_block_interpolates_unless_raw() {
+        use mangrove_core::StrPart;
+        // a non-raw text block interpolates `${name}` (§6.3)
+        let src = "a: \"\"\"\n  hello ${name}\n  \"\"\"";
+        assert_eq!(
+            toks(src).get(2),
+            Some(&Tok::InterpStr(vec![
+                StrPart::Lit("hello ".into()),
+                StrPart::Ref("name".into()),
+            ]))
+        );
+        // a raw text block is literal — `${name}` stays as text
+        let raw = "a: r\"\"\"\n  hello ${name}\n  \"\"\"";
+        assert_eq!(toks(raw).get(2), Some(&Tok::Str("hello ${name}".into())));
     }
 
     #[test]

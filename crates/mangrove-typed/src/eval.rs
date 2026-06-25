@@ -110,7 +110,11 @@ pub fn eval(
 
 fn reduce(v: &Value, cx: &Ctx, depth: usize) -> Result<Value, Box<ValidationError>> {
     if depth >= MAX_DEPTH {
-        return Err(err("", "a reference cycle", "an acyclic reference"));
+        return Err(err(
+            "",
+            "a reference cycle or expression nested too deep",
+            "an acyclic, bounded-depth expression",
+        ));
     }
     match v {
         Value::Ref(name) => {

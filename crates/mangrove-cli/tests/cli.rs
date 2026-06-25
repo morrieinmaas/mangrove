@@ -420,6 +420,30 @@ fn match_hashes_like_literal() {
 }
 
 #[test]
+fn text_block_interpolation_hashes_like_literal() {
+    // §6.3: a non-raw text block interpolates ${name}.
+    let schema = "type D = { msg: str }\nschema D\n";
+    let templ = std::env::temp_dir().join("m4b_tb_templ.mang");
+    let lit = std::env::temp_dir().join("m4b_tb_lit.mang");
+    std::fs::write(
+        &templ,
+        format!("params {{ name: str = \"api\" }}\n{schema}msg: \"\"\"\n  service ${{name}} ready\n  \"\"\"\n"),
+    )
+    .unwrap();
+    std::fs::write(&lit, format!("{schema}msg: \"service api ready\"\n")).unwrap();
+    let h = |p: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg("hash")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert_eq!(h(&templ), h(&lit));
+}
+
+#[test]
 fn nonexhaustive_match_fails_check() {
     // No `_` and the scrutinee union isn't fully covered → eval error (D37).
     let out = run_check(
