@@ -268,6 +268,16 @@ fn collect_pin_refs(doc: &Document) -> std::collections::BTreeSet<(String, Strin
     if let Some(n) = &doc.schema_narrow {
         collect_named(n, &mut names);
     }
+    // Also scan L3 param and fn type positions, so a pin there is fetched too.
+    for p in &doc.params {
+        collect_named(&p.ty, &mut names);
+    }
+    for f in &doc.fns {
+        for (_, ty) in &f.params {
+            collect_named(ty, &mut names);
+        }
+        collect_named(&f.ret, &mut names);
+    }
     let mut out = std::collections::BTreeSet::new();
     for n in names {
         if let Some((alias, rest)) = n.split_once('@')

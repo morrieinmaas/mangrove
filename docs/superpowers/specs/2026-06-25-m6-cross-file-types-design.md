@@ -28,3 +28,23 @@ Hermetic, golden-hash anchored. M6a: a module defining types; a root `use`ing it
 
 - Value-position type annotations (no inference, §2).
 - Importing `fn`s across files (M6 imports types; cross-file `fn` is a later, separate concern).
+
+---
+
+## Post-review notes (M6)
+
+The M6 adversarial review came back clean on all four highest-severity guarantees
+(integrity-through-pins, canonical-form/type soundness, pin-encoding robustness,
+depth/termination). Three non-blocking notes; dispositions:
+
+- **Pins in `params`/`fn` type positions are now fetched.** `collect_pin_refs` also
+  scans param types and fn param/return types, so a pin written there resolves
+  end-to-end (previously it would have been unresolvable).
+- **Staleness lint (advisory "pin older than the alias's main version") is dropped,
+  not deferred.** Versions are opaque resolver refs (git tags / dir names); "older"
+  is not generally computable without imposing a version ordering the language does
+  not define. If a project wants this, it belongs in a linter with a project-specific
+  version scheme, not the core.
+- **Cross-file types inside a *called* module** remain one-level/deferred (M6 imports
+  types into the root env). Such a type is rejected (fail-closed), only the error
+  wording is generic — a known, harmless UX rough edge.
