@@ -31,20 +31,117 @@ pub fn lower(node: &SyntaxNode) -> Result<Document, ParseError> {
     })
 }
 
-/// Returns `(key, Value)` for one simple binding.
+/// Returns `(key, Value)` for one binding node.
 fn lower_binding(node: &SyntaxNode) -> Result<(String, Value), ParseError> {
-    let mut toks = node.children_with_tokens().filter_map(|e| match e {
-        NodeOrToken::Token(t) if !t.kind().is_trivia() => Some(t),
-        _ => None,
-    });
-    let key_tok = toks.next().expect("binding has a key");
-    let key = decode_key(&key_tok)?;
-    // skip COLON
-    let val_tok = toks
-        .find(|t| t.kind() != SyntaxKind::COLON)
-        .expect("binding has a value");
-    let value = decode_scalar(&val_tok)?;
-    Ok((key, value))
+    // Extract non-trivia tokens and child nodes from the binding.
+    let mut key_opt: Option<SyntaxToken> = None;
+    let mut after_colon = false;
+
+    for elem in node.children_with_tokens() {
+        match elem {
+            NodeOrToken::Token(t) if t.kind().is_trivia() => continue,
+            NodeOrToken::Token(t) if t.kind() == SyntaxKind::COLON => {
+                after_colon = true;
+            }
+            NodeOrToken::Token(t) if !after_colon => {
+                key_opt = Some(t);
+            }
+            NodeOrToken::Token(t) if after_colon => {
+                let key = decode_key(key_opt.as_ref().expect("key before colon"))?;
+                let value = decode_scalar(&t)?;
+                return Ok((key, value));
+            }
+            NodeOrToken::Node(n) if after_colon => {
+                let key = decode_key(key_opt.as_ref().expect("key before colon"))?;
+                let value = lower_composite(&n)?;
+                return Ok((key, value));
+            }
+            _ => {}
+        }
+    }
+    Err(ParseError {
+        message: "binding has no value".into(),
+        line: 0,
+        col: 0,
+    })
+}
+
+/// Lower a RECORD or LIST node into a `Value`.
+fn lower_composite(node: &SyntaxNode) -> Result<Value, ParseError> {
+    match node.kind() {
+        SyntaxKind::RECORD => {
+            let mut map = BTreeMap::new();
+            for child in node.children() {
+                if child.kind() == SyntaxKind::FIELD {
+                    let (key, value) = lower_field(&child)?;
+                    map.insert(key, value);
+                }
+            }
+            Ok(Value::Map(map))
+        }
+        SyntaxKind::LIST => {
+            let mut items = Vec::new();
+            for elem in node.children_with_tokens() {
+                match elem {
+                    NodeOrToken::Token(t) if t.kind().is_trivia() => continue,
+                    NodeOrToken::Token(t)
+                        if matches!(
+                            t.kind(),
+                            SyntaxKind::L_BRACKET
+                                | SyntaxKind::R_BRACKET
+                                | SyntaxKind::COMMA
+                                | SyntaxKind::NEWLINE
+                        ) => {}
+                    NodeOrToken::Token(t) => {
+                        items.push(decode_scalar(&t)?);
+                    }
+                    NodeOrToken::Node(n) => {
+                        items.push(lower_composite(&n)?);
+                    }
+                }
+            }
+            Ok(Value::List(items))
+        }
+        other => Err(ParseError {
+            message: format!("unexpected node kind in value position: {other:?}"),
+            line: 0,
+            col: 0,
+        }),
+    }
+}
+
+/// Returns `(key, Value)` for one FIELD node inside a RECORD.
+fn lower_field(node: &SyntaxNode) -> Result<(String, Value), ParseError> {
+    let mut key_opt: Option<SyntaxToken> = None;
+    let mut after_colon = false;
+
+    for elem in node.children_with_tokens() {
+        match elem {
+            NodeOrToken::Token(t) if t.kind().is_trivia() => continue,
+            NodeOrToken::Token(t) if t.kind() == SyntaxKind::COLON => {
+                after_colon = true;
+            }
+            NodeOrToken::Token(t) if !after_colon => {
+                key_opt = Some(t);
+            }
+            NodeOrToken::Token(t) if after_colon => {
+                let key = decode_key(key_opt.as_ref().expect("key before colon"))?;
+                let value = decode_scalar(&t)?;
+                return Ok((key, value));
+            }
+            NodeOrToken::Node(n) if after_colon => {
+                let key = decode_key(key_opt.as_ref().expect("key before colon"))?;
+                let value = lower_composite(&n)?;
+                return Ok((key, value));
+            }
+            _ => {}
+        }
+    }
+    Err(ParseError {
+        message: "field has no value".into(),
+        line: 0,
+        col: 0,
+    })
 }
 
 fn decode_key(t: &SyntaxToken) -> Result<String, ParseError> {

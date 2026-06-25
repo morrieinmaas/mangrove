@@ -121,6 +121,8 @@ fn parse_binding(p: &mut Parser) {
 
 fn parse_atom(p: &mut Parser) {
     match p.current() {
+        SyntaxKind::L_BRACE => parse_record(p),
+        SyntaxKind::L_BRACKET => parse_list(p),
         SyntaxKind::INT
         | SyntaxKind::STR
         | SyntaxKind::BOOL
@@ -133,4 +135,50 @@ fn parse_atom(p: &mut Parser) {
             p.bump();
         }
     }
+}
+
+fn parse_record(p: &mut Parser) {
+    p.start(SyntaxKind::RECORD);
+    p.bump(); // L_BRACE
+    loop {
+        match p.current() {
+            SyntaxKind::R_BRACE | SyntaxKind::EOF => break,
+            SyntaxKind::COMMA | SyntaxKind::NEWLINE => {
+                p.bump(); // separator — stays in tree for losslessness
+            }
+            SyntaxKind::BAREWORD | SyntaxKind::STR => {
+                p.start(SyntaxKind::FIELD);
+                p.bump(); // key
+                if p.current() == SyntaxKind::COLON {
+                    p.bump(); // COLON
+                }
+                parse_atom(p); // value
+                p.finish(); // FIELD
+            }
+            _ => {
+                // Unknown token — bump to avoid infinite loop; Task 11 adds recovery.
+                p.bump();
+            }
+        }
+    }
+    p.bump(); // R_BRACE (or no-op at EOF)
+    p.finish(); // RECORD
+}
+
+fn parse_list(p: &mut Parser) {
+    p.start(SyntaxKind::LIST);
+    p.bump(); // L_BRACKET
+    loop {
+        match p.current() {
+            SyntaxKind::R_BRACKET | SyntaxKind::EOF => break,
+            SyntaxKind::COMMA | SyntaxKind::NEWLINE => {
+                p.bump(); // separator — stays in tree for losslessness
+            }
+            _ => {
+                parse_atom(p); // element value (recurses for nested composites)
+            }
+        }
+    }
+    p.bump(); // R_BRACKET (or no-op at EOF)
+    p.finish(); // LIST
 }

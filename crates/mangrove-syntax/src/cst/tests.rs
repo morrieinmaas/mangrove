@@ -50,6 +50,30 @@ fn parses_with_leading_trivia_losslessly() {
     }
 }
 
+#[test]
+fn oracle_records_and_lists() {
+    assert_hash_equivalent("a: { b: 1, c: { d: 2 } }\n");
+    assert_hash_equivalent("xs: [ 1, 2, 3 ]\n");
+    assert_hash_equivalent("a: { xs: [ 1, 2 ], b: \"x\" }\n");
+    // newline-separated fields (as in examples/*.mang)
+    assert_hash_equivalent("a: {\n  b: 1\n  c: 2\n}\n");
+    // list of records
+    assert_hash_equivalent("items: [ { n: 1 }, { n: 2 } ]\n");
+    // empty record / empty list
+    assert_hash_equivalent("e: {}\n");
+    assert_hash_equivalent("e: []\n");
+}
+
+#[test]
+fn composite_losslessness() {
+    let src = "a: { b: [ 1, 2 ] }\n";
+    assert_eq!(
+        super::parse::parse_cst(src).syntax().text().to_string(),
+        src,
+        "composite tree must round-trip losslessly"
+    );
+}
+
 use super::kind::SyntaxKind;
 
 #[test]
