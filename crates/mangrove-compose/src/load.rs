@@ -44,27 +44,31 @@ pub struct Composed {
 /// the resolver + lockfile (`.mangrove/resolvers.toml`, `mangrove.lock`) —
 /// namespaced `use`s (hash-verified before evaluation, §5.2).
 pub fn compose(path: &Path) -> Result<Composed, String> {
-    let canon = path
-        .canonicalize()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    let root_dir = canon.parent().unwrap_or_else(|| Path::new("."));
-    let resolvers = Resolvers::find_and_load(root_dir)?;
-    let lock = Lockfile::find_and_load(root_dir)?;
-    compose_rec(path, &mut Vec::new(), &resolvers, &lock, false, None)
+    // The root document is never verified (no importer) and anchors its own
+    // resolvers/lock by upward search (pkg_root = None).
+    compose_rec(
+        path,
+        &mut Vec::new(),
+        &Lockfile::default(),
+        None,
+        false,
+        None,
+    )
 }
 
-/// `in_remote`: true once we have crossed a namespaced import — within a remote
-/// subtree every file is pinned and unpinnable local (`./`) imports are refused.
-/// `verify_as`: the lockfile reference to verify *this* file's bytes against
-/// (the bytes are read once and that exact buffer is both verified and parsed —
-/// no re-open, so no TOCTOU).
+/// Per-package anchoring (M7/D50). `verify_lock`: the *importer's* lock, against
+/// which THIS file's bytes are verified (read once, then parsed — no re-open, no
+/// TOCTOU). `verify_as`: the reference to verify as, or `None` for an unverified
+/// (root / local) file. `in_remote`: inside a fetched package (no `./` imports).
+/// `pkg_root`: `Some(root)` for a fetched package (anchor its own resolvers/lock
+/// at exactly that root); `None` for the root document (anchor by upward search).
 fn compose_rec(
     path: &Path,
     visiting: &mut Vec<PathBuf>,
-    resolvers: &Resolvers,
-    lock: &Lockfile,
-    in_remote: bool,
+    verify_lock: &Lockfile,
     verify_as: Option<&str>,
+    in_remote: bool,
+    pkg_root: Option<&Path>,
 ) -> Result<Composed, String> {
     // `visiting.len()` is the current `use`-chain depth; cap it so a deep chain
     // of files errors cleanly instead of overflowing the stack (SIGABRT).
@@ -77,16 +81,26 @@ fn compose_rec(
     if visiting.contains(&canon) {
         return Err(format!("cyclic `use` involving {}", path.display()));
     }
-    // Read once; verify THIS buffer before parsing it (no second open → no TOCTOU).
+    // Read once; verify THIS buffer against the importer's lock before parsing
+    // (no second open → no TOCTOU).
     let bytes = std::fs::read(&canon).map_err(|e| format!("{}: {e}", path.display()))?;
     if let Some(reference) = verify_as {
-        lock.verify(&bytes, reference)?;
+        verify_lock.verify(&bytes, reference)?;
     }
     let src = String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8", path.display()))?;
     let doc = parse_document(&src).map_err(|e| format!("{}:{e}", path.display()))?;
 
     visiting.push(canon.clone());
     let dir = canon.parent().unwrap_or_else(|| Path::new("."));
+    // Anchor THIS package's resolvers + lock (D50): a fetched package uses exactly
+    // its own `<root>/.mangrove`; the root document searches upward.
+    let (resolvers, lock) = match pkg_root {
+        Some(root) => (Resolvers::load_at(root)?, Lockfile::load_at(root)?),
+        None => (
+            Resolvers::find_and_load(dir)?,
+            Lockfile::find_and_load(dir)?,
+        ),
+    };
     // alias → the full sub-`Composed`: its `.body` feeds a spread (`...alias`),
     // and the whole module feeds a module call (`alias(args)`, M4d.2).
     let mut modules: BTreeMap<String, Composed> = BTreeMap::new();
@@ -100,12 +114,28 @@ fn compose_rec(
                     u.path
                 ));
             }
-            compose_rec(&dir.join(&u.path), visiting, resolvers, lock, false, None)?
+            // Same package — same anchoring (pkg_root unchanged); not verified.
+            compose_rec(
+                &dir.join(&u.path),
+                visiting,
+                &lock,
+                None,
+                in_remote,
+                pkg_root,
+            )?
         } else {
-            // Namespaced: resolve, then the recursive call verifies the bytes it
-            // reads against the lockfile before evaluating them (fail closed).
-            let resolved = resolvers.resolve_path(&u.path)?;
-            compose_rec(&resolved, visiting, resolvers, lock, true, Some(&u.path))?
+            // Namespaced: resolve via THIS package's resolvers; verify the fetched
+            // bytes against THIS package's lock (the importer's, D50); the dep then
+            // anchors its own resolvers/lock at its package root.
+            let (dep_root, resolved) = resolvers.resolve_rooted(&u.path)?;
+            compose_rec(
+                &resolved,
+                visiting,
+                &lock,
+                Some(&u.path),
+                true,
+                Some(&dep_root),
+            )?
         };
         if modules.contains_key(&u.alias) {
             return Err(format!("duplicate `use` alias `{}`", u.alias));
@@ -130,14 +160,14 @@ fn compose_rec(
             )
         })?;
         let pinned_ref = format!("{ns}@{version}");
-        let resolved = resolvers.resolve_path(&pinned_ref)?;
+        let (dep_root, resolved) = resolvers.resolve_rooted(&pinned_ref)?;
         let composed = compose_rec(
             &resolved,
             visiting,
-            resolvers,
-            lock,
-            true,
+            &lock,
             Some(&pinned_ref),
+            true,
+            Some(&dep_root),
         )?;
         pinned.insert(key, composed);
     }
@@ -181,9 +211,11 @@ fn compose_rec(
     })
 }
 
-/// Walk the `use` graph reachable from `path` and return every namespaced
-/// reference mapped to its source-bytes hash (for `mangrove update`). Unlike
-/// composing, this does NOT verify against the lockfile — it *produces* it.
+/// Collect the root package's *direct* namespaced references + pins, mapped to
+/// their source-bytes hash, for `mangrove update`. Under per-package anchoring
+/// (D50) the root's lock pins only what the root imports directly; a dependency
+/// ships its own committed lock for its deps. So this recurses through the root's
+/// *local* files but does not descend into a fetched dependency.
 pub fn lock_references(path: &Path) -> Result<BTreeMap<String, String>, String> {
     let canon = path
         .canonicalize()
@@ -191,7 +223,7 @@ pub fn lock_references(path: &Path) -> Result<BTreeMap<String, String>, String> 
     let root_dir = canon.parent().unwrap_or_else(|| Path::new("."));
     let resolvers = Resolvers::find_and_load(root_dir)?;
     let mut out = BTreeMap::new();
-    collect_rec(&canon, &resolvers, &mut Vec::new(), &mut out, false)?;
+    collect_rec(&canon, &resolvers, &mut Vec::new(), &mut out)?;
     Ok(out)
 }
 
@@ -200,7 +232,6 @@ fn collect_rec(
     resolvers: &Resolvers,
     visiting: &mut Vec<PathBuf>,
     out: &mut BTreeMap<String, String>,
-    in_remote: bool,
 ) -> Result<(), String> {
     if visiting.len() >= MAX_USE_DEPTH {
         return Err(format!("`use` chain too deep (> {MAX_USE_DEPTH})"));
@@ -216,26 +247,21 @@ fn collect_rec(
     visiting.push(canon.clone());
     let dir = canon.parent().unwrap_or_else(|| Path::new("."));
     for u in &doc.uses {
-        // Mirror compose_rec: a `./` import inside a remote subtree is unpinnable,
-        // so refuse it here too — the lock we write must match what compose accepts.
         if u.path.starts_with("./") || u.path.starts_with("../") {
-            if in_remote {
-                return Err(format!(
-                    "a remote package may not use the local import `{}` (unpinnable; M3b.1)",
-                    u.path
-                ));
-            }
-            collect_rec(&dir.join(&u.path), resolvers, visiting, out, false)?;
+            // Local file of the root package — recurse to find its namespaced deps.
+            collect_rec(&dir.join(&u.path), resolvers, visiting, out)?;
         } else {
+            // A direct namespaced dependency: pin its source hash. Do NOT descend —
+            // the dependency carries its own committed lock for its own deps (D50).
             let p = resolvers.resolve_path(&u.path)?;
             let bytes = std::fs::read(&p)
                 .map_err(|e| format!("resolving `{}`: {}: {e}", u.path, p.display()))?;
             out.insert(u.path.clone(), mangrove_resolve::source_hash(&bytes));
-            collect_rec(&p, resolvers, visiting, out, true)?;
         }
     }
     // Version-pinned packages (§5.6, M6b): record each pinned ref so `update`
-    // writes the lock entry `check`/`hash` will verify against.
+    // writes the lock entry `check`/`hash` will verify against. Like a direct dep,
+    // the pinned package is not descended into.
     for (alias, version) in collect_pin_refs(&doc) {
         let Some(u) = doc.uses.iter().find(|u| u.alias == alias) else {
             return Err(format!("type pin references unknown alias `{alias}`"));
@@ -251,7 +277,6 @@ fn collect_rec(
         let bytes = std::fs::read(&p)
             .map_err(|e| format!("resolving pin `{pinned_ref}`: {}: {e}", p.display()))?;
         out.insert(pinned_ref.clone(), mangrove_resolve::source_hash(&bytes));
-        collect_rec(&p, resolvers, visiting, out, true)?;
     }
     visiting.pop();
     Ok(())

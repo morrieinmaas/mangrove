@@ -61,46 +61,32 @@ impl Resolvers {
             return Ok(Resolvers::default());
         };
         let text = std::fs::read_to_string(&cfg).map_err(|e| format!("{}: {e}", cfg.display()))?;
-        let table: toml::Table = text
-            .parse()
-            .map_err(|e| format!("{}: {e}", cfg.display()))?;
-        let mut map = BTreeMap::new();
-        if let Some(toml::Value::Table(namespaces)) = table.get("namespace") {
-            for (ns, v) in namespaces {
-                let toml::Value::Table(entry) = v else {
-                    continue;
-                };
-                let remote = entry.get("remote").and_then(toml::Value::as_str);
-                let git = entry.get("git").and_then(toml::Value::as_str);
-                let backend = match (remote, git) {
-                    (Some(r), None) => Backend::Local(PathBuf::from(r)),
-                    (None, Some(g)) => Backend::Git { url: g.to_string() },
-                    (Some(_), Some(_)) => {
-                        return Err(format!(
-                            "{}: namespace `{ns}` sets both `remote` and `git` (pick one)",
-                            cfg.display()
-                        ));
-                    }
-                    (None, None) => {
-                        return Err(format!(
-                            "{}: namespace `{ns}` needs `remote` or `git`",
-                            cfg.display()
-                        ));
-                    }
-                };
-                map.insert(ns.clone(), backend);
-            }
-        }
-        Ok(Resolvers {
-            map,
-            config_dir: Some(config_dir),
-        })
+        parse_resolvers(&text, &cfg, config_dir)
     }
 
-    /// Resolve a namespaced reference `"<ns>/<rest>@<tag>"` to a local file path.
-    /// For a git backend this fetches the repo at `<tag>` into the cache first.
-    /// The returned bytes are still hash-verified by the caller (D27).
+    /// Load a resolver config from exactly `<dir>/.mangrove/resolvers.toml` (no
+    /// upward search) — used to anchor a *fetched package's* resolvers at its own
+    /// root, so a dependency's resolution never leaks the consumer's config (M7).
+    /// An empty resolver set if the file is absent.
+    pub fn load_at(dir: &Path) -> Result<Resolvers, String> {
+        let cfg = dir.join(".mangrove/resolvers.toml");
+        if !cfg.exists() {
+            return Ok(Resolvers::default());
+        }
+        let text = std::fs::read_to_string(&cfg).map_err(|e| format!("{}: {e}", cfg.display()))?;
+        parse_resolvers(&text, &cfg, dir.to_path_buf())
+    }
+
+    /// Resolve a namespaced reference to a local file path (see [`resolve_rooted`]).
     pub fn resolve_path(&self, reference: &str) -> Result<PathBuf, String> {
+        self.resolve_rooted(reference).map(|(_, file)| file)
+    }
+
+    /// Resolve a namespaced reference `"<ns>/<rest>@<tag>"` to `(package_root, file)`.
+    /// `package_root` is the fetched package's root (the local dir / git checkout),
+    /// where its own `.mangrove/` is anchored (M7). For a git backend this fetches
+    /// the repo at `<tag>` first. The bytes are still hash-verified by the caller (D27).
+    pub fn resolve_rooted(&self, reference: &str) -> Result<(PathBuf, PathBuf), String> {
         let (ns_path, tag) = reference.rsplit_once('@').ok_or_else(|| {
             format!("namespaced import `{reference}` must be `<namespace>@<tag>`")
         })?;
@@ -129,7 +115,7 @@ impl Resolvers {
                     Some(d) => d.join(remote),
                     None => remote.clone(),
                 };
-                Ok(base.join(rel))
+                Ok((base.clone(), base.join(rel)))
             }
             Backend::Git { url } => {
                 let cfg = self
@@ -138,10 +124,63 @@ impl Resolvers {
                     .ok_or("git backend needs a config directory")?;
                 let checkout = cfg.join(".mangrove/cache").join(first).join(tag);
                 git_fetch(url, tag, &checkout)?;
-                Ok(checkout.join(rel))
+                Ok((checkout.clone(), checkout.join(rel)))
             }
         }
     }
+}
+
+/// Parse a `mangrove.lock` file into a `Lockfile` anchored at `dir`.
+fn parse_lock(file: &Path, dir: PathBuf) -> Result<Lockfile, String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let table: toml::Table = text
+        .parse()
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut map = BTreeMap::new();
+    for (k, v) in &table {
+        if let toml::Value::String(h) = v {
+            map.insert(k.clone(), h.clone());
+        }
+    }
+    Ok(Lockfile { map, dir })
+}
+
+/// Parse a `.mangrove/resolvers.toml` body into a `Resolvers` anchored at `config_dir`.
+fn parse_resolvers(text: &str, cfg: &Path, config_dir: PathBuf) -> Result<Resolvers, String> {
+    let table: toml::Table = text
+        .parse()
+        .map_err(|e| format!("{}: {e}", cfg.display()))?;
+    let mut map = BTreeMap::new();
+    if let Some(toml::Value::Table(namespaces)) = table.get("namespace") {
+        for (ns, v) in namespaces {
+            let toml::Value::Table(entry) = v else {
+                continue;
+            };
+            let remote = entry.get("remote").and_then(toml::Value::as_str);
+            let git = entry.get("git").and_then(toml::Value::as_str);
+            let backend = match (remote, git) {
+                (Some(r), None) => Backend::Local(PathBuf::from(r)),
+                (None, Some(g)) => Backend::Git { url: g.to_string() },
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "{}: namespace `{ns}` sets both `remote` and `git` (pick one)",
+                        cfg.display()
+                    ));
+                }
+                (None, None) => {
+                    return Err(format!(
+                        "{}: namespace `{ns}` needs `remote` or `git`",
+                        cfg.display()
+                    ));
+                }
+            };
+            map.insert(ns.clone(), backend);
+        }
+    }
+    Ok(Resolvers {
+        map,
+        config_dir: Some(config_dir),
+    })
 }
 
 /// Reject empty/`..`/leading-`-` segments and anything outside `[A-Za-z0-9._/-]`.
@@ -240,24 +279,27 @@ impl Lockfile {
     /// (anchored at `root_dir`) if none exists.
     pub fn find_and_load(root_dir: &Path) -> Result<Lockfile, String> {
         match find_upward(root_dir, "mangrove.lock") {
-            Some((file, dir)) => {
-                let text = std::fs::read_to_string(&file)
-                    .map_err(|e| format!("{}: {e}", file.display()))?;
-                let table: toml::Table = text
-                    .parse()
-                    .map_err(|e| format!("{}: {e}", file.display()))?;
-                let mut map = BTreeMap::new();
-                for (k, v) in &table {
-                    if let toml::Value::String(h) = v {
-                        map.insert(k.clone(), h.clone());
-                    }
-                }
-                Ok(Lockfile { map, dir })
-            }
+            Some((file, dir)) => parse_lock(&file, dir),
             None => Ok(Lockfile {
                 map: BTreeMap::new(),
                 dir: root_dir.to_path_buf(),
             }),
+        }
+    }
+
+    /// Load a lockfile from exactly `<dir>/mangrove.lock` (no upward search) — the
+    /// per-package anchor for verifying a fetched package's own deps (M7). An empty
+    /// lockfile (anchored at `dir`) if absent — so the package's namespaced uses
+    /// fail closed.
+    pub fn load_at(dir: &Path) -> Result<Lockfile, String> {
+        let file = dir.join("mangrove.lock");
+        if file.exists() {
+            parse_lock(&file, dir.to_path_buf())
+        } else {
+            Ok(Lockfile {
+                map: BTreeMap::new(),
+                dir: dir.to_path_buf(),
+            })
         }
     }
 
