@@ -29,6 +29,18 @@ pub enum Value {
     /// binding (§6.1). Reduced to its referent by the eval stage (M4a); like the
     /// other markers it must never reach the CBOR encoder unresolved.
     Ref(String),
+    /// An L3 interpolated string (`"api:${version}"`, §6.3): an ordered run of
+    /// literal text and `${name}` holes. Reduced to a `Str` by the eval stage
+    /// (M4b); a transient marker that must never reach the CBOR encoder.
+    Interp(Vec<StrPart>),
+}
+
+/// One piece of an interpolated string (§6.3): literal text or a `$name`/`${name}`
+/// reference hole.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StrPart {
+    Lit(String),
+    Ref(String),
 }
 
 impl Value {

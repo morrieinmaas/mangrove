@@ -704,6 +704,10 @@ impl Parser {
                 self.advance();
                 Ok(Value::Str(s))
             }
+            Tok::InterpStr(parts) => {
+                self.advance();
+                Ok(Value::Interp(parts))
+            }
             Tok::Bool(b) => {
                 self.advance();
                 Ok(Value::Bool(b))

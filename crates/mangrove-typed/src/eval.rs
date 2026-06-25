@@ -6,8 +6,8 @@
 
 use crate::env::TypeEnv;
 use crate::validate::validate;
-use mangrove_core::Value;
 use mangrove_core::error::ValidationError;
+use mangrove_core::{StrPart, Value};
 use mangrove_syntax::Param;
 use std::collections::BTreeMap;
 
@@ -90,6 +90,26 @@ fn reduce(
             // Resolve transitively so a binding that is itself a reference works.
             reduce(target, scope, depth + 1)
         }
+        Value::Interp(parts) => {
+            let mut s = String::new();
+            for part in parts {
+                match part {
+                    StrPart::Lit(t) => s.push_str(t),
+                    StrPart::Ref(name) => {
+                        let target = scope.get(name).ok_or_else(|| {
+                            err(
+                                "",
+                                format!("reference `{name}`"),
+                                "a param or sibling binding",
+                            )
+                        })?;
+                        let v = reduce(target, scope, depth + 1)?;
+                        s.push_str(&render_scalar(&v)?);
+                    }
+                }
+            }
+            Ok(Value::Str(s))
+        }
         Value::List(xs) => Ok(Value::List(
             xs.iter()
                 .map(|x| reduce(x, scope, depth + 1))
@@ -106,11 +126,29 @@ fn reduce(
     }
 }
 
+/// Render a scalar into the text of an interpolation hole (§6.3). Interpolation
+/// is value-level: only a scalar can land in a string — a list/map/bytes cannot,
+/// so structure can never be smuggled into a string.
+fn render_scalar(v: &Value) -> Result<String, Box<ValidationError>> {
+    match v {
+        Value::Str(s) => Ok(s.clone()),
+        Value::Int(n) => Ok(n.to_string()),
+        Value::Decimal(d) => Ok(d.to_string()),
+        Value::Bool(b) => Ok(b.to_string()),
+        other => Err(err(
+            "",
+            format!("{other:?}"),
+            "a scalar (str/int/decimal/bool) to interpolate into a string",
+        )),
+    }
+}
+
 /// Whether a value tree contains an unresolved reference (so default validation
 /// can skip a default that needs reduction first).
 fn contains_ref(v: &Value) -> bool {
     match v {
         Value::Ref(_) => true,
+        Value::Interp(_) => true,
         Value::List(xs) => xs.iter().any(contains_ref),
         Value::Map(m) => m.values().any(contains_ref),
         _ => false,
@@ -191,6 +229,31 @@ mod tests {
         }];
         let e = eval(&Value::Map(BTreeMap::new()), &params, &types()).unwrap_err();
         assert!(e.path.contains("params.n"), "{e}");
+    }
+
+    #[test]
+    fn interpolation_renders_param_into_string() {
+        let params = vec![Param {
+            name: "v".into(),
+            ty: Type::Str,
+            default: Some(Value::Str("1.0".into())),
+        }];
+        let mut m = BTreeMap::new();
+        m.insert(
+            "image".into(),
+            Value::Interp(vec![StrPart::Lit("api:".into()), StrPart::Ref("v".into())]),
+        );
+        let out = eval(&Value::Map(m), &params, &types()).unwrap();
+        let Value::Map(o) = out else { panic!() };
+        assert_eq!(o.get("image"), Some(&Value::Str("api:1.0".into())));
+    }
+
+    #[test]
+    fn interpolating_a_non_scalar_errors() {
+        let mut m = BTreeMap::new();
+        m.insert("a".into(), Value::List(vec![]));
+        m.insert("s".into(), Value::Interp(vec![StrPart::Ref("a".into())]));
+        assert!(eval(&Value::Map(m), &[], &types()).is_err());
     }
 
     #[test]

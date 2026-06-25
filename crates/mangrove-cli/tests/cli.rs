@@ -217,6 +217,30 @@ fn param_default_reference_hashes_like_literal() {
 }
 
 #[test]
+fn interpolation_hashes_like_literal() {
+    // §6.3: "api:${v}" with v="1.0" evaluates to the same value as "api:1.0".
+    let schema = "type D = { image: str }\nschema D\n";
+    let templ = std::env::temp_dir().join("m4b_templ.mang");
+    let lit = std::env::temp_dir().join("m4b_lit.mang");
+    std::fs::write(
+        &templ,
+        format!("params {{ v: str = \"1.0\" }}\n{schema}image: \"api:${{v}}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(&lit, format!("{schema}image: \"api:1.0\"\n")).unwrap();
+    let h = |p: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg("hash")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert_eq!(h(&templ), h(&lit));
+}
+
+#[test]
 fn required_param_without_value_fails_check() {
     // A doc with an unbound required param is a function, not a value (D34).
     let out = run_check("m4a_req.mang", "params { v: str }\na: 1\n");

@@ -5,4 +5,4 @@ pub mod num;
 pub mod value;
 
 pub use num::exact_bigint;
-pub use value::Value;
+pub use value::{StrPart, Value};

@@ -48,6 +48,9 @@ pub enum Tok {
     /// Resolved against a unit type during validation (M2b).
     UnitLit(BigDecimal, String),
     Str(String),
+    /// A plain string with `$name`/`${name}` interpolation holes (§6.3). A string
+    /// with no holes lexes to `Str` (so L0–L2 strings are unchanged).
+    InterpStr(Vec<mangrove_core::StrPart>),
     Bool(bool),
     Bytes(Vec<u8>),
     Bareword(String),
@@ -431,25 +434,90 @@ impl Lexer {
     }
 
     fn lex_plain_string(&mut self, line: usize, col: usize) -> Result<Tok, LexError> {
+        use mangrove_core::StrPart;
         self.bump(); // opening "
-        let mut s = String::new();
+        let mut parts: Vec<StrPart> = Vec::new();
+        let mut cur = String::new();
         loop {
             match self.peek() {
                 None => return Err(self.err("unterminated string", line, col)),
                 Some('"') => {
                     self.bump();
-                    return Ok(Tok::Str(s));
+                    // No interpolation holes → a plain `Str` (L0–L2 unchanged).
+                    if parts.is_empty() {
+                        return Ok(Tok::Str(cur));
+                    }
+                    if !cur.is_empty() {
+                        parts.push(StrPart::Lit(std::mem::take(&mut cur)));
+                    }
+                    return Ok(Tok::InterpStr(parts));
                 }
                 Some('\\') => {
                     self.bump();
-                    self.read_escape(&mut s, line, col)?;
+                    // `\$` lands here and becomes a literal `$` — not a hole.
+                    self.read_escape(&mut cur, line, col)?;
+                }
+                Some('$') => {
+                    // `$` opens a hole only before `{` or an identifier; otherwise
+                    // it is a literal `$` (so regex anchors like "^foo$" and "$5"
+                    // keep working). `\$` also yields a literal `$`.
+                    let opens_hole = matches!(self.peek_at(1), Some('{'))
+                        || matches!(self.peek_at(1), Some(c) if c == '_' || c.is_ascii_alphabetic());
+                    if opens_hole {
+                        self.bump(); // consume `$`
+                        let name = self.read_interp_name(line, col)?;
+                        if !cur.is_empty() {
+                            parts.push(StrPart::Lit(std::mem::take(&mut cur)));
+                        }
+                        parts.push(StrPart::Ref(name));
+                    } else {
+                        cur.push('$');
+                        self.bump();
+                    }
                 }
                 Some(c) => {
-                    s.push(c);
+                    cur.push(c);
                     self.bump();
                 }
             }
         }
+    }
+
+    /// Read the name of a `$name` or `${name}` interpolation hole (§6.3).
+    fn read_interp_name(&mut self, line: usize, col: usize) -> Result<String, LexError> {
+        let braced = self.peek() == Some('{');
+        if braced {
+            self.bump();
+        }
+        let mut name = String::new();
+        match self.peek() {
+            Some(c) if c == '_' || c.is_ascii_alphabetic() => {
+                name.push(c);
+                self.bump();
+            }
+            _ => {
+                return Err(self.err(
+                    "expected an identifier after `$` (use `\\$` for a literal `$`)",
+                    line,
+                    col,
+                ));
+            }
+        }
+        while let Some(c) = self.peek() {
+            if c == '_' || c.is_ascii_alphanumeric() {
+                name.push(c);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        if braced {
+            if self.peek() != Some('}') {
+                return Err(self.err("unterminated `${…}`", line, col));
+            }
+            self.bump();
+        }
+        Ok(name)
     }
 
     fn read_escape(&mut self, s: &mut String, line: usize, col: usize) -> Result<(), LexError> {
@@ -754,6 +822,30 @@ mod tests {
     #[test]
     fn raw_string_no_escapes() {
         assert_eq!(toks(r#"a: r"\n""#).get(2), Some(&Tok::Str("\\n".into())));
+    }
+
+    #[test]
+    fn dollar_interpolation_vs_literal_dollar() {
+        use mangrove_core::StrPart;
+        // `$` not before an identifier/`{` is literal — regex anchors keep working.
+        assert_eq!(toks("a: \"^foo$\"").get(2), Some(&Tok::Str("^foo$".into())));
+        assert_eq!(toks("a: \"$5\"").get(2), Some(&Tok::Str("$5".into())));
+        // `\$` forces a literal `$` even before an identifier.
+        assert_eq!(toks(r#"a: "\$x""#).get(2), Some(&Tok::Str("$x".into())));
+        // `$name` / `${name}` open interpolation holes.
+        assert_eq!(
+            toks("a: \"v${ver}!\"").get(2),
+            Some(&Tok::InterpStr(vec![
+                StrPart::Lit("v".into()),
+                StrPart::Ref("ver".into()),
+                StrPart::Lit("!".into()),
+            ]))
+        );
+        // raw strings never interpolate.
+        assert_eq!(
+            toks("a: r\"${ver}\"").get(2),
+            Some(&Tok::Str("${ver}".into()))
+        );
     }
 
     #[test]

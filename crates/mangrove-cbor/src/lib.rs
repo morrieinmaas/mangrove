@@ -56,6 +56,10 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
         Value::Ref(name) => {
             panic!("unresolved reference `{name}` reached the CBOR encoder — eval first")
         }
+        // ponytail: guard — an interpolated string is reduced to a `Str` by eval.
+        Value::Interp(_) => {
+            panic!("unresolved interpolation reached the CBOR encoder — eval first")
+        }
     }
 }
 
