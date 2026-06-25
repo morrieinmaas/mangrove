@@ -366,13 +366,37 @@ fn render(
                     return lits.join(" | ");
                 }
             }
-            "str".to_string()
+            if schema.get("minLength").is_some() || schema.get("maxLength").is_some() {
+                warnings.push(
+                    "string minLength/maxLength is not expressible as a Mangrove type \
+                     refinement; ignored"
+                        .into(),
+                );
+            }
+            match schema.get("pattern").and_then(J::as_str) {
+                Some(p) => format!("str & =~ {}", mstr(p)),
+                None => "str".to_string(),
+            }
         }
-        Some("integer") => "int".to_string(),
-        Some("number") => "decimal".to_string(),
+        Some("integer") => format!("int{}", numeric_bounds(schema)),
+        Some("number") => format!("decimal{}", numeric_bounds(schema)),
         Some("boolean") => "bool".to_string(),
         _ => opaque(used_opaque),
     }
+}
+
+/// Inclusive numeric bounds → a Mangrove range refinement suffix, e.g. ` & >= 1 & <= 100`.
+/// Open-ended on either side. Exclusive bounds (`exclusiveMinimum`/`Maximum`) are not
+/// expressible as inclusive ranges and are ignored.
+fn numeric_bounds(schema: &J) -> String {
+    let mut out = String::new();
+    if let Some(J::Number(n)) = schema.get("minimum") {
+        out.push_str(&format!(" & >= {n}"));
+    }
+    if let Some(J::Number(n)) = schema.get("maximum") {
+        out.push_str(&format!(" & <= {n}"));
+    }
+    out
 }
 
 fn render_record(
@@ -485,6 +509,59 @@ mod tests {
         let g = generate(spec, Some("T")).unwrap();
         assert_eq!(g.warnings.len(), 1, "{:?}", g.warnings);
         assert!(g.types.contains("type T = Json"), "{}", g.types);
+    }
+
+    #[test]
+    fn integer_minimum_maximum_become_a_range_refinement() {
+        let spec = r##"{ "definitions": { "S": { "type": "object", "required": ["port"],
+          "properties": { "port": { "type": "integer", "minimum": 1, "maximum": 65535 } } } } }"##;
+        let g = generate(spec, Some("S")).unwrap();
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+        assert!(
+            g.types.contains("port: int & >= 1 & <= 65535"),
+            "{}",
+            g.types
+        );
+    }
+
+    #[test]
+    fn number_minimum_maximum_become_a_decimal_range() {
+        let spec = r##"{ "definitions": { "S": { "type": "object", "required": ["r"],
+          "properties": { "r": { "type": "number", "minimum": 0, "maximum": 1 } } } } }"##;
+        let g = generate(spec, Some("S")).unwrap();
+        assert!(g.types.contains("r: decimal & >= 0 & <= 1"), "{}", g.types);
+    }
+
+    #[test]
+    fn integer_minimum_only_emits_open_ended_range() {
+        let spec = r##"{ "definitions": { "S": { "type": "object", "required": ["n"],
+          "properties": { "n": { "type": "integer", "minimum": 1 } } } } }"##;
+        let g = generate(spec, Some("S")).unwrap();
+        assert!(g.types.contains("n: int & >= 1"), "{}", g.types);
+        assert!(!g.types.contains("<="), "{}", g.types);
+    }
+
+    #[test]
+    fn string_pattern_becomes_a_regex_refinement() {
+        let spec = r##"{ "definitions": { "S": { "type": "object", "required": ["name"],
+          "properties": { "name": { "type": "string", "pattern": "[a-z]+" } } } } }"##;
+        let g = generate(spec, Some("S")).unwrap();
+        assert!(
+            g.types.contains(r#"name: str & =~ "[a-z]+""#),
+            "{}",
+            g.types
+        );
+    }
+
+    #[test]
+    fn string_length_bounds_warn_and_are_ignored() {
+        // no type-level string-length refinement exists in Mangrove → warn, keep `str`.
+        let spec = r##"{ "definitions": { "S": { "type": "object", "required": ["s"],
+          "properties": { "s": { "type": "string", "maxLength": 63 } } } } }"##;
+        let g = generate(spec, Some("S")).unwrap();
+        assert_eq!(g.warnings.len(), 1, "{:?}", g.warnings);
+        assert!(g.types.contains("s: str"), "{}", g.types);
+        assert!(!g.types.contains("&"), "{}", g.types);
     }
 
     #[test]

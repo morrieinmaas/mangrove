@@ -62,6 +62,51 @@ fn generated_types_reject_a_bad_manifest() {
 }
 
 #[test]
+fn generated_range_and_pattern_refinements_reject_out_of_bounds_values() {
+    // The whole "catch a bullshit value" story: a spec with a numeric range and a
+    // string pattern → generated refinements → `check` enforces them end to end.
+    let dir = std::env::temp_dir().join(format!("openapi_refine_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = dir.join("refine.json");
+    std::fs::write(
+        &spec,
+        r##"{ "definitions": { "Port": { "type": "object", "required": ["num","name"],
+          "properties": {
+            "num":  { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "name": { "type": "string", "pattern": "[a-z]+" } } } } }"##,
+    )
+    .unwrap();
+    let out = mangrove(&["gen-openapi", spec.to_str().unwrap(), "--root", "Port"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let types = String::from_utf8(out.stdout).unwrap();
+    assert!(types.contains("num: int & >= 1 & <= 65535"), "{types}");
+    assert!(types.contains(r#"name: str & =~ "[a-z]+""#), "{types}");
+
+    // conforming value passes
+    let ok = format!("{types}schema Port\nnum: 8443\nname: \"https\"\n");
+    let pok = dir.join("ok.mang");
+    std::fs::write(&pok, ok).unwrap();
+    assert!(
+        mangrove(&["check", pok.to_str().unwrap()]).status.success(),
+        "conforming manifest should pass"
+    );
+
+    // out-of-range port is rejected
+    let bad = format!("{types}schema Port\nnum: 99999\nname: \"https\"\n");
+    let pbad = dir.join("bad.mang");
+    std::fs::write(&pbad, bad).unwrap();
+    assert_eq!(
+        mangrove(&["check", pbad.to_str().unwrap()]).status.code(),
+        Some(1),
+        "out-of-range port should be rejected"
+    );
+}
+
+#[test]
 fn free_form_object_becomes_json_and_validates_nested() {
     // `additionalProperties: true` → a `Json` field that accepts arbitrary nesting (M8).
     let dir = std::env::temp_dir().join(format!("openapi_ff_{}", std::process::id()));
