@@ -78,6 +78,14 @@ fn cmd_hash(path: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // L3 eval: reduce params/references to plain values before hashing (D35).
+    let body = match mangrove_typed::eval(&doc.body, &doc.params, &env) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
     // The content address is the schema-RESOLVED canonical form (D12): a bound
     // schema resolves unit literals to base integers; a schemaless document
     // hashes its raw data (M1 behaviour) but may not contain unit literals (D14).
@@ -93,14 +101,14 @@ fn cmd_hash(path: &str) -> ExitCode {
             // Only a valid document has a canonical resolved form, so validate
             // before resolving — this also keeps invalid input (e.g. a unit
             // literal in a non-unit field) from ever reaching the encoder.
-            let errors = mangrove_typed::validate(&doc.body, &ty, &env);
+            let errors = mangrove_typed::validate(&body, &ty, &env);
             if !errors.is_empty() {
                 for e in &errors {
                     eprintln!("{path}: {e}");
                 }
                 return ExitCode::from(1);
             }
-            match mangrove_typed::resolve(&doc.body, &ty, &env) {
+            match mangrove_typed::resolve(&body, &ty, &env) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("{path}: {e}");
@@ -109,11 +117,11 @@ fn cmd_hash(path: &str) -> ExitCode {
             }
         }
         None => {
-            if contains_unit(&doc.body) {
+            if contains_unit(&body) {
                 eprintln!("{path}: a unit literal requires a schema");
                 return ExitCode::from(1);
             }
-            doc.body
+            body
         }
     };
     println!("{}", mangrove_canonical::hash(&to_hash));
@@ -166,6 +174,14 @@ fn cmd_check(path: &str) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // L3 eval: reduce params/references before validating (D35).
+    let body = match mangrove_typed::eval(&doc.body, &doc.params, &env) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{path}: {e}");
+            return ExitCode::from(1);
+        }
+    };
     let Some(schema_name) = doc.schema else {
         println!("ok (no schema)");
         return ExitCode::SUCCESS;
@@ -178,10 +194,10 @@ fn cmd_check(path: &str) -> ExitCode {
         }
     };
     // Advisory @deprecated warnings (never affect the exit code).
-    for warning in mangrove_typed::deprecations(&doc.body, &schema_ty, &env) {
+    for warning in mangrove_typed::deprecations(&body, &schema_ty, &env) {
         eprintln!("warning: {warning}");
     }
-    let errors = mangrove_typed::validate(&doc.body, &schema_ty, &env);
+    let errors = mangrove_typed::validate(&body, &schema_ty, &env);
     if errors.is_empty() {
         println!("ok");
         ExitCode::SUCCESS

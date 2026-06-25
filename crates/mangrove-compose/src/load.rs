@@ -7,7 +7,7 @@ use crate::merge::merge;
 use mangrove_core::Value;
 use mangrove_resolve::{Lockfile, Resolvers};
 use mangrove_syntax::{
-    Annotation, Document, ListOpItem, Stmt, Type, TypeDef, UnitDef, parse_document,
+    Annotation, Document, ListOpItem, Param, Stmt, Type, TypeDef, UnitDef, parse_document,
 };
 use mangrove_typed::TypeEnv;
 use std::collections::BTreeMap;
@@ -28,6 +28,8 @@ pub struct Composed {
     pub schema: Option<String>,
     /// `schema Base & { … }` narrowing record, if present (§5.5).
     pub schema_narrow: Option<Type>,
+    /// L3 `params` of the root document (§6.1); govern the eval stage.
+    pub params: Vec<Param>,
     pub body: Value,
 }
 
@@ -130,6 +132,7 @@ fn compose_rec(
         unitdefs: doc.unitdefs,
         schema: doc.schema,
         schema_narrow: doc.schema_narrow,
+        params: doc.params,
         body: acc,
     })
 }

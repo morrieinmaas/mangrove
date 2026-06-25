@@ -71,6 +71,15 @@ pub struct Use {
     pub alias: String,
 }
 
+/// One L3 parameter (`name: <type> [= <default>]`, §6.1). A param with a default
+/// is optional; one without is required (D34).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub ty: Type,
+    pub default: Option<Value>,
+}
+
 /// A body statement (L2), ordered so composition folds them left-to-right.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
@@ -107,6 +116,8 @@ pub struct Document {
     pub schema: Option<String>,
     /// Subtype-redefinition narrowing record (`schema Base & { … }`, §5.5).
     pub schema_narrow: Option<Type>,
+    /// L3 `params` block (§6.1); empty for L0–L2 documents.
+    pub params: Vec<Param>,
     /// Ordered body statements (binds + spreads), for the compose driver.
     pub stmts: Vec<Stmt>,
     /// The folded body of plain bindings (spread-free path; used by `hash`
@@ -198,6 +209,7 @@ impl Parser {
         let mut unitdefs = Vec::new();
         let mut schema: Option<String> = None;
         let mut schema_narrow: Option<Type> = None;
+        let mut params: Vec<Param> = Vec::new();
         let mut stmts: Vec<Stmt> = Vec::new();
         let mut body = BTreeMap::new();
         self.skip_seps();
@@ -216,6 +228,13 @@ impl Parser {
                 typedefs.push(self.parse_typedef()?);
             } else if self.is_keyword_stmt("unit") {
                 unitdefs.push(self.parse_unitdef()?);
+            } else if matches!(&self.peek().tok, Tok::Bareword(b) if b == "params")
+                && self.next_is(&Tok::LBrace)
+            {
+                if !params.is_empty() {
+                    return Err(self.error("duplicate `params` block".into()));
+                }
+                params = self.parse_params()?;
             } else if self.is_keyword_stmt("schema") {
                 self.advance(); // 'schema'
                 let name = match self.peek().tok.clone() {
@@ -306,9 +325,50 @@ impl Parser {
             unitdefs,
             schema,
             schema_narrow,
+            params,
             stmts,
             body: Value::Map(body),
         })
+    }
+
+    /// `params { name: <type> [= <default>], … }` (§6.1). A default makes the
+    /// param optional (D34). Entries are newline/comma separated.
+    fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
+        self.advance(); // 'params'
+        self.expect(&Tok::LBrace)?;
+        let mut out: Vec<Param> = Vec::new();
+        self.skip_seps();
+        while !self.check(&Tok::RBrace) {
+            if self.at_eof() {
+                return Err(self.error("unterminated `params` block".into()));
+            }
+            let name = match self.peek().tok.clone() {
+                Tok::Bareword(n) => {
+                    self.advance();
+                    n
+                }
+                other => return Err(self.error(format!("expected a param name, found {other:?}"))),
+            };
+            if out.iter().any(|p| p.name == name) {
+                return Err(self.error(format!("duplicate param {name:?}")));
+            }
+            self.expect(&Tok::Colon)?;
+            let ty = self.parse_type_expr(0)?;
+            let default = if self.check(&Tok::Eq) {
+                self.advance();
+                Some(self.parse_value(0)?)
+            } else {
+                None
+            };
+            out.push(Param { name, ty, default });
+            let had_sep = self.at_sep();
+            self.skip_seps();
+            if !had_sep && !self.check(&Tok::RBrace) {
+                return Err(self.error("expected ',' or newline between params".into()));
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(out)
     }
 
     /// `use ./path.mang as alias` (M3a: local relative path only).
@@ -652,6 +712,12 @@ impl Parser {
             Tok::Bareword(b) if b == "unset" => {
                 self.advance();
                 Ok(Value::Unset)
+            }
+            // Any other bare identifier in value position is an L3 reference to a
+            // param or sibling binding (§6.1), reduced by the eval stage (M4a).
+            Tok::Bareword(name) => {
+                self.advance();
+                Ok(Value::Ref(name))
             }
             Tok::Bytes(b) => {
                 self.advance();

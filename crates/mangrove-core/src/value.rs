@@ -25,6 +25,10 @@ pub enum Value {
     /// yielding *absence*. Removed during composition (L2); like `Unit`, it must
     /// never reach the CBOR encoder.
     Unset,
+    /// An L3 bare-name reference (`replicas: count`) to a param or sibling
+    /// binding (§6.1). Reduced to its referent by the eval stage (M4a); like the
+    /// other markers it must never reach the CBOR encoder unresolved.
+    Ref(String),
 }
 
 impl Value {

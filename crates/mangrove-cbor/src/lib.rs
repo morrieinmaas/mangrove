@@ -51,6 +51,11 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
         // ponytail: guard — `unset` is removed during composition (L2); it must
         // never reach the encoder.
         Value::Unset => panic!("`unset` reached the CBOR encoder — compose first"),
+        // ponytail: guard — an L3 reference is reduced to its value by the eval
+        // stage (M4a); it must never reach the encoder unresolved.
+        Value::Ref(name) => {
+            panic!("unresolved reference `{name}` reached the CBOR encoder — eval first")
+        }
     }
 }
 
