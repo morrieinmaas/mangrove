@@ -1,6 +1,16 @@
 #[allow(unused_imports)]
 use super::{kind::*, lex::*, lower::*, parse::*};
 
+#[test]
+fn parses_a_simple_binding_into_a_lossless_tree() {
+    let src = "port: 8443\n";
+    let parse = super::parse::parse_cst(src);
+    let node = parse.syntax();
+    // losslessness at the tree level: the tree's text equals the source.
+    assert_eq!(node.text().to_string(), src);
+    assert_eq!(node.kind(), SyntaxKind::DOCUMENT);
+}
+
 use super::kind::SyntaxKind;
 
 #[test]
