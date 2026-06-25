@@ -217,6 +217,36 @@ fn param_default_reference_hashes_like_literal() {
 }
 
 #[test]
+fn fn_call_hashes_like_literal() {
+    // §6.2: port(8443) is sugar for { number: 8443, name: "http" }.
+    let types = "type Port = { number: int, name: str }\ntype D = { p: Port }\n";
+    let templ = std::env::temp_dir().join("m4d_templ.mang");
+    let lit = std::env::temp_dir().join("m4d_lit.mang");
+    std::fs::write(
+        &templ,
+        format!(
+            "{types}fn port(n: int): Port = {{ number: n, name: \"http\" }}\nschema D\np: port(8443)\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &lit,
+        format!("{types}schema D\np: {{ number: 8443, name: \"http\" }}\n"),
+    )
+    .unwrap();
+    let h = |p: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg("hash")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert_eq!(h(&templ), h(&lit));
+}
+
+#[test]
 fn match_hashes_like_literal() {
     // §6.1: replicas: match env { dev: 1, staging: 2, prod: 6 } with env="prod".
     let schema = "type D = { replicas: int }\nschema D\n";

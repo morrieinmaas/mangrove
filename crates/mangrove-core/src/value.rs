@@ -40,6 +40,13 @@ pub enum Value {
         scrutinee: Box<Value>,
         arms: Vec<(Option<Value>, Value)>,
     },
+    /// An L3 call to a schema-defined function (`port(8443)`, §6.2), with
+    /// positional arguments. Reduced to the function's body by the eval stage
+    /// (M4d); a transient marker.
+    Call {
+        name: String,
+        args: Vec<Value>,
+    },
 }
 
 /// One piece of an interpolated string (§6.3): literal text or a `$name`/`${name}`

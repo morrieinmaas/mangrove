@@ -291,6 +291,7 @@ pub(crate) fn render(v: &Value) -> String {
         Value::Ref(name) => name.clone(),
         Value::Interp(_) => "<interpolated string>".into(),
         Value::Match { .. } => "<match>".into(),
+        Value::Call { name, .. } => format!("{name}(…)"),
     }
 }
 

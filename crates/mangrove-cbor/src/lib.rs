@@ -64,6 +64,10 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
         Value::Match { .. } => {
             panic!("unresolved `match` reached the CBOR encoder — eval first")
         }
+        // ponytail: guard — a function call is reduced to its result by eval.
+        Value::Call { .. } => {
+            panic!("unresolved function call reached the CBOR encoder — eval first")
+        }
     }
 }
 

@@ -79,7 +79,7 @@ fn cmd_hash(path: &str) -> ExitCode {
         }
     };
     // L3 eval: reduce params/references to plain values before hashing (D35).
-    let body = match mangrove_typed::eval(&doc.body, &doc.params, &env) {
+    let body = match mangrove_typed::eval(&doc.body, &doc.params, &doc.fns, &env) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{path}: {e}");
@@ -175,7 +175,7 @@ fn cmd_check(path: &str) -> ExitCode {
         }
     };
     // L3 eval: reduce params/references before validating (D35).
-    let body = match mangrove_typed::eval(&doc.body, &doc.params, &env) {
+    let body = match mangrove_typed::eval(&doc.body, &doc.params, &doc.fns, &env) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{path}: {e}");

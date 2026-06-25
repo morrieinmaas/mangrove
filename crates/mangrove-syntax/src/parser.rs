@@ -80,6 +80,16 @@ pub struct Param {
     pub default: Option<Value>,
 }
 
+/// A schema-defined function (`fn port(n: int): Port = { … }`, §6.2): total,
+/// non-recursive, with positional params, a return type, and a body expression.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FnDef {
+    pub name: String,
+    pub params: Vec<(String, Type)>,
+    pub ret: Type,
+    pub body: Value,
+}
+
 /// A body statement (L2), ordered so composition folds them left-to-right.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
@@ -118,6 +128,8 @@ pub struct Document {
     pub schema_narrow: Option<Type>,
     /// L3 `params` block (§6.1); empty for L0–L2 documents.
     pub params: Vec<Param>,
+    /// L3 schema-defined functions (§6.2); empty for L0–L2 documents.
+    pub fns: Vec<FnDef>,
     /// Ordered body statements (binds + spreads), for the compose driver.
     pub stmts: Vec<Stmt>,
     /// The folded body of plain bindings (spread-free path; used by `hash`
@@ -210,6 +222,7 @@ impl Parser {
         let mut schema: Option<String> = None;
         let mut schema_narrow: Option<Type> = None;
         let mut params: Vec<Param> = Vec::new();
+        let mut fns: Vec<FnDef> = Vec::new();
         let mut stmts: Vec<Stmt> = Vec::new();
         let mut body = BTreeMap::new();
         self.skip_seps();
@@ -235,6 +248,8 @@ impl Parser {
                     return Err(self.error("duplicate `params` block".into()));
                 }
                 params = self.parse_params()?;
+            } else if self.is_keyword_stmt("fn") {
+                fns.push(self.parse_fndef()?);
             } else if self.is_keyword_stmt("schema") {
                 self.advance(); // 'schema'
                 let name = match self.peek().tok.clone() {
@@ -326,8 +341,62 @@ impl Parser {
             schema,
             schema_narrow,
             params,
+            fns,
             stmts,
             body: Value::Map(body),
+        })
+    }
+
+    /// `fn name(p: T, …): Ret = <body>` (§6.2). Positional params; the body is a
+    /// value expression (it may reference the params).
+    fn parse_fndef(&mut self) -> Result<FnDef, ParseError> {
+        self.advance(); // 'fn'
+        let name = match self.peek().tok.clone() {
+            Tok::Bareword(n) => {
+                self.advance();
+                n
+            }
+            other => return Err(self.error(format!("expected a function name, found {other:?}"))),
+        };
+        self.expect(&Tok::LParen)?;
+        let mut params: Vec<(String, Type)> = Vec::new();
+        self.skip_seps();
+        while !self.check(&Tok::RParen) {
+            if self.at_eof() {
+                return Err(self.error("unterminated function parameter list".into()));
+            }
+            let pname = match self.peek().tok.clone() {
+                Tok::Bareword(n) => {
+                    self.advance();
+                    n
+                }
+                other => {
+                    return Err(self.error(format!("expected a param name, found {other:?}")));
+                }
+            };
+            if params.iter().any(|(n, _)| n == &pname) {
+                return Err(self.error(format!("duplicate function param {pname:?}")));
+            }
+            self.expect(&Tok::Colon)?;
+            let ty = self.parse_type_expr(0)?;
+            params.push((pname, ty));
+            if self.check(&Tok::Comma) {
+                self.advance();
+                self.skip_seps();
+            } else {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        self.expect(&Tok::Colon)?;
+        let ret = self.parse_type_expr(0)?;
+        self.expect(&Tok::Eq)?;
+        let body = self.parse_value(0)?;
+        Ok(FnDef {
+            name,
+            params,
+            ret,
+            body,
         })
     }
 
@@ -753,6 +822,31 @@ impl Parser {
         })
     }
 
+    /// `name(arg, …)` — a positional call to a schema-defined function (§6.2).
+    fn parse_call(&mut self, name: String, depth: usize) -> Result<Value, ParseError> {
+        if depth >= MAX_DEPTH {
+            return Err(self.error("nesting too deep".into()));
+        }
+        self.advance(); // name
+        self.expect(&Tok::LParen)?;
+        let mut args: Vec<Value> = Vec::new();
+        self.skip_seps();
+        while !self.check(&Tok::RParen) {
+            if self.at_eof() {
+                return Err(self.error("unterminated call argument list".into()));
+            }
+            args.push(self.parse_value(depth + 1)?);
+            if self.check(&Tok::Comma) {
+                self.advance();
+                self.skip_seps();
+            } else {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        Ok(Value::Call { name, args })
+    }
+
     fn parse_value(&mut self, depth: usize) -> Result<Value, ParseError> {
         match self.peek().tok.clone() {
             Tok::Int(n) => {
@@ -784,6 +878,8 @@ impl Parser {
                 self.advance();
                 Ok(Value::Unset)
             }
+            // `name(arg, …)` — a call to a schema-defined function (§6.2, M4d).
+            Tok::Bareword(name) if self.next_is(&Tok::LParen) => self.parse_call(name, depth),
             // `match scrutinee { pat: val, … }` (§6.1), reduced by eval (M4c).
             Tok::Bareword(b) if b == "match" => self.parse_match(depth),
             // Any other bare identifier in value position is an L3 reference to a

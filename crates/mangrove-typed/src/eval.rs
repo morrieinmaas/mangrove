@@ -8,16 +8,17 @@ use crate::env::TypeEnv;
 use crate::validate::validate;
 use mangrove_core::error::ValidationError;
 use mangrove_core::{StrPart, Value};
-use mangrove_syntax::{Param, Type};
+use mangrove_syntax::{FnDef, Param, Type};
 use std::collections::BTreeMap;
 
 /// Eval context: the value scope (params + sibling bindings), the params' declared
-/// types (for `match` exhaustiveness, D37), and the type environment (to resolve
-/// a named param type to its union).
+/// types (for `match` exhaustiveness, D37), the type environment (to resolve a
+/// named param type to its union), and the schema-defined functions (§6.2).
 struct Ctx<'a> {
     scope: BTreeMap<String, Value>,
     ptypes: BTreeMap<String, Type>,
     types: &'a TypeEnv,
+    fns: &'a [FnDef],
 }
 
 /// Bound on reference-chain depth — a ref resolving to a ref … guards against a
@@ -39,6 +40,7 @@ fn err(
 pub fn eval(
     body: &Value,
     params: &[Param],
+    fns: &[FnDef],
     types: &TypeEnv,
 ) -> Result<Value, Box<ValidationError>> {
     let mut scope: BTreeMap<String, Value> = BTreeMap::new();
@@ -82,6 +84,7 @@ pub fn eval(
         scope,
         ptypes,
         types,
+        fns,
     };
     reduce(body, &cx, 0)
 }
@@ -131,6 +134,7 @@ fn reduce(v: &Value, cx: &Ctx, depth: usize) -> Result<Value, Box<ValidationErro
                 "a value covered by a match arm",
             ))
         }
+        Value::Call { name, args } => reduce_call(name, args, cx, depth),
         Value::List(xs) => Ok(Value::List(
             xs.iter()
                 .map(|x| reduce(x, cx, depth + 1))
@@ -145,6 +149,53 @@ fn reduce(v: &Value, cx: &Ctx, depth: usize) -> Result<Value, Box<ValidationErro
         }
         other => Ok(other.clone()),
     }
+}
+
+/// Reduce a call to a schema-defined function (§6.2): bind reduced, type-checked
+/// args to the fn's params in a fresh scope, evaluate the body, and check the
+/// result against the return type. A fn body sees only its own params (a pure,
+/// non-recursive constructor); runaway recursion is caught by the depth bound.
+fn reduce_call(
+    name: &str,
+    args: &[Value],
+    cx: &Ctx,
+    depth: usize,
+) -> Result<Value, Box<ValidationError>> {
+    let f = cx.fns.iter().find(|f| f.name == name).ok_or_else(|| {
+        err(
+            "",
+            format!("call to unknown function `{name}`"),
+            "a schema-defined `fn`",
+        )
+    })?;
+    if args.len() != f.params.len() {
+        return Err(err(
+            "",
+            format!("`{name}` called with {} argument(s)", args.len()),
+            format!("{} argument(s)", f.params.len()),
+        ));
+    }
+    let mut fscope: BTreeMap<String, Value> = BTreeMap::new();
+    let mut fptypes: BTreeMap<String, Type> = BTreeMap::new();
+    for ((pname, pty), arg) in f.params.iter().zip(args) {
+        let av = reduce(arg, cx, depth + 1)?; // args evaluate in the CALLER's scope
+        if let Some(e) = validate(&av, pty, cx.types).into_iter().next() {
+            return Err(err(format!("{name}({pname})"), e.got, e.expected));
+        }
+        fscope.insert(pname.clone(), av);
+        fptypes.insert(pname.clone(), pty.clone());
+    }
+    let fcx = Ctx {
+        scope: fscope,
+        ptypes: fptypes,
+        types: cx.types,
+        fns: cx.fns,
+    };
+    let result = reduce(&f.body, &fcx, depth + 1)?;
+    if let Some(e) = validate(&result, &f.ret, cx.types).into_iter().next() {
+        return Err(err(format!("{name}() result"), e.got, e.expected));
+    }
+    Ok(result)
 }
 
 /// Look up a name in the value scope.
@@ -230,7 +281,7 @@ fn render_scalar(v: &Value) -> Result<String, Box<ValidationError>> {
 /// can skip a default that needs reduction first).
 fn contains_ref(v: &Value) -> bool {
     match v {
-        Value::Ref(_) | Value::Interp(_) | Value::Match { .. } => true,
+        Value::Ref(_) | Value::Interp(_) | Value::Match { .. } | Value::Call { .. } => true,
         Value::List(xs) => xs.iter().any(contains_ref),
         Value::Map(m) => m.values().any(contains_ref),
         _ => false,
@@ -258,7 +309,7 @@ mod tests {
         }];
         let mut m = BTreeMap::new();
         m.insert("replicas".into(), Value::Ref("n".into()));
-        let out = eval(&Value::Map(m), &params, &types()).unwrap();
+        let out = eval(&Value::Map(m), &params, &[], &types()).unwrap();
         assert_eq!(
             out,
             Value::Map(BTreeMap::from([("replicas".into(), int(3))]))
@@ -272,7 +323,7 @@ mod tests {
             ty: Type::Str,
             default: None,
         }];
-        let e = eval(&Value::Map(BTreeMap::new()), &params, &types()).unwrap_err();
+        let e = eval(&Value::Map(BTreeMap::new()), &params, &[], &types()).unwrap_err();
         assert!(e.path.contains("version"), "{e}");
     }
 
@@ -280,7 +331,7 @@ mod tests {
     fn unknown_reference_errors() {
         let mut m = BTreeMap::new();
         m.insert("x".into(), Value::Ref("nope".into()));
-        let e = eval(&Value::Map(m), &[], &types()).unwrap_err();
+        let e = eval(&Value::Map(m), &[], &[], &types()).unwrap_err();
         assert!(e.got.contains("nope"), "{e}");
     }
 
@@ -289,7 +340,7 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("a".into(), int(7));
         m.insert("b".into(), Value::Ref("a".into()));
-        let out = eval(&Value::Map(m), &[], &types()).unwrap();
+        let out = eval(&Value::Map(m), &[], &[], &types()).unwrap();
         let Value::Map(o) = out else { panic!() };
         assert_eq!(o.get("b"), Some(&int(7)));
     }
@@ -299,7 +350,7 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("a".into(), Value::Ref("b".into()));
         m.insert("b".into(), Value::Ref("a".into()));
-        assert!(eval(&Value::Map(m), &[], &types()).is_err());
+        assert!(eval(&Value::Map(m), &[], &[], &types()).is_err());
     }
 
     #[test]
@@ -309,7 +360,7 @@ mod tests {
             ty: Type::Int,
             default: Some(Value::Str("oops".into())),
         }];
-        let e = eval(&Value::Map(BTreeMap::new()), &params, &types()).unwrap_err();
+        let e = eval(&Value::Map(BTreeMap::new()), &params, &[], &types()).unwrap_err();
         assert!(e.path.contains("params.n"), "{e}");
     }
 
@@ -325,7 +376,7 @@ mod tests {
             "image".into(),
             Value::Interp(vec![StrPart::Lit("api:".into()), StrPart::Ref("v".into())]),
         );
-        let out = eval(&Value::Map(m), &params, &types()).unwrap();
+        let out = eval(&Value::Map(m), &params, &[], &types()).unwrap();
         let Value::Map(o) = out else { panic!() };
         assert_eq!(o.get("image"), Some(&Value::Str("api:1.0".into())));
     }
@@ -335,7 +386,7 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("a".into(), Value::List(vec![]));
         m.insert("s".into(), Value::Interp(vec![StrPart::Ref("a".into())]));
-        assert!(eval(&Value::Map(m), &[], &types()).is_err());
+        assert!(eval(&Value::Map(m), &[], &[], &types()).is_err());
     }
 
     fn matchv(scrutinee: &str, arms: Vec<(Option<Value>, Value)>) -> Value {
@@ -364,7 +415,7 @@ mod tests {
         ];
         let mut m = BTreeMap::new();
         m.insert("replicas".into(), matchv("env", arms));
-        let out = eval(&Value::Map(m), &params, &types()).unwrap();
+        let out = eval(&Value::Map(m), &params, &[], &types()).unwrap();
         let Value::Map(o) = out else { panic!() };
         assert_eq!(o.get("replicas"), Some(&int(6)));
     }
@@ -380,7 +431,7 @@ mod tests {
                 vec![(Some(Value::Str("a".into())), int(1)), (None, int(0))],
             ),
         );
-        let out = eval(&Value::Map(m), &[], &types()).unwrap();
+        let out = eval(&Value::Map(m), &[], &[], &types()).unwrap();
         let Value::Map(o) = out else { panic!() };
         assert_eq!(o.get("y"), Some(&int(0))); // fell through to `_`
     }
@@ -394,7 +445,7 @@ mod tests {
             "y".into(),
             matchv("x", vec![(Some(Value::Str("a".into())), int(1))]),
         );
-        assert!(eval(&Value::Map(m), &[], &types()).is_err());
+        assert!(eval(&Value::Map(m), &[], &[], &types()).is_err());
     }
 
     #[test]
@@ -413,7 +464,83 @@ mod tests {
             "r".into(),
             matchv("env", vec![(Some(Value::Str("dev".into())), int(1))]), // missing "prod"
         );
-        assert!(eval(&Value::Map(m), &params, &types()).is_err());
+        assert!(eval(&Value::Map(m), &params, &[], &types()).is_err());
+    }
+
+    #[test]
+    fn fn_call_binds_args_and_reduces_body() {
+        // fn id(n: int): int = n  ;  x: id(5)  ⇒  x: 5
+        let f = FnDef {
+            name: "id".into(),
+            params: vec![("n".into(), Type::Int)],
+            ret: Type::Int,
+            body: Value::Ref("n".into()),
+        };
+        let fns = vec![f];
+        let mut m = BTreeMap::new();
+        m.insert(
+            "x".into(),
+            Value::Call {
+                name: "id".into(),
+                args: vec![int(5)],
+            },
+        );
+        let out = eval(&Value::Map(m), &[], &fns, &types()).unwrap();
+        let Value::Map(o) = out else { panic!() };
+        assert_eq!(o.get("x"), Some(&int(5)));
+    }
+
+    #[test]
+    fn fn_arity_mismatch_errors() {
+        let f = FnDef {
+            name: "id".into(),
+            params: vec![("n".into(), Type::Int)],
+            ret: Type::Int,
+            body: Value::Ref("n".into()),
+        };
+        let fns = vec![f];
+        let mut m = BTreeMap::new();
+        m.insert(
+            "x".into(),
+            Value::Call {
+                name: "id".into(),
+                args: vec![],
+            },
+        );
+        assert!(eval(&Value::Map(m), &[], &fns, &types()).is_err());
+    }
+
+    #[test]
+    fn unknown_fn_call_errors() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "x".into(),
+            Value::Call {
+                name: "nope".into(),
+                args: vec![],
+            },
+        );
+        assert!(eval(&Value::Map(m), &[], &[], &types()).is_err());
+    }
+
+    #[test]
+    fn fn_arg_type_violation_errors() {
+        let f = FnDef {
+            name: "id".into(),
+            params: vec![("n".into(), Type::Int)],
+            ret: Type::Int,
+            body: Value::Ref("n".into()),
+        };
+        let fns = vec![f];
+        let mut m = BTreeMap::new();
+        m.insert(
+            "x".into(),
+            Value::Call {
+                name: "id".into(),
+                args: vec![Value::Str("oops".into())], // not an int
+            },
+        );
+        assert!(eval(&Value::Map(m), &[], &fns, &types()).is_err());
     }
 
     #[test]
@@ -421,6 +548,6 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("a".into(), int(1));
         let body = Value::Map(m);
-        assert_eq!(eval(&body, &[], &types()).unwrap(), body);
+        assert_eq!(eval(&body, &[], &[], &types()).unwrap(), body);
     }
 }
