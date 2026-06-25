@@ -217,6 +217,35 @@ fn param_default_reference_hashes_like_literal() {
 }
 
 #[test]
+fn scale_equivalent_decimal_interpolations_hash_equal() {
+    // D12: 1.0 and 1.00 are the same canonical decimal, so interpolating either
+    // must yield the same content address (regression for the render_scalar fix).
+    let schema = "type D = { s: str }\nschema D\n";
+    let a = std::env::temp_dir().join("m4_dec_a.mang");
+    let b = std::env::temp_dir().join("m4_dec_b.mang");
+    std::fs::write(
+        &a,
+        format!("params {{ v: decimal = 1.0 }}\n{schema}s: \"${{v}}\"\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &b,
+        format!("params {{ v: decimal = 1.00 }}\n{schema}s: \"${{v}}\"\n"),
+    )
+    .unwrap();
+    let h = |p: &std::path::Path| {
+        let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+            .arg("hash")
+            .arg(p)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert_eq!(h(&a), h(&b));
+}
+
+#[test]
 fn fn_call_hashes_like_literal() {
     // §6.2: port(8443) is sugar for { number: 8443, name: "http" }.
     let types = "type Port = { number: int, name: str }\ntype D = { p: Port }\n";

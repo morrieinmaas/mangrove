@@ -247,6 +247,9 @@ fn literal_union_members(ty: &Type, env: &TypeEnv) -> Option<Vec<Value>> {
     match ty {
         Type::Named(n) => env.resolve(n).and_then(|t| literal_union_members(t, env)),
         Type::Union(variants) => variants.iter().map(literal_value).collect(),
+        // `bool` is the finite set {true, false} — a match covering both is total
+        // (D37) without needing a `_` arm.
+        Type::Bool => Some(vec![Value::Bool(true), Value::Bool(false)]),
         _ => None,
     }
 }
@@ -267,11 +270,14 @@ fn render_scalar(v: &Value) -> Result<String, Box<ValidationError>> {
     match v {
         Value::Str(s) => Ok(s.clone()),
         Value::Int(n) => Ok(n.to_string()),
-        Value::Decimal(d) => Ok(d.to_string()),
+        // Render the CANONICAL decimal so interpolation agrees with the encoder's
+        // notion of decimal identity — otherwise `1.0` and `1.00` (the same value)
+        // would interpolate to different strings and break D12.
+        Value::Decimal(d) => Ok(d.normalized().to_string()),
         Value::Bool(b) => Ok(b.to_string()),
         other => Err(err(
             "",
-            format!("{other:?}"),
+            crate::validate::render(other),
             "a scalar (str/int/decimal/bool) to interpolate into a string",
         )),
     }
@@ -541,6 +547,38 @@ mod tests {
             },
         );
         assert!(eval(&Value::Map(m), &[], &fns, &types()).is_err());
+    }
+
+    #[test]
+    fn bool_match_is_exhaustive_without_wildcard() {
+        let params = vec![Param {
+            name: "b".into(),
+            ty: Type::Bool,
+            default: Some(Value::Bool(true)),
+        }];
+        let mut m = BTreeMap::new();
+        m.insert(
+            "r".into(),
+            matchv(
+                "b",
+                vec![
+                    (Some(Value::Bool(true)), int(1)),
+                    (Some(Value::Bool(false)), int(0)),
+                ],
+            ),
+        );
+        let out = eval(&Value::Map(m), &params, &[], &types()).unwrap();
+        let Value::Map(o) = out else { panic!() };
+        assert_eq!(o.get("r"), Some(&int(1)));
+    }
+
+    #[test]
+    fn decimal_interpolation_uses_canonical_form() {
+        // 1.0 and 1.00 are the same canonical decimal → must render identically.
+        let d = |s: &str| Value::Decimal(s.parse().unwrap());
+        assert_eq!(render_scalar(&d("1.0")).unwrap(), "1");
+        assert_eq!(render_scalar(&d("1.00")).unwrap(), "1");
+        assert_eq!(render_scalar(&d("1.50")).unwrap(), "1.5");
     }
 
     #[test]
