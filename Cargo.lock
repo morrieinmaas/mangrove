@@ -211,6 +211,7 @@ dependencies = [
  "mangrove-compose",
  "mangrove-convert",
  "mangrove-core",
+ "mangrove-fmt",
  "mangrove-openapi",
  "mangrove-resolve",
  "mangrove-syntax",

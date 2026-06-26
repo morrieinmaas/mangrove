@@ -55,6 +55,7 @@ fn main() -> ExitCode {
             }
             None => usage(),
         },
+        Some("fmt") => cmd_fmt(&args[2..]),
         _ => usage(),
     }
 }
@@ -63,7 +64,8 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: mangrove [--version | hash <file> | check <file> | update <file> \
          | import <file.yaml|.toml> | export <file.mang> [--to yaml|toml] \
-         | gen-openapi <spec.json> [--root <Definition>]]"
+         | gen-openapi <spec.json> [--root <Definition>] \
+         | fmt <file…> | fmt --check <file…> | fmt -]"
     );
     ExitCode::from(2)
 }
@@ -381,6 +383,66 @@ fn cmd_check(path: &str) -> ExitCode {
             print_error(e);
         }
         ExitCode::from(1)
+    }
+}
+
+/// `mangrove fmt <file…> | --check <file…> | -`
+///
+/// - `fmt -`             : read stdin, write formatted text to stdout.
+/// - `fmt --check <file…>`: print paths of files that would change; exit 1 if any.
+/// - `fmt <file…>`       : rewrite each file in place if its content would change.
+fn cmd_fmt(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("-") => {
+            let mut src = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut src).expect("read stdin");
+            print!("{}", mangrove_fmt::format_str(&src).text);
+            ExitCode::SUCCESS
+        }
+        Some("--check") => {
+            let mut changed = false;
+            for path in &args[1..] {
+                let src = match std::fs::read_to_string(path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{path}: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                if mangrove_fmt::format_str(&src).text != src {
+                    eprintln!("{path}");
+                    changed = true;
+                }
+            }
+            if changed {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Some(_) => {
+            for path in args {
+                let src = match std::fs::read_to_string(path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{path}: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                let out = mangrove_fmt::format_str(&src).text;
+                if out != src {
+                    if let Err(e) = std::fs::write(path, out) {
+                        eprintln!("{path}: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!("usage: mangrove fmt <file…> | --check <file…> | -");
+            ExitCode::from(2)
+        }
     }
 }
 
