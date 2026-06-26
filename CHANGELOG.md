@@ -11,8 +11,12 @@ The Mangrove language server — the last of the v0.3.x tooling series.
   under the cursor plus its `##` doc comment), **document symbols** (outline of
   types / units / schema / params / fns / bindings), **semantic-token
   highlighting** (no tree-sitter grammar — classification comes straight from the
-  CST), and **formatting** (delegates to `mangrove fmt`). Full reparse on change;
-  in-memory document store.
+  CST), **formatting** (delegates to `mangrove fmt`), **go-to-definition** (local:
+  references, type/unit declarations, schema names), and **completion** (declared
+  type/unit names, keywords, and the bound schema's record fields). Full reparse on
+  change; in-memory document store. UTF-16 position encoding (CRLF-aware), with
+  precise diagnostic spans located in the CST; hardened by an adversarial review
+  (panic-isolated request handling, correct request ids on malformed input).
 - **Read-only invariant:** documents that `use` namespaced imports skip the
   type-check stage; the server never resolves imports, fetches, or writes files.
 - **Editor integration:** a Neovim plugin (`editors/nvim/` — filetype detection
