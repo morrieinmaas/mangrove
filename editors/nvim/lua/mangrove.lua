@@ -7,7 +7,9 @@
 -- This registers the `mangrove` filetype (via ftdetect/mangrove.lua), starts
 -- `mangrove lsp` for every `.mang` buffer, and enables semantic-token
 -- highlighting (Mangrove ships no tree-sitter grammar — highlighting comes from
--- the LSP). The server is read-only and never touches the network.
+-- the LSP). The server provides diagnostics, hover, document symbols,
+-- go-to-definition, completion, and semantic-token highlighting. The server is
+-- read-only and never touches the network.
 
 local M = {}
 

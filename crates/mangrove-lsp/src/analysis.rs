@@ -168,7 +168,9 @@ fn locate_span_for_type_error(msg: &str, root: &SyntaxNode, src_len: usize) -> (
     } else if let Some(rest) = inner.strip_prefix("duplicate type/unit definition: ") {
         Some(rest.trim())
     } else if let Some(rest) = inner.strip_prefix("non-productive recursive type involving `") {
-        rest.strip_suffix('`').map(str::trim)
+        // Extract the name between backticks: the rest starts after "involving `",
+        // so we need to find where the closing backtick is.
+        rest.split('`').next().map(str::trim)
     } else {
         None
     };
@@ -276,6 +278,7 @@ pub fn semantic_tokens(src: &str) -> Vec<SemToken> {
             SyntaxKind::STR | SyntaxKind::INTERP_STR | SyntaxKind::BYTES => SemKind::String,
             SyntaxKind::INT | SyntaxKind::DECIMAL => SemKind::Number,
             SyntaxKind::UNIT_LIT => SemKind::Unit,
+            SyntaxKind::BOOL => SemKind::Keyword,
             SyntaxKind::COLON
             | SyntaxKind::AMP
             | SyntaxKind::PIPE
@@ -306,18 +309,7 @@ fn classify_bareword(tok: &mangrove_syntax::cst::SyntaxToken) -> SemKind {
     let text = tok.text();
     if matches!(
         text,
-        "type"
-            | "unit"
-            | "schema"
-            | "use"
-            | "params"
-            | "fn"
-            | "match"
-            | "require"
-            | "unset"
-            | "as"
-            | "true"
-            | "false"
+        "type" | "unit" | "schema" | "use" | "params" | "fn" | "match" | "require" | "unset" | "as"
     ) {
         return SemKind::Keyword;
     }
@@ -792,6 +784,17 @@ mod tests {
     }
 
     #[test]
+    fn semantic_tokens_classify_booleans() {
+        let src = "a: true\nb: false\n";
+        let toks = semantic_tokens(src);
+        let kinds: Vec<SemKind> = toks.iter().map(|t| t.kind).collect();
+        assert!(
+            kinds.contains(&SemKind::Keyword),
+            "expected SemKind::Keyword for booleans, got {kinds:?}"
+        );
+    }
+
+    #[test]
     fn hover_on_a_type_name_shows_the_declaration_and_doc() {
         let src = "## the server schema\ntype Server = { host: str }\nschema Server\n";
         // offset into "Server" on the type line (after the doc comment + "type ")
@@ -850,6 +853,33 @@ mod tests {
             d.range.1 < src.len(),
             "diagnostic range should not span the whole document (got {:?})",
             d.range
+        );
+    }
+
+    #[test]
+    fn non_productive_recursion_diagnostic_points_at_declaration() {
+        // non-productive recursion: type T = T
+        let src = "type T = T\nschema T\nx: 1\n";
+        let diags = diagnostics(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("schema error")),
+            "expected a schema-error diagnostic, got {diags:?}"
+        );
+        let d = diags
+            .iter()
+            .find(|d| d.message.contains("non-productive recursive type"))
+            .unwrap();
+        // Range must be narrower than the whole document
+        assert!(
+            d.range.1 < src.len(),
+            "diagnostic range should not span the whole document (got {:?})",
+            d.range
+        );
+        // Range should land on the "type T" line
+        let snip = &src[d.range.0..d.range.1];
+        assert!(
+            snip.contains("type T"),
+            "diagnostic range should land on a type T declaration, snip={snip:?}"
         );
     }
 
