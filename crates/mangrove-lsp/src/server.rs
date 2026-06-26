@@ -2,21 +2,23 @@
 //! resolves imports, fetches, or writes files. Document state is in-memory and
 //! re-analyzed in full on every change.
 
-use crate::analysis::{self, SemKind, SymbolKind};
+use crate::analysis::{self, CompletionKind, SemKind, SymbolKind};
 use crate::line_index::LineIndex;
 use lsp_server::{Connection, ErrorCode, ExtractError, Message, Request, RequestId, Response};
 use lsp_types::{
-    Diagnostic, DiagnosticSeverity, DocumentSymbol, Hover, HoverContents, HoverProviderCapability,
-    MarkupContent, MarkupKind, OneOf, Position, PublishDiagnosticsParams, Range, SemanticToken,
-    SemanticTokenType, SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, SymbolKind as LspSymbolKind, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri, WorkDoneProgressOptions,
+    CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionResponse,
+    Diagnostic, DiagnosticSeverity, DocumentSymbol, GotoDefinitionResponse, Hover, HoverContents,
+    HoverProviderCapability, Location, MarkupContent, MarkupKind, OneOf, Position,
+    PublishDiagnosticsParams, Range, SemanticToken, SemanticTokenType, SemanticTokens,
+    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, SymbolKind as LspSymbolKind,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Uri, WorkDoneProgressOptions,
     notification::{
         DidChangeTextDocument, DidOpenTextDocument, Notification as _, PublishDiagnostics,
     },
     request::{
-        DocumentSymbolRequest, Formatting, HoverRequest, Request as _, SemanticTokensFullRequest,
+        Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, Request as _,
+        SemanticTokensFullRequest,
     },
 };
 use std::collections::HashMap;
@@ -72,6 +74,11 @@ fn server_capabilities() -> ServerCapabilities {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![":".to_string(), " ".to_string()]),
+            ..CompletionOptions::default()
+        }),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
                 legend: SemanticTokensLegend {
@@ -125,6 +132,8 @@ fn handle_request(
             DocumentSymbolRequest::METHOD => on_document_symbol(state, req),
             SemanticTokensFullRequest::METHOD => on_semantic_tokens(state, req),
             Formatting::METHOD => on_formatting(state, req),
+            GotoDefinition::METHOD => on_goto_definition(state, req),
+            Completion::METHOD => on_completion(state, req),
             _ => Response::new_err(
                 req.id,
                 ErrorCode::MethodNotFound as i32,
@@ -345,6 +354,71 @@ fn on_formatting(state: &State, req: Request) -> Response {
         id,
         serde_json::to_value(vec![edit]).unwrap_or(serde_json::Value::Null),
     )
+}
+
+fn on_goto_definition(state: &State, req: Request) -> Response {
+    let (id, params) = match cast::<GotoDefinition>(req) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let uri = params
+        .text_document_position_params
+        .text_document
+        .uri
+        .to_string();
+    let Some(text) = state.docs.get(&uri) else {
+        return Response::new_ok(id, serde_json::Value::Null);
+    };
+    let offset = offset_of(text, params.text_document_position_params.position);
+    let result: Option<GotoDefinitionResponse> =
+        analysis::goto_definition(text, offset).and_then(|(start, end)| {
+            let idx = LineIndex::new(text);
+            let parsed: Uri = uri.parse().ok()?;
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: parsed,
+                range: to_range(&idx, (start, end)),
+            }))
+        });
+    Response::new_ok(
+        id,
+        serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+fn on_completion(state: &State, req: Request) -> Response {
+    let (id, params) = match cast::<Completion>(req) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let uri = params.text_document_position.text_document.uri.to_string();
+    let Some(text) = state.docs.get(&uri) else {
+        return Response::new_ok(id, serde_json::Value::Null);
+    };
+    let offset = offset_of(text, params.text_document_position.position);
+    let items: Vec<CompletionItem> = analysis::completions(text, offset)
+        .into_iter()
+        .map(|c| CompletionItem {
+            label: c.label,
+            kind: Some(completion_item_kind(c.kind)),
+            ..CompletionItem::default()
+        })
+        .collect();
+    let result = CompletionResponse::List(CompletionList {
+        is_incomplete: false,
+        items,
+    });
+    Response::new_ok(
+        id,
+        serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+fn completion_item_kind(k: CompletionKind) -> CompletionItemKind {
+    match k {
+        CompletionKind::TypeName => CompletionItemKind::STRUCT,
+        CompletionKind::Keyword => CompletionItemKind::KEYWORD,
+        CompletionKind::Field => CompletionItemKind::FIELD,
+    }
 }
 
 // ---- helpers ----

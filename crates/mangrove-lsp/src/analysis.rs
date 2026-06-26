@@ -8,7 +8,25 @@
 //! (its parse + local-symbol features still work).
 
 use mangrove_syntax::cst::{SyntaxKind, SyntaxNode, lower, parse_cst};
+use mangrove_syntax::ty::Type;
 use rowan::TextRange;
+
+/// A completion item returned by the analysis layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletionItem {
+    pub label: String,
+    pub kind: CompletionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionKind {
+    /// A `type X = …` or `unit X` declaration.
+    TypeName,
+    /// A top-level language keyword.
+    Keyword,
+    /// A record-field name from the bound schema type.
+    Field,
+}
 
 /// A diagnostic with a byte-offset range into the source.
 #[derive(Debug, Clone, PartialEq)]
@@ -402,6 +420,316 @@ pub fn range_tuple(r: TextRange) -> (usize, usize) {
     (r.start().into(), r.end().into())
 }
 
+// ---- go-to-definition ----
+
+/// Resolve the symbol under `offset` to the byte range of its definition in
+/// the same document.  Returns `None` if the cursor is not on a resolvable
+/// symbol, or if the definition is cross-file (out of scope for v1).
+///
+/// Supported cases (local only):
+/// - A `REF` node / bare-word in value position → the top-level `BINDING`
+///   whose key matches, or a `params` entry with the same name.
+/// - A bareword in type-name position inside a `TYPE_DEF`/`UNIT_DEF`/
+///   `SCHEMA_DECL` → the `TYPE_DEF` or `UNIT_DEF` that declares it.
+pub fn goto_definition(src: &str, offset: usize) -> Option<(usize, usize)> {
+    let root = parse_cst(src).syntax();
+    let off: rowan::TextSize = (offset as u32).into();
+
+    // Find the significant token under the cursor.
+    let covering: Vec<_> = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.text_range().contains_inclusive(off))
+        .collect();
+    let tok = covering
+        .iter()
+        .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+        .cloned()?;
+
+    // Only BAREWORD tokens are interesting for definition lookup.
+    if tok.kind() != SyntaxKind::BAREWORD {
+        return None;
+    }
+    let name = tok.text().to_string();
+
+    // Skip language keywords — they have no definition site.
+    if matches!(
+        name.as_str(),
+        "type"
+            | "unit"
+            | "schema"
+            | "use"
+            | "params"
+            | "fn"
+            | "match"
+            | "require"
+            | "unset"
+            | "as"
+            | "true"
+            | "false"
+            | "int"
+            | "str"
+            | "bool"
+            | "decimal"
+            | "bytes"
+            | "brand"
+    ) {
+        return None;
+    }
+
+    // Determine the context of the token by examining its parent node kind.
+    let parent = tok.parent()?;
+    let in_type_position = matches!(
+        parent.kind(),
+        SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF | SyntaxKind::SCHEMA_DECL
+    );
+
+    if in_type_position {
+        // In a SCHEMA_DECL the name always refers to a type definition — jump there.
+        if parent.kind() == SyntaxKind::SCHEMA_DECL {
+            return find_type_decl(&root, &name);
+        }
+
+        // The token is inside a TYPE_DEF or UNIT_DEF: it is either (a) the
+        // declared name itself (first significant token after the keyword) or
+        // (b) a type reference inside the body.
+        let declared = node_decl_name(&parent);
+        let is_decl_name = declared.as_deref() == Some(name.as_str());
+
+        // If the cursor is on the declaration name itself, jump to the enclosing
+        // declaration node (that is the definition).
+        if is_decl_name {
+            let r = parent.text_range();
+            return Some((r.start().into(), r.end().into()));
+        }
+
+        // Otherwise it's a reference to another type/unit.
+        return find_type_decl(&root, &name);
+    }
+
+    // For tokens inside a REF node or general value/binding context, look for
+    // a top-level binding or param entry with this name.  Qualified refs
+    // (`alias.Type`) are cross-file — skip them.
+    if name.contains('.') {
+        return None;
+    }
+
+    // Try REF node parent first.
+    let maybe_ref = parent.kind() == SyntaxKind::REF
+        || parent.kind() == SyntaxKind::BINDING
+        || parent.kind() == SyntaxKind::MATCH_EXPR
+        || parent.kind() == SyntaxKind::CALL
+        || parent.kind() == SyntaxKind::DOCUMENT;
+
+    // Also accept barewords that are in BINDING value position (the key side
+    // is not a reference, the value side is).  We detect value-position by
+    // checking there is a COLON sibling before this token in the binding.
+    let in_value_position = if parent.kind() == SyntaxKind::BINDING {
+        let mut seen_colon = false;
+        let mut is_value = false;
+        for el in parent.children_with_tokens() {
+            match el {
+                rowan::NodeOrToken::Token(t) if t.kind() == SyntaxKind::COLON => {
+                    seen_colon = true;
+                }
+                rowan::NodeOrToken::Token(t)
+                    if seen_colon && t.text_range() == tok.text_range() =>
+                {
+                    is_value = true;
+                    break;
+                }
+                rowan::NodeOrToken::Node(n) if seen_colon => {
+                    // token is inside a child node after the colon
+                    if n.text_range().contains_inclusive(off) {
+                        is_value = true;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+        is_value
+    } else {
+        maybe_ref
+    };
+
+    if !in_value_position && parent.kind() != SyntaxKind::REF {
+        return None;
+    }
+
+    // Search: binding key, then params entry, then type/unit decl as fallback.
+    find_binding(&root, &name)
+        .or_else(|| find_param_entry(&root, &name))
+        .or_else(|| find_type_decl(&root, &name))
+}
+
+/// Find the top-level BINDING with the given key name; return its byte range.
+fn find_binding(root: &SyntaxNode, name: &str) -> Option<(usize, usize)> {
+    for child in root.children() {
+        if child.kind() != SyntaxKind::BINDING {
+            continue;
+        }
+        // The key is the first significant token.
+        let key = child
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)?;
+        if key.text() == name {
+            let r = child.text_range();
+            return Some((r.start().into(), r.end().into()));
+        }
+    }
+    None
+}
+
+/// Find a param entry inside a PARAM_DECL block with the given name.
+fn find_param_entry(root: &SyntaxNode, name: &str) -> Option<(usize, usize)> {
+    for child in root.children() {
+        if child.kind() != SyntaxKind::PARAM_DECL {
+            continue;
+        }
+        // Walk tokens inside the params block; each param name is a BAREWORD
+        // that precedes a COLON.
+        let tokens: Vec<_> = child
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+            .collect();
+        let mut i = 0;
+        while i < tokens.len() {
+            if tokens[i].kind() == SyntaxKind::BAREWORD
+                && tokens.get(i + 1).map(|t| t.kind()) == Some(SyntaxKind::COLON)
+                && tokens[i].text() == name
+            {
+                let r = tokens[i].text_range();
+                return Some((r.start().into(), r.end().into()));
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Find a TYPE_DEF or UNIT_DEF whose declared name equals `name`.
+fn find_type_decl(root: &SyntaxNode, name: &str) -> Option<(usize, usize)> {
+    for child in root.children() {
+        if !matches!(child.kind(), SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF) {
+            continue;
+        }
+        if node_decl_name(&child).as_deref() == Some(name) {
+            let r = child.text_range();
+            return Some((r.start().into(), r.end().into()));
+        }
+    }
+    None
+}
+
+// ---- completions ----
+
+/// Top-level language keywords offered as completion items.
+const KEYWORDS: &[&str] = &[
+    "type", "schema", "unit", "use", "params", "fn", "match", "unset",
+];
+
+/// Return completion items for a cursor at `offset` in `src`.
+///
+/// Pragmatic v1: returns the union of
+/// - declared type names (TYPE_DEF / UNIT_DEF) — Kind=TypeName
+/// - top-level keywords — Kind=Keyword
+/// - record-field names from the document's bound schema type — Kind=Field
+///
+/// No precise context detection; over-offering is intentional (better than
+/// mis-resolving).  Cross-file completion is out of scope.
+pub fn completions(src: &str, _offset: usize) -> Vec<CompletionItem> {
+    let root = parse_cst(src).syntax();
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Helper to dedup-insert.
+    let mut push = |item: CompletionItem| {
+        if seen.insert(item.label.clone()) {
+            items.push(item);
+        }
+    };
+
+    // 1. Declared type/unit names.
+    for child in root.children() {
+        match child.kind() {
+            SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF => {
+                if let Some(name) = node_decl_name(&child) {
+                    push(CompletionItem {
+                        label: name,
+                        kind: CompletionKind::TypeName,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 2. Keywords.
+    for &kw in KEYWORDS {
+        push(CompletionItem {
+            label: kw.to_string(),
+            kind: CompletionKind::Keyword,
+        });
+    }
+
+    // 3. Record-field names from the bound schema type (if any).
+    //    We lower the document to get the schema name, then resolve the type
+    //    definition from the local typedefs.
+    if let Some(fields) = schema_record_fields(src) {
+        for field in fields {
+            push(CompletionItem {
+                label: field,
+                kind: CompletionKind::Field,
+            });
+        }
+    }
+
+    items
+}
+
+/// If the document has a `schema X` and `X` resolves locally to a record type,
+/// return that record's field names.  Returns `None` if the schema is absent,
+/// unresolvable, or not a plain record.
+fn schema_record_fields(src: &str) -> Option<Vec<String>> {
+    let root = parse_cst(src).syntax();
+    let doc = lower(&root).ok()?;
+    // skip cross-file imports (can't resolve locally)
+    if !doc.uses.is_empty() {
+        return None;
+    }
+    let schema_name = doc.schema.as_deref()?;
+    // Resolve the schema name through typedefs.
+    let fields = resolve_record_fields(schema_name, &doc.typedefs)?;
+    Some(fields.iter().map(|f| f.name.clone()).collect())
+}
+
+/// Walk the typedef list resolving `Named` aliases until we find a `Record`
+/// and return its fields.  Avoids infinite loops by bounding depth.
+fn resolve_record_fields<'a>(
+    name: &str,
+    typedefs: &'a [mangrove_syntax::parser::TypeDef],
+) -> Option<&'a [mangrove_syntax::ty::FieldDef]> {
+    let mut current = name;
+    let mut depth = 0usize;
+    loop {
+        if depth > 16 {
+            return None; // cycle guard
+        }
+        let td = typedefs.iter().find(|t| t.name == current)?;
+        match &td.ty {
+            Type::Record { fields, .. } => return Some(fields),
+            Type::Named(next) => {
+                current = next.as_str();
+                depth += 1;
+            }
+            _ => return None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,6 +850,124 @@ mod tests {
             d.range.1 < src.len(),
             "diagnostic range should not span the whole document (got {:?})",
             d.range
+        );
+    }
+
+    // ---- goto_definition tests ----
+
+    #[test]
+    fn goto_definition_value_ref_resolves_to_binding() {
+        // `host` in value position of `addr` should resolve to `host: "x"`.
+        let src = "host: \"x\"\naddr: host\n";
+        // offset into "host" on line 2 (the ref)
+        let ref_off = src.rfind("host").unwrap();
+        let result = goto_definition(src, ref_off);
+        assert!(result.is_some(), "expected a definition, got None");
+        let (start, end) = result.unwrap();
+        // The definition range should cover the first `host: "x"` binding.
+        let snip = &src[start..end];
+        assert!(snip.contains("host"), "snip={snip:?}");
+        // Should not point at the ref itself (i.e. it must be at or before the ref).
+        assert!(start < ref_off, "definition should precede the reference");
+    }
+
+    #[test]
+    fn goto_definition_type_ref_resolves_to_type_decl() {
+        let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
+        // offset into "Server" in the `schema Server` line
+        let schema_off = src.rfind("Server").unwrap();
+        // The first Server is in the TYPE_DEF; rfind gives us the schema line one.
+        let result = goto_definition(src, schema_off);
+        // Should resolve to the `type Server = …` declaration.
+        assert!(result.is_some(), "expected goto_definition to resolve");
+        let (start, _end) = result.unwrap();
+        let snip = &src[start..];
+        assert!(
+            snip.starts_with("type Server") || snip.contains("type Server"),
+            "expected to land on type declaration, got start={start}: {snip:.40?}"
+        );
+    }
+
+    #[test]
+    fn goto_definition_returns_none_for_keyword() {
+        let src = "type Server = { host: str }\nschema Server\n";
+        // offset at "type" keyword
+        let off = src.find("type").unwrap();
+        assert_eq!(goto_definition(src, off), None);
+    }
+
+    #[test]
+    fn goto_definition_returns_none_for_unknown_ref() {
+        let src = "host: ghost\n";
+        let off = src.find("ghost").unwrap();
+        // `ghost` is not declared anywhere → None
+        assert_eq!(goto_definition(src, off), None);
+    }
+
+    // ---- completions tests ----
+
+    #[test]
+    fn completions_include_declared_type_name() {
+        let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
+        let items = completions(src, 0);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Server"),
+            "expected 'Server' in completions, got {labels:?}"
+        );
+        let server = items.iter().find(|i| i.label == "Server").unwrap();
+        assert_eq!(server.kind, CompletionKind::TypeName);
+    }
+
+    #[test]
+    fn completions_include_keywords() {
+        let src = "type Server = { host: str }\nschema Server\n";
+        let items = completions(src, 0);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"type"),
+            "expected keyword 'type' in completions, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"schema"),
+            "expected keyword 'schema' in completions, got {labels:?}"
+        );
+        let kw = items.iter().find(|i| i.label == "type").unwrap();
+        assert_eq!(kw.kind, CompletionKind::Keyword);
+    }
+
+    #[test]
+    fn completions_include_schema_record_fields() {
+        // Document with a bound record schema — field names should appear.
+        let src =
+            "type Server = { host: str, port: int }\nschema Server\nhost: \"x\"\nport: 8080\n";
+        let items = completions(src, 0);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"host"),
+            "expected field 'host' in completions, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"port"),
+            "expected field 'port' in completions, got {labels:?}"
+        );
+        let f = items.iter().find(|i| i.label == "host").unwrap();
+        assert_eq!(f.kind, CompletionKind::Field);
+    }
+
+    #[test]
+    fn completions_no_duplicate_labels() {
+        // A name that could appear as both a type and a binding should appear once.
+        let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
+        let items = completions(src, 0);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        let mut dedup = labels.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(
+            labels.len(),
+            dedup.len(),
+            "duplicate completion labels: {labels:?}"
         );
     }
 }
