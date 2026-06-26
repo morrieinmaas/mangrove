@@ -23,6 +23,38 @@ fn oracle_simple_bindings() {
     assert_hash_equivalent("a: true\nb: \"x\"\n");
 }
 
+/// Like `assert_hash_equivalent` but compares `Value`s by `PartialEq` instead of
+/// hashing. Required for transient markers (`Value::Unit`, `Value::Interp`, etc.)
+/// that the CBOR encoder deliberately panics on (they must be resolved before
+/// canonicalization). Both legacy and CST must agree on the same Value.
+fn assert_value_equivalent(src: &str) {
+    let legacy = super::super::parse(src);
+    let cst = super::lower::lower(&super::parse::parse_cst(src).syntax()).map(|d| d.body);
+    match (legacy, cst) {
+        (Ok(lv), Ok(cv)) => assert_eq!(lv, cv, "value mismatch for {src:?}"),
+        (Err(_), Err(_)) => {}
+        (l, r) => panic!("legacy vs cst disagree for {src:?}: {l:?} / {r:?}"),
+    }
+}
+
+#[test]
+fn oracle_full_scalars() {
+    // Fully-resolved scalars: use hash oracle (CBOR-encodable).
+    assert_hash_equivalent("x: 0.25\n"); // decimal
+    assert_hash_equivalent("t: \"\"\"line one\nline two\"\"\"\n"); // text block, no holes → Str
+    assert_hash_equivalent("xs: [ 0.1, 0.2 ]\n");
+    // bytes literal: b64"aGVsbG8=" (base64 for "hello"), from cst/lex.rs scans_bytes_literal test
+    assert_hash_equivalent("b: b64\"aGVsbG8=\"\n");
+
+    // Transient markers (Unit, Interp): CBOR encoder panics on them by design;
+    // compare by PartialEq — both sides must produce the identical Value.
+    assert_value_equivalent("x: 512Mi\n"); // unit literal → Value::Unit
+    assert_value_equivalent("s: \"hi ${name}\"\n"); // interpolated string → Value::Interp
+    assert_value_equivalent("ti: \"\"\"hi ${name}\"\"\"\n"); // text block WITH a hole → Value::Interp
+    // composites: contain transient markers, so use value equality
+    assert_value_equivalent("m: { mem: 256Mi, cpu: 0.5 }\n");
+}
+
 #[test]
 fn parses_a_simple_binding_into_a_lossless_tree() {
     let src = "port: 8443\n";

@@ -163,8 +163,18 @@ fn decode_scalar(t: &SyntaxToken) -> Result<Value, ParseError> {
         Tok::Int(n) => Ok(Value::Int(n.clone())),
         Tok::Bool(b) => Ok(Value::Bool(*b)),
         Tok::Str(s) => Ok(Value::Str(s.clone())),
-        // DECIMAL/UNIT_LIT/INTERP_STR/BYTES handled in later tasks.
-        other => unreachable!("decode_scalar not yet handling {other:?}"),
+        Tok::Decimal(d) => Ok(Value::Decimal(d.clone())),
+        Tok::UnitLit(mantissa, suffix) => Ok(Value::Unit {
+            mantissa: mantissa.clone(),
+            suffix: suffix.clone(),
+        }),
+        Tok::InterpStr(parts) => Ok(Value::Interp(parts.clone())),
+        Tok::Bytes(b) => Ok(Value::Bytes(b.clone())),
+        other => Err(ParseError {
+            message: format!("unexpected scalar token: {other:?}"),
+            line: 0,
+            col: 0,
+        }),
     }
 }
 
