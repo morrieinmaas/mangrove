@@ -42,6 +42,10 @@ pub enum SyntaxKind {
     DECIMAL,
     UNIT_LIT,
     STR,
+    // RESERVED — not currently emitted by the lexer/parser. Type and match
+    // interiors are flat token runs under TYPE_DEF / MATCH_EXPR in v0.3.0;
+    // these tags exist for a future structured parser. Do not write tree
+    // visitors assuming these nodes exist.
     INTERP_STR,
     BOOL,
     BYTES,
@@ -74,6 +78,10 @@ pub enum SyntaxKind {
     DEFAULT,
     BINDING,
     // types
+    // RESERVED — not currently emitted by the lexer/parser. Type and match
+    // interiors are flat token runs under TYPE_DEF / MATCH_EXPR in v0.3.0;
+    // these tags exist for a future structured parser. Do not write tree
+    // visitors assuming these nodes exist.
     TYPE_PRIMITIVE,
     TYPE_RANGE,
     TYPE_REGEX,

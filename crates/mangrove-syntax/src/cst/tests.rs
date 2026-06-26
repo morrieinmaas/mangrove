@@ -378,6 +378,40 @@ fn syntaxkind_all_matches_discriminants() {
     }
 }
 
+#[test]
+fn tree_has_expected_kinds_at_paths() {
+    use super::kind::SyntaxKind::*;
+    // helper: collect (kind, text) of all non-trivia tokens under the first node of `kind`.
+    fn first_node(root: &SyntaxNode, k: SyntaxKind) -> SyntaxNode {
+        root.descendants()
+            .find(|n| n.kind() == k)
+            .expect("node kind present")
+    }
+    // a binding with a record value
+    let p = parse_cst("a: { b: 1, c: [ 2, 3 ] }\n");
+    let root = p.syntax();
+    assert_eq!(root.kind(), DOCUMENT);
+    let binding = first_node(&root, BINDING);
+    // the record value is a RECORD node, its fields are FIELD nodes
+    let record = first_node(&binding, RECORD);
+    let fields: Vec<_> = record.children().filter(|n| n.kind() == FIELD).collect();
+    assert_eq!(fields.len(), 2, "record has two FIELD children");
+    // the list value is a LIST node with INT element tokens
+    let list = first_node(&record, LIST);
+    let ints: Vec<_> = list
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == INT)
+        .collect();
+    assert_eq!(ints.len(), 2, "list has two INT tokens");
+    // a type def is a TYPE_DEF node; a templating ref value is a REF node; unset is UNSET
+    let p2 = parse_cst("type T = int\nschema T\nx: y\nz: unset\n");
+    let r2 = p2.syntax();
+    assert_eq!(first_node(&r2, TYPE_DEF).kind(), TYPE_DEF);
+    assert_eq!(first_node(&r2, REF).kind(), REF);
+    assert_eq!(first_node(&r2, UNSET).kind(), UNSET);
+}
+
 fn relex_roundtrips(src: &str) {
     let toks = super::lex::lex_lossless(src);
     let joined: String = toks.iter().map(|t| &src[t.start..t.end]).collect();
