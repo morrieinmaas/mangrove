@@ -106,6 +106,73 @@ fn composite_losslessness() {
     );
 }
 
+// ---- Task 8: full-Document equivalence oracle ----
+
+fn assert_document_equivalent(src: &str) {
+    let legacy = super::super::parse_document(src);
+    let cst = super::lower::lower(&super::parse::parse_cst(src).syntax());
+    match (legacy, cst) {
+        (Ok(l), Ok(c)) => assert_eq!(l, c, "document mismatch for {src:?}"),
+        (Err(_), Err(_)) => {}
+        (l, r) => panic!("legacy vs cst disagree for {src:?}: {l:?} / {r:?}"),
+    }
+}
+
+#[test]
+fn oracle_declarations() {
+    // simple type def + schema + body
+    assert_document_equivalent("type T = int\nschema T\nx: 1\n");
+    // unit def
+    assert_document_equivalent("unit Mem : int { B = 1, Ki = 1024B }\nschema Mem\nx: 1Ki\n");
+    // use statement
+    assert_document_equivalent("use \"./base.mang\" as base\nschema Base\nx: 1\n");
+    // type def with annotation
+    assert_document_equivalent(
+        "type Port = int & >= 1 & <= 65535 @doc(\"port\")\nschema Port\nx: 1\n",
+    );
+    // schema with narrow
+    assert_document_equivalent(
+        "type Base = { a: int }\nschema Base & { b: str }\na: 1\nb: \"x\"\n",
+    );
+}
+
+#[test]
+fn oracle_declaration_losslessness() {
+    let srcs = [
+        "type T = int\nschema T\nx: 1\n",
+        "unit Mem : int { B = 1, Ki = 1024B }\nschema Mem\nx: 1Ki\n",
+        "use \"./base.mang\" as base\nschema Base\nx: 1\n",
+        "type Port = int & >= 1 & <= 65535\nschema Port\nx: 1\n",
+    ];
+    for src in srcs {
+        let node = super::parse::parse_cst(src).syntax();
+        assert_eq!(
+            node.text().to_string(),
+            src,
+            "declaration-bearing input must round-trip losslessly: {src:?}"
+        );
+    }
+}
+
+#[test]
+fn oracle_example_k8s_deployment() {
+    let p =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/k8s-deployment.mang");
+    let src = std::fs::read_to_string(&p).unwrap();
+    assert_document_equivalent(&src);
+}
+
+#[test]
+fn oracle_example_pyproject() {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/pyproject.mang");
+    let src = std::fs::read_to_string(&p).unwrap();
+    assert_document_equivalent(&src);
+}
+
+// k8s-templated.mang uses Value::Ref, Value::Match, and params — deferred to Task 10.
+// #[test]
+// fn oracle_example_k8s_templated() { ... }
+
 use super::kind::SyntaxKind;
 
 #[test]

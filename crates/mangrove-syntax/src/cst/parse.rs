@@ -97,15 +97,180 @@ pub fn parse_cst(src: &str) -> Parse {
 }
 
 fn parse_document(p: &mut Parser) {
-    // Filled out construct-by-construct in Task 6+. For Task 4 we handle only the
-    // simplest binding: `bareword : value` where value is an int/str/bool. This
-    // proves the event→tree→lower loop end to end before porting the full grammar.
     while p.current() != SyntaxKind::EOF {
         if p.current() == SyntaxKind::NEWLINE {
             p.bump();
             continue;
         }
-        parse_binding(p);
+        // Determine what kind of top-level item this is by inspecting the
+        // leading significant token (and the next one to distinguish declarations
+        // from bindings named the same as a keyword).
+        if is_decl_keyword(p, "use") && lookahead_is_str(p) {
+            parse_use_decl(p);
+        } else if is_decl_keyword(p, "type") && lookahead_is_bareword(p) {
+            parse_type_def(p);
+        } else if is_decl_keyword(p, "unit") && lookahead_is_bareword(p) {
+            parse_unit_def(p);
+        } else if is_decl_keyword(p, "params") && lookahead_is_lbrace(p) {
+            parse_param_decl(p);
+        } else if is_decl_keyword(p, "fn") && lookahead_is_bareword(p) {
+            parse_fn_def(p);
+        } else if is_decl_keyword(p, "schema") && lookahead_is_bareword(p) {
+            parse_schema_decl(p);
+        } else {
+            parse_binding(p);
+        }
+    }
+}
+
+/// Returns true if the next significant token is a BAREWORD with the given text.
+fn is_decl_keyword(p: &Parser, kw: &str) -> bool {
+    if p.current() != SyntaxKind::BAREWORD {
+        return false;
+    }
+    // Find the raw token position for this significant token.
+    let mut i = p.pos;
+    while i < p.toks.len() && p.toks[i].kind.is_trivia() {
+        i += 1;
+    }
+    if i >= p.toks.len() {
+        return false;
+    }
+    &p.src[p.toks[i].start..p.toks[i].end] == kw
+}
+
+/// Returns true if the first significant token AFTER the current one is a BAREWORD.
+fn lookahead_is_bareword(p: &Parser) -> bool {
+    nth_sig(p, 1) == SyntaxKind::BAREWORD
+}
+
+/// Returns true if the first significant token after the current one is a STR.
+fn lookahead_is_str(p: &Parser) -> bool {
+    nth_sig(p, 1) == SyntaxKind::STR
+}
+
+/// Returns true if the first significant token after the current one is L_BRACE.
+fn lookahead_is_lbrace(p: &Parser) -> bool {
+    nth_sig(p, 1) == SyntaxKind::L_BRACE
+}
+
+/// Returns the kind of the Nth significant token (0 = current, 1 = next, ...).
+fn nth_sig(p: &Parser, n: usize) -> SyntaxKind {
+    let mut count = 0;
+    let mut i = p.pos;
+    while i < p.toks.len() {
+        if !p.toks[i].kind.is_trivia() {
+            if count == n {
+                return p.toks[i].kind;
+            }
+            count += 1;
+        }
+        i += 1;
+    }
+    SyntaxKind::EOF
+}
+
+// ---- Declaration parsers ----
+// For each declaration, the strategy is: start the node, then consume all
+// tokens belonging to this declaration losslessly, then finish. Brace/bracket/
+// paren depth tracking ensures we consume the full block for block-bearing forms.
+
+/// `use "path" as alias` — single logical line.
+fn parse_use_decl(p: &mut Parser) {
+    p.start(SyntaxKind::USE_DECL);
+    consume_through_newline(p);
+    p.finish();
+}
+
+/// `type Name = <type-expr> [@annotations...]` — single logical line (no brace in
+/// simple cases; some types like record types span multiple lines but the
+/// depth-tracking handles that).
+fn parse_type_def(p: &mut Parser) {
+    p.start(SyntaxKind::TYPE_DEF);
+    consume_through_newline_at_depth_0(p);
+    p.finish();
+}
+
+/// `unit Name : int { ... }` — has a brace-delimited block.
+fn parse_unit_def(p: &mut Parser) {
+    p.start(SyntaxKind::UNIT_DEF);
+    consume_through_newline_at_depth_0(p);
+    p.finish();
+}
+
+/// `params { ... }` — has a brace-delimited block.
+fn parse_param_decl(p: &mut Parser) {
+    p.start(SyntaxKind::PARAM_DECL);
+    consume_through_newline_at_depth_0(p);
+    p.finish();
+}
+
+/// `fn name(params): RetType = body` — the body may be a brace/bracket-delimited
+/// value.
+fn parse_fn_def(p: &mut Parser) {
+    p.start(SyntaxKind::FN_DEF);
+    consume_through_newline_at_depth_0(p);
+    p.finish();
+}
+
+/// `schema Name` or `schema Name & { ... }` — the latter has a brace block.
+fn parse_schema_decl(p: &mut Parser) {
+    p.start(SyntaxKind::SCHEMA_DECL);
+    consume_through_newline_at_depth_0(p);
+    p.finish();
+}
+
+/// Consume all tokens up to and including the next NEWLINE at brace/bracket/paren
+/// depth 0, or until EOF. This handles declarations that may contain nested braces
+/// (type records, unit blocks, fn bodies, etc.).
+fn consume_through_newline_at_depth_0(p: &mut Parser) {
+    // First bump leading trivia.
+    p.eat_trivia();
+    let mut depth = 0usize;
+    loop {
+        match p.current() {
+            SyntaxKind::EOF => break,
+            SyntaxKind::NEWLINE if depth == 0 => {
+                p.bump(); // include the newline in the node
+                break;
+            }
+            SyntaxKind::L_BRACE | SyntaxKind::L_BRACKET | SyntaxKind::L_PAREN => {
+                depth += 1;
+                p.bump();
+            }
+            SyntaxKind::R_BRACE | SyntaxKind::R_BRACKET | SyntaxKind::R_PAREN => {
+                depth = depth.saturating_sub(1);
+                p.bump();
+                // After closing the outermost block, eat the trailing newline.
+                if depth == 0 {
+                    if p.current() == SyntaxKind::NEWLINE {
+                        p.bump();
+                    }
+                    break;
+                }
+            }
+            _ => {
+                p.bump();
+            }
+        }
+    }
+}
+
+/// Consume all tokens up to and including the next NEWLINE (no depth tracking —
+/// used for `use` which is guaranteed single-line).
+fn consume_through_newline(p: &mut Parser) {
+    p.eat_trivia();
+    loop {
+        match p.current() {
+            SyntaxKind::EOF => break,
+            SyntaxKind::NEWLINE => {
+                p.bump();
+                break;
+            }
+            _ => {
+                p.bump();
+            }
+        }
     }
 }
 

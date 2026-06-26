@@ -143,6 +143,63 @@ pub struct Document {
     pub body: Value,
 }
 
+// ---- pub(crate) wrappers for CST lowering ----
+// Each wrapper lexes the given source slice and calls the existing private parser
+// method. These let `cst::lower` decode individual declaration nodes without
+// re-implementing the declaration grammar and without running `parse_document`
+// on the full source (which would make the oracle tautological).
+
+/// Parse a `use "path" as alias` declaration from a node's text slice.
+pub(crate) fn parse_use_str(src: &str) -> Result<Use, ParseError> {
+    let tokens = lex(src).map_err(|e| ParseError {
+        message: e.message,
+        line: e.line,
+        col: e.col,
+    })?;
+    Parser { tokens, pos: 0 }.parse_use()
+}
+
+/// Parse a `unit Name : int { … }` declaration from a node's text slice.
+pub(crate) fn parse_unitdef_str(src: &str) -> Result<UnitDef, ParseError> {
+    let tokens = lex(src).map_err(|e| ParseError {
+        message: e.message,
+        line: e.line,
+        col: e.col,
+    })?;
+    Parser { tokens, pos: 0 }.parse_unitdef()
+}
+
+/// Parse a `params { … }` block from a node's text slice.
+pub(crate) fn parse_params_str(src: &str) -> Result<Vec<Param>, ParseError> {
+    let tokens = lex(src).map_err(|e| ParseError {
+        message: e.message,
+        line: e.line,
+        col: e.col,
+    })?;
+    Parser { tokens, pos: 0 }.parse_params()
+}
+
+/// Parse a `fn name(…): T = body` definition from a node's text slice.
+pub(crate) fn parse_fndef_str(src: &str) -> Result<FnDef, ParseError> {
+    let tokens = lex(src).map_err(|e| ParseError {
+        message: e.message,
+        line: e.line,
+        col: e.col,
+    })?;
+    Parser { tokens, pos: 0 }.parse_fndef()
+}
+
+/// Parse a full `type Name = <type-expr> [@annotations…]` declaration from a
+/// node's text slice.
+pub(crate) fn parse_typedef_str(src: &str) -> Result<TypeDef, ParseError> {
+    let tokens = lex(src).map_err(|e| ParseError {
+        message: e.message,
+        line: e.line,
+        col: e.col,
+    })?;
+    Parser { tokens, pos: 0 }.parse_typedef()
+}
+
 /// Parse a complete document (typedefs + schema + body).
 pub fn parse_document(src: &str) -> Result<Document, ParseError> {
     let tokens = lex(src).map_err(|e| ParseError {
