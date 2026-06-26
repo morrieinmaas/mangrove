@@ -7,6 +7,7 @@
 //!   `mangrove export <file> --to`   — evaluate a document and emit YAML/TOML
 //!   `mangrove gen-openapi <spec>`   — generate Mangrove types from an OpenAPI spec
 //!   `mangrove fmt <file>…`          — format documents (--check to gate; - for stdin)
+//!   `mangrove lsp`                  — run the language server over stdio (editors)
 
 use mangrove_core::error::ValidationError;
 use std::process::ExitCode;
@@ -61,7 +62,20 @@ fn main() -> ExitCode {
             None => usage(),
         },
         Some("fmt") => cmd_fmt(&args[2..]),
+        Some("lsp") => cmd_lsp(),
         _ => usage(),
+    }
+}
+
+/// `mangrove lsp` — run the language server over stdio (read-only, no network).
+/// Editors spawn this; it speaks LSP on stdin/stdout until shutdown.
+fn cmd_lsp() -> ExitCode {
+    match mangrove_lsp::server::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("lsp: {e}");
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -70,7 +84,7 @@ fn usage() -> ExitCode {
         "usage: mangrove [--version | hash <file> | check <file> | update <file> \
          | import <file.yaml|.toml> | export <file.mang> [--to yaml|toml] \
          | gen-openapi <spec.json> [--root <Definition>] \
-         | fmt <file…> | fmt --check <file…> | fmt -]"
+         | fmt <file…> | fmt --check <file…> | fmt - | lsp]"
     );
     ExitCode::from(2)
 }

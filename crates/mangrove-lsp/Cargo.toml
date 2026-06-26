@@ -1,0 +1,25 @@
+[package]
+name = "mangrove-lsp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mangrove-syntax = { path = "../mangrove-syntax" }
+mangrove-fmt = { path = "../mangrove-fmt" }
+mangrove-typed = { path = "../mangrove-typed" }
+mangrove-compose = { path = "../mangrove-compose" }
+rowan = { workspace = true }
+lsp-server = "0.8.0"
+lsp-types = "0.97.0"
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+lsp-server = "0.8.0"
+lsp-types = "0.97.0"
+serde_json.workspace = true

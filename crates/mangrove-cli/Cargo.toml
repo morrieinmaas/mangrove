@@ -19,6 +19,7 @@ mangrove-compose = { path = "../mangrove-compose" }
 mangrove-resolve = { path = "../mangrove-resolve" }
 mangrove-convert = { path = "../mangrove-convert" }
 mangrove-fmt = { path = "../mangrove-fmt" }
+mangrove-lsp = { path = "../mangrove-lsp" }
 mangrove-openapi = { path = "../mangrove-openapi" }
 
 [lints]
