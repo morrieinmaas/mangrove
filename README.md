@@ -64,6 +64,7 @@ See the [language specification](mangrove-spec.md) and the [design RFC](mangrove
 ```
 mangrove hash   <file.mang>            # the BLAKE3 content address of the canonical value
 mangrove check  <file.mang>            # validate against the bound schema
+mangrove fmt    <file.mang>            # format in place (--check for CI, - for stdin)
 mangrove update <file.mang>            # resolve + pin namespaced imports into mangrove.lock
 mangrove import <file.yaml|.toml>      # convert YAML/TOML to a schemaless Mangrove document
 mangrove export <file.mang> --to yaml  # evaluate and emit YAML/TOML
