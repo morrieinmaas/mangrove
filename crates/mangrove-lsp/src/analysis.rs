@@ -876,30 +876,61 @@ fn is_decl_name_in_node(node: &SyntaxNode, name: &str) -> bool {
     node_decl_name(node).as_deref() == Some(name)
 }
 
-/// Collect all byte ranges in `src` where `name` appears as a type-name token
-/// (i.e. BAREWORD tokens whose parent is a TYPE_DEF, UNIT_DEF, or SCHEMA_DECL,
-/// OR that are the declared name of a TYPE_DEF/UNIT_DEF).
+/// Collect all byte ranges in `src` where `name` appears as a type-name token.
+///
+/// A BAREWORD matching `name` inside a TYPE_DEF, UNIT_DEF, or SCHEMA_DECL is
+/// included UNLESS it is a record-type field KEY — detected by:
+///   brace-depth > 0  AND  the next significant token is COLON
+///
+/// This correctly:
+/// - Keeps the decl name (`type T = …` / `unit T : …` at depth 0 — depth rule skips exclusion).
+/// - Keeps type references in field-value position (`{ x: T }` — next token is not COLON).
+/// - Excludes record field keys (`{ T: int }` — depth > 0 and next token IS COLON).
 fn type_name_occurrences(root: &SyntaxNode, name: &str) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
-    for tok in root
-        .descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| t.kind() == SyntaxKind::BAREWORD && t.text() == name)
-    {
-        let parent = match tok.parent() {
-            Some(p) => p,
-            None => continue,
-        };
-        // Accept: token lives inside a TYPE_DEF, UNIT_DEF, or SCHEMA_DECL node
-        // (which covers both the decl name and type-body references).
-        if matches!(
-            parent.kind(),
+
+    for node in root.children() {
+        if !matches!(
+            node.kind(),
             SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF | SyntaxKind::SCHEMA_DECL
         ) {
-            let r = tok.text_range();
-            out.push((r.start().into(), r.end().into()));
+            continue;
+        }
+
+        // Collect all significant tokens in document order within this node.
+        let tokens: Vec<_> = node
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+            .collect();
+
+        let mut brace_depth: u32 = 0;
+        for (i, tok) in tokens.iter().enumerate() {
+            match tok.kind() {
+                SyntaxKind::L_BRACE | SyntaxKind::L_BRACKET | SyntaxKind::L_PAREN => {
+                    brace_depth += 1;
+                }
+                SyntaxKind::R_BRACE | SyntaxKind::R_BRACKET | SyntaxKind::R_PAREN => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                }
+                SyntaxKind::BAREWORD if tok.text() == name => {
+                    // Exclude field keys: inside braces AND next significant token is COLON.
+                    let next_is_colon = tokens
+                        .get(i + 1)
+                        .map(|t| t.kind() == SyntaxKind::COLON)
+                        .unwrap_or(false);
+                    if brace_depth > 0 && next_is_colon {
+                        // This is a record-type field key — skip it.
+                        continue;
+                    }
+                    let r = tok.text_range();
+                    out.push((r.start().into(), r.end().into()));
+                }
+                _ => {}
+            }
         }
     }
+
     out
 }
 
@@ -1953,6 +1984,95 @@ mod tests {
         let src = "host: ghost\n";
         let off = src.find("ghost").unwrap();
         assert_eq!(rename(src, off, "spirit"), None);
+    }
+
+    // ---- field-key exclusion tests (bug: rename must not touch record-type field keys) ----
+
+    /// find-references on type T must NOT include the `T` field key in `type Rec = { T: int }`.
+    /// Only the type decl name and the `schema T` reference are valid occurrences.
+    #[test]
+    fn references_type_name_excludes_record_field_key() {
+        // "T" appears as: type T decl name, field key in Rec, and schema T reference.
+        let src = "type T = int\ntype Rec = { T: int }\nschema T\nv: 1\n";
+        let decl_off = src.find('T').unwrap(); // offset of `T` in `type T = int`
+        let refs = references(src, decl_off, true);
+        // Must find exactly the decl + schema ref (count == 2).
+        assert_eq!(
+            refs.len(),
+            2,
+            "expected exactly 2 occurrences (decl + schema ref), got {refs:?}"
+        );
+        // All ranges must be outside the `{ T: int }` record body.
+        let rec_body_start = src.find("{ T:").unwrap();
+        let rec_body_end = src.find('}').unwrap() + 1;
+        for (s, _e) in &refs {
+            assert!(
+                *s < rec_body_start || *s >= rec_body_end,
+                "occurrence at byte {s} falls inside the record-type body (field key), refs={refs:?}"
+            );
+        }
+    }
+
+    /// rename T -> U must not touch the `T` field key in `type Rec = { T: int }`.
+    #[test]
+    fn rename_type_name_does_not_corrupt_record_field_key() {
+        let src = "type T = int\ntype Rec = { T: int }\nschema T\nv: 1\n";
+        let decl_off = src.find('T').unwrap();
+        let ranges = rename(src, decl_off, "U").expect("rename should succeed");
+        // Apply edits in reverse order.
+        let mut result = src.to_string();
+        let mut sorted = ranges.clone();
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.0));
+        for (s, e) in sorted {
+            result.replace_range(s..e, "U");
+        }
+        assert_eq!(
+            result, "type U = int\ntype Rec = { T: int }\nschema U\nv: 1\n",
+            "rename T->U corrupted the record-type field key: {result:?}"
+        );
+    }
+
+    /// A bareword that IS a type REFERENCE in field-value position (e.g. `{{ x: T }}`)
+    /// must still be found by references/rename (it is NOT a field key — it follows a colon
+    /// but is the VALUE, not the KEY).
+    #[test]
+    fn references_type_name_includes_type_ref_in_field_value() {
+        // `T` appears as: type T decl, field VALUE `{ x: T }` in Rec, and schema T.
+        let src = "type T = int\ntype Rec = { x: T }\nschema T\nv: 1\n";
+        let decl_off = src.find('T').unwrap();
+        let refs = references(src, decl_off, true);
+        // Should find 3: decl + the type-ref `T` in `{ x: T }` + schema T.
+        assert_eq!(
+            refs.len(),
+            3,
+            "expected 3 occurrences (decl + field-value type ref + schema ref), got {refs:?}"
+        );
+    }
+
+    /// unit decl-name rename must still work (unit `Mem : int` has a COLON at depth 0 — must KEEP).
+    #[test]
+    fn rename_unit_decl_name_still_works() {
+        let src = "unit Mem : int\nschema Mem\nv: 1\n";
+        let decl_off = src.find("Mem").unwrap();
+        let ranges = rename(src, decl_off, "Bytes").expect("rename should succeed");
+        let mut result = src.to_string();
+        let mut sorted = ranges.clone();
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.0));
+        for (s, e) in sorted {
+            result.replace_range(s..e, "Bytes");
+        }
+        assert!(
+            result.contains("unit Bytes"),
+            "unit decl rename failed: {result:?}"
+        );
+        assert!(
+            result.contains("schema Bytes"),
+            "unit schema rename failed: {result:?}"
+        );
+        assert!(
+            !result.contains("Mem"),
+            "old name still present after rename: {result:?}"
+        );
     }
 
     // ---- cross-file go-to-definition tests ----
