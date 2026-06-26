@@ -114,16 +114,12 @@ pub fn format_str(src: &str) -> FormatResult {
                 after_newline = true;
             }
             COMMENT | DOC | DIRECTIVE => {
-                // Emit indentation if we're at the start of a line.
+                // At line start: re-indent to current depth.
+                // Inline (trailing): emit exactly one leading space.
                 if after_newline {
-                    // These tokens are not closers, so always indent at `depth`.
                     out.push_str(&"  ".repeat(depth));
-                }
-                // Pass through; treat as non-significant for spacing purposes.
-                if !after_newline {
-                    if let Some(p) = prev_sig {
-                        out.push_str(space_between(Some(p), COMMENT));
-                    }
+                } else {
+                    out.push(' ');
                 }
                 out.push_str(tok.text());
                 newline_run = 0;
@@ -201,6 +197,28 @@ pub fn format_str(src: &str) -> FormatResult {
                 prev_sig = Some(k);
                 newline_run = 0;
                 after_newline = false;
+            }
+            COMMA => {
+                // Drop trailing commas: if the next significant token is a block
+                // closer (`}` or `]`), skip this comma entirely.
+                let next_kind = if next_sig[i] < n {
+                    Some(tokens[next_sig[i]].kind())
+                } else {
+                    None
+                };
+                if matches!(next_kind, Some(R_BRACE) | Some(R_BRACKET)) {
+                    // Skip the trailing comma — don't update prev_sig or after_newline.
+                } else {
+                    if after_newline {
+                        out.push_str(&"  ".repeat(depth));
+                    } else {
+                        out.push_str(space_between(prev_sig, k));
+                    }
+                    out.push_str(tok.text());
+                    prev_sig = Some(k);
+                    newline_run = 0;
+                    after_newline = false;
+                }
             }
             _ => {
                 // Regular significant token.
@@ -283,14 +301,16 @@ mod tests {
         }
     }
 
-    // Trailing-comma entry (`a: [1,2,3,]`) is kept EVALUABLE so it exercises
-    // the hash branch — removing a `,` would cause the structural branch to fail.
+    // Trailing-comma entries are kept EVALUABLE so they exercise the hash branch
+    // — removing a `,` would cause the structural branch to fail.
     const CORPUS: &[&str] = &[
         "a: 1\n",
         "a: { b: 1, c: [ 2, 3 ] }\n",
         "type P = int & >= 1 & <= 65535\nschema P\nx: 5\n",
         "# lead\na: \"x\"  # trailing\n",
-        "a: [1,2,3,]\n", // trailing comma — evaluable, so hash branch is used
+        "a: [1,2,3,]\n",        // trailing comma — evaluable, hash branch
+        "xs: [ 1, 2, 3, ]\n",   // trailing comma in list — evaluable, hash branch
+        "a: { b: 1, c: 2, }\n", // trailing comma in record — evaluable, hash branch
     ];
 
     #[test]
@@ -341,6 +361,40 @@ mod tests {
     #[test]
     fn oracles_hold_on_corpus() {
         for src in CORPUS {
+            assert_idempotent(src);
+            assert_meaning_preserved(src);
+        }
+    }
+
+    #[test]
+    fn drops_trailing_commas() {
+        assert_eq!(format_str("xs: [ 1, 2, 3, ]\n").text, "xs: [ 1, 2, 3 ]\n");
+        assert_eq!(
+            format_str("a: { b: 1, c: 2, }\n").text,
+            "a: { b: 1, c: 2 }\n"
+        );
+    }
+
+    #[test]
+    fn preserves_comments() {
+        // leading comment re-indented to depth
+        assert_eq!(
+            format_str("a: {\n# inner\nb: 1\n}\n").text,
+            "a: {\n  # inner\n  b: 1\n}\n"
+        );
+        // trailing comment kept with one leading space
+        assert_eq!(format_str("a: 1    # note\n").text, "a: 1 # note\n");
+        // doc comment preserved
+        assert_eq!(format_str("## doc\na: 1\n").text, "## doc\na: 1\n");
+    }
+
+    #[test]
+    fn comment_meaning_preserved_on_corpus() {
+        for src in [
+            "# c\na: 1\n",
+            "a: 1 # t\n",
+            "## d\ntype T = int\nschema T\nx: 1\n",
+        ] {
             assert_idempotent(src);
             assert_meaning_preserved(src);
         }
