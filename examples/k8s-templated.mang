@@ -2,10 +2,10 @@
 # replicas via `match`, image tag via interpolation, memory via a unit type.
 # `check`/`hash` use the param defaults (env = prod).
 
-unit Mem : int { B = 1, Ki = 1024B, Mi = 1024Ki }
+unit Mem: int { B = 1, Ki = 1024B, Mi = 1024Ki }
 
 params {
-  env:     "dev" | "staging" | "prod" = "prod"
+  env: "dev" | "staging" | "prod" = "prod"
   version: str = "1.21.0"
 }
 

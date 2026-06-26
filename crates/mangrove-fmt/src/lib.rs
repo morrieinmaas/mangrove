@@ -199,14 +199,21 @@ pub fn format_str(src: &str) -> FormatResult {
                 after_newline = false;
             }
             COMMA => {
-                // Drop trailing commas: if the next significant token is a block
-                // closer (`}` or `]`), skip this comma entirely.
+                // Drop trailing commas in value contexts only: if the next
+                // significant token is a block closer (`}` or `]`), skip this
+                // comma — but only when NOT inside a type definition or unit
+                // definition, where trailing commas are structural.
                 let next_kind = if next_sig[i] < n {
                     Some(tokens[next_sig[i]].kind())
                 } else {
                     None
                 };
-                if matches!(next_kind, Some(R_BRACE) | Some(R_BRACKET)) {
+                let in_type_ctx = tok.parent().is_some_and(|p| {
+                    std::iter::once(p.clone())
+                        .chain(p.ancestors())
+                        .any(|n| matches!(n.kind(), TYPE_DEF | UNIT_DEF | FN_DEF | PARAM_DECL))
+                });
+                if !in_type_ctx && matches!(next_kind, Some(R_BRACE) | Some(R_BRACKET)) {
                     // Skip the trailing comma — don't update prev_sig or after_newline.
                 } else {
                     if after_newline {
@@ -398,6 +405,74 @@ mod tests {
             assert_idempotent(src);
             assert_meaning_preserved(src);
         }
+    }
+
+    /// Returns `true` if `v` contains no L3 markers (Ref/Interp/Match/Call/
+    /// ModuleCall) and no unresolved Unit/Unset values — i.e. it is safe to
+    /// pass to `mangrove_canonical::hash`.
+    fn is_hashable(v: &mangrove_core::Value) -> bool {
+        use mangrove_core::Value::*;
+        match v {
+            Int(_) | Decimal(_) | Str(_) | Bool(_) | Bytes(_) => true,
+            List(xs) => xs.iter().all(is_hashable),
+            Map(m) => m.values().all(is_hashable),
+            // L3 markers and unresolved values — not hashable
+            Unit { .. }
+            | Unset
+            | Ref(_)
+            | Interp(_)
+            | Match { .. }
+            | Call { .. }
+            | ModuleCall { .. } => false,
+        }
+    }
+
+    #[test]
+    fn fmt_is_meaning_preserving_and_idempotent_over_examples() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+        let mut n = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let p = entry.unwrap().path();
+            if p.extension().and_then(|s| s.to_str()) == Some("mang") {
+                let src = std::fs::read_to_string(&p).unwrap();
+                let f1 = format_str(&src).text;
+                let f2 = format_str(&f1).text;
+                assert_eq!(f1, f2, "fmt not idempotent on {p:?}");
+                // hash unchanged (examples are evaluable)
+                let h0_val = mangrove_syntax::parse(&src).unwrap();
+                let h1_val = mangrove_syntax::parse(&f1).unwrap();
+                if is_hashable(&h0_val) {
+                    let h0 = mangrove_canonical::hash(&h0_val);
+                    let h1 = mangrove_canonical::hash(&h1_val);
+                    assert_eq!(h0, h1, "fmt changed the hash of {p:?}");
+                } else {
+                    // L3 params file: structural equivalence (same non-trivia tokens)
+                    let toks = |s: &str| {
+                        mangrove_syntax::cst::parse_cst(s)
+                            .syntax()
+                            .descendants_with_tokens()
+                            .filter_map(|e| e.into_token())
+                            .filter(|t| {
+                                !matches!(
+                                    t.kind(),
+                                    mangrove_syntax::cst::SyntaxKind::WHITESPACE
+                                        | mangrove_syntax::cst::SyntaxKind::NEWLINE
+                                        | mangrove_syntax::cst::SyntaxKind::COMMENT
+                                )
+                            })
+                            .map(|t| (t.kind(), t.text().to_string()))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        toks(&src),
+                        toks(&f1),
+                        "fmt changed non-trivia tokens of {p:?}"
+                    );
+                }
+                n += 1;
+            }
+        }
+        assert!(n >= 3, "expected example corpus, found {n}");
     }
 
     /// Round-trip test for already-canonical inputs.

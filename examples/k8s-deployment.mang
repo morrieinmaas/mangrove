@@ -2,7 +2,7 @@
 # Exercises: unit types (memory), decimals (cpu), literal types (apiVersion/kind),
 # refinements (replicas, containerPort), @key lists, and deep nesting.
 
-unit Mem : int { B = 1, Ki = 1024B, Mi = 1024Ki, Gi = 1024Mi }
+unit Mem: int { B = 1, Ki = 1024B, Mi = 1024Ki, Gi = 1024Mi }
 
 type ResourceReqs = { memory: Mem, cpu: decimal }
 type Resources = { requests: ResourceReqs, limits: ResourceReqs }
