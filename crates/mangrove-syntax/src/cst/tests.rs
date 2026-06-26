@@ -173,6 +173,103 @@ fn oracle_example_pyproject() {
 // #[test]
 // fn oracle_example_k8s_templated() { ... }
 
+// ---- Task 9: full type-grammar equivalence coverage ----
+
+/// Covers every type-grammar form across the full type surface.
+/// Syntax for each form was sourced from existing tests in parser.rs, ty.rs,
+/// and examples/*.mang — nothing was guessed.
+///
+/// Most cases pass immediately (the delegation in lower.rs handles them).
+/// Any failure points to a segmentation bug (TYPE_DEF node cut short).
+#[test]
+fn oracle_type_grammar() {
+    // 1. Int refinement (§4.3): `int & >= 1 & <= 65535`
+    assert_document_equivalent("type P = int & >= 1 & <= 65535\nschema P\nx: 5\n");
+
+    // 2. Decimal range (§4.3): `decimal & >= 0.0 & <= 1.0`
+    assert_document_equivalent("type Ratio = decimal & >= 0 & <= 1\nschema Ratio\nx: 0.5\n");
+
+    // 3. Regex (§4.3): from pyproject.mang
+    assert_document_equivalent("type S = str & =~ \"^[a-z]+$\"\nschema S\nx: \"abc\"\n");
+
+    // 4. Union of string literals (§4.4): from ty.rs union_of_literals test
+    assert_document_equivalent("type Env = \"dev\" | \"prod\"\nschema Env\nx: \"dev\"\n");
+
+    // 5. Union including a primitive: `str | int`
+    assert_document_equivalent("type StrOrInt = str | int\nschema StrOrInt\nx: 1\n");
+
+    // 6. Brand (§4.6): from parser.rs brand_type_parses_and_takes_typedef_name test
+    assert_document_equivalent("type Satoshis = brand int & >= 0\nschema Satoshis\nx: 1\n");
+
+    // 7. Map type (§4.4): `{ [str]: int }` — from ty.rs map_and_list test
+    assert_document_equivalent("type Labels = { [str]: int }\nschema Labels\nx: { key: 1 }\n");
+
+    // 8. List type (§4.4): `[ str ]` — from ty.rs map_and_list test
+    assert_document_equivalent("type Tags = [ str ]\nschema Tags\nx: [ \"a\" ]\n");
+
+    // 9. Named type reference: `type A = int; type B = A`
+    assert_document_equivalent(
+        "type Port = int & >= 1 & <= 65535\ntype Host = str\nschema Port\nx: 8080\n",
+    );
+
+    // 10. Annotation on typedef: `@doc("...")` — from parser.rs annotations_parse_on_typedef_and_field
+    assert_document_equivalent("type Port = int @doc(\"port number\")\nschema Port\nx: 1\n");
+
+    // 11. @deprecated annotation: from parser.rs annotations_parse_on_typedef_and_field
+    assert_document_equivalent(
+        "type OldId = str @deprecated(\"use NewId\")\nschema OldId\nx: \"a\"\n",
+    );
+
+    // 12. Simple single-line record type
+    assert_document_equivalent(
+        "type Addr = { host: str, port: int }\nschema Addr\nhost: \"x\"\nport: 8\n",
+    );
+
+    // 13. Record type with optional field: from ty.rs record_with_optional test
+    assert_document_equivalent(
+        "type Cfg = { host: str, port: int, tls?: bool }\nschema Cfg\nhost: \"x\"\nport: 8\n",
+    );
+
+    // 14. Record with field default: `| *value` — from ty.rs field_defaults_parse test
+    assert_document_equivalent(
+        "type Cfg2 = { ns: str | *\"default\", n: int | *0 }\nschema Cfg2\nns: \"x\"\nn: 1\n",
+    );
+
+    // 15. Field annotation @key inside record: from k8s-deployment.mang
+    //     `ports: [ Port ] @key(name)` — the @key is a field-level annotation inside the record.
+    assert_document_equivalent(
+        "type Port = { containerPort: int & >= 1 & <= 65535, name: str }\ntype Cont = { ports: [ Port ] @key(name) }\nschema Cont\nports: [ { containerPort: 8080, name: \"http\" } ]\n",
+    );
+
+    // 16. Record with `require` predicate (§4.7): from parser.rs require_clause_parses test
+    assert_document_equivalent(
+        "type Bounds = { a: int, b: int, require: a <= b @message(\"a must be <= b\") }\nschema Bounds\na: 1\nb: 2\n",
+    );
+
+    // 17. Multi-line record type: the form most likely to expose a segmentation gap.
+    //     (From k8s-deployment.mang Container type — multi-line with field annotations.)
+    assert_document_equivalent(
+        "type Port = { containerPort: int & >= 1 & <= 65535, name: str }\ntype Container = {\n  name: str,\n  image: str,\n  ports: [ Port ],\n}\nschema Container\nname: \"api\"\nimage: \"reg/img:1\"\nports: [ { containerPort: 8443, name: \"https\" } ]\n",
+    );
+
+    // 18. Annotation on the typedef itself AFTER a record closing brace:
+    //     `type R = { a: int } @doc("x")` — this is the known segmentation-gap case.
+    assert_document_equivalent("type R = { a: int } @doc(\"annotated record\")\nschema R\na: 1\n");
+}
+
+/// Losslessness assertion for a multi-line type definition: the CST tree text
+/// must round-trip byte-for-byte.
+#[test]
+fn multiline_type_def_losslessness() {
+    let src = "type Container = {\n  name: str,\n  image: str,\n  ports: [ int ],\n}\nschema Container\nname: \"api\"\nimage: \"reg/img:1\"\nports: [ 8443 ]\n";
+    let node = super::parse::parse_cst(src).syntax();
+    assert_eq!(
+        node.text().to_string(),
+        src,
+        "multi-line type def must round-trip losslessly"
+    );
+}
+
 use super::kind::SyntaxKind;
 
 #[test]

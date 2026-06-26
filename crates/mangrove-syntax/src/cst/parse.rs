@@ -241,13 +241,10 @@ fn consume_through_newline_at_depth_0(p: &mut Parser) {
             SyntaxKind::R_BRACE | SyntaxKind::R_BRACKET | SyntaxKind::R_PAREN => {
                 depth = depth.saturating_sub(1);
                 p.bump();
-                // After closing the outermost block, eat the trailing newline.
-                if depth == 0 {
-                    if p.current() == SyntaxKind::NEWLINE {
-                        p.bump();
-                    }
-                    break;
-                }
+                // When we return to depth 0, do NOT break immediately — fall
+                // through to the outer loop so it can consume any trailing
+                // tokens on this logical line (e.g. `@doc("…")` or `@key(name)`
+                // annotations after a closing brace) before stopping at NEWLINE.
             }
             _ => {
                 p.bump();
