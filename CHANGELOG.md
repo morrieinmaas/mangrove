@@ -1,17 +1,25 @@
 # Changelog
 
-## v0.2.1
+## v0.3.0
 
-A formatter and a migration guide; sets the workspace version to match the
-release (it had lagged at 0.1.0 through the prior tags).
+A lossless CST front end and the `mangrove fmt` formatter built on it, plus a
+migration guide. Also sets the workspace version to match the release (it had
+lagged at 0.1.0 through the prior tags). LSP support is the next step in the
+v0.3.x series.
+
+### Syntax / front end
+- **Lossless CST:** a concrete syntax tree (rowan-based) that preserves every
+  byte — whitespace, comments, and recovers from parse errors into a complete
+  tree. Evaluation keeps the fast legacy parser; tooling (fmt, future LSP) reads
+  the CST. The two front ends are proven equivalent over the example corpus.
 
 ### Tooling
 - **`mangrove fmt`:** a deterministic, comment- and meaning-preserving formatter
   (normalizes inline spacing and 2-space depth indentation, collapses blank
   runs, drops trailing commas) wired into the CLI: `fmt <file>…` rewrites in
   place, `fmt --check <file>…` exits 1 if any file would change (writes nothing,
-  for CI gates), `fmt -` formats stdin → stdout. Built on a lossless CST front
-  end, so it produces best-effort output even on parse errors.
+  for CI gates), `fmt -` formats stdin → stdout. Built on the lossless CST, so
+  it produces best-effort output even on parse errors.
 
 ### Docs
 - **Migration guide** (`docs/MIGRATING.md` + `docs/migrate.just`): a phased,
