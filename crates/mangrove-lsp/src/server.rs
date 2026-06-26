@@ -9,16 +9,17 @@ use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionOptions, CompletionResponse,
     Diagnostic, DiagnosticSeverity, DocumentSymbol, GotoDefinitionResponse, Hover, HoverContents,
     HoverProviderCapability, Location, MarkupContent, MarkupKind, OneOf, Position,
-    PublishDiagnosticsParams, Range, SemanticToken, SemanticTokenType, SemanticTokens,
-    SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, SymbolKind as LspSymbolKind,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri, WorkDoneProgressOptions,
+    PublishDiagnosticsParams, Range, RenameOptions, SemanticToken, SemanticTokenType,
+    SemanticTokens, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensResult, SemanticTokensServerCapabilities, ServerCapabilities,
+    SymbolKind as LspSymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
+    WorkDoneProgressOptions, WorkspaceEdit,
     notification::{
         DidChangeTextDocument, DidOpenTextDocument, Notification as _, PublishDiagnostics,
     },
     request::{
-        Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, Request as _,
-        SemanticTokensFullRequest,
+        Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, References,
+        Rename, Request as _, SemanticTokensFullRequest,
     },
 };
 use std::collections::HashMap;
@@ -75,6 +76,11 @@ fn server_capabilities() -> ServerCapabilities {
         document_symbol_provider: Some(OneOf::Left(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(false),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![":".to_string(), " ".to_string()]),
             ..CompletionOptions::default()
@@ -134,6 +140,8 @@ fn handle_request(
             Formatting::METHOD => on_formatting(state, req),
             GotoDefinition::METHOD => on_goto_definition(state, req),
             Completion::METHOD => on_completion(state, req),
+            References::METHOD => on_references(state, req),
+            Rename::METHOD => on_rename(state, req),
             _ => Response::new_err(
                 req.id,
                 ErrorCode::MethodNotFound as i32,
@@ -410,6 +418,75 @@ fn on_completion(state: &State, req: Request) -> Response {
     Response::new_ok(
         id,
         serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+fn on_references(state: &State, req: Request) -> Response {
+    let (id, params) = match cast::<References>(req) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let uri = params.text_document_position.text_document.uri.to_string();
+    let Some(text) = state.docs.get(&uri) else {
+        return Response::new_ok(id, serde_json::Value::Null);
+    };
+    let offset = offset_of(text, params.text_document_position.position);
+    let include_decl = params.context.include_declaration;
+    let locs: Vec<Location> = analysis::references(text, offset, include_decl)
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let idx = LineIndex::new(text);
+            let parsed: Uri = uri.parse().ok()?;
+            Some(Location {
+                uri: parsed,
+                range: to_range(&idx, (start, end)),
+            })
+        })
+        .collect();
+    if locs.is_empty() {
+        return Response::new_ok(id, serde_json::Value::Null);
+    }
+    Response::new_ok(
+        id,
+        serde_json::to_value(locs).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[allow(clippy::mutable_key_type)] // Uri has interior mutability; standard lsp_types pattern
+fn on_rename(state: &State, req: Request) -> Response {
+    let (id, params) = match cast::<Rename>(req) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let uri = params.text_document_position.text_document.uri.to_string();
+    let Some(text) = state.docs.get(&uri) else {
+        return Response::new_ok(id, serde_json::Value::Null);
+    };
+    let offset = offset_of(text, params.text_document_position.position);
+    let Some(ranges) = analysis::rename(text, offset, &params.new_name) else {
+        return Response::new_ok(id, serde_json::Value::Null);
+    };
+    let idx = LineIndex::new(text);
+    let edits: Vec<TextEdit> = ranges
+        .into_iter()
+        .map(|(start, end)| TextEdit {
+            range: to_range(&idx, (start, end)),
+            new_text: params.new_name.clone(),
+        })
+        .collect();
+    let parsed: Uri = match uri.parse() {
+        Ok(u) => u,
+        Err(_) => return Response::new_ok(id, serde_json::Value::Null),
+    };
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(parsed, edits);
+    let workspace_edit = WorkspaceEdit {
+        changes: Some(changes),
+        ..WorkspaceEdit::default()
+    };
+    Response::new_ok(
+        id,
+        serde_json::to_value(workspace_edit).unwrap_or(serde_json::Value::Null),
     )
 }
 

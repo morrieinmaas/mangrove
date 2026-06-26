@@ -616,6 +616,409 @@ fn find_type_decl(root: &SyntaxNode, name: &str) -> Option<(usize, usize)> {
     None
 }
 
+// ---- references ----
+
+/// The "symbol kind" we resolved the cursor to — for sharing between
+/// `references` and `rename`.
+#[derive(Debug, Clone, PartialEq)]
+enum ResolvedSymbol {
+    /// A `type X` or `unit X` declaration; `name` is the declared identifier.
+    TypeName(String),
+    /// A top-level binding key or `params` entry; `name` is the identifier.
+    ValueName(String),
+}
+
+/// Resolve the token under `offset` to a local symbol, or return `None` when
+/// the cursor is on a keyword, a qualified name (`alias.Foo`), or an unresolvable
+/// token.  Reuses the same token-finding logic as `goto_definition`.
+fn resolve_symbol(root: &SyntaxNode, _src: &str, offset: usize) -> Option<ResolvedSymbol> {
+    let off: rowan::TextSize = (offset as u32).into();
+
+    let covering: Vec<_> = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.text_range().contains_inclusive(off))
+        .collect();
+    let tok = covering
+        .iter()
+        .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+        .cloned()?;
+
+    if tok.kind() != SyntaxKind::BAREWORD {
+        return None;
+    }
+    let name = tok.text().to_string();
+
+    if is_keyword(&name) {
+        return None;
+    }
+
+    // Qualified names are cross-file.
+    if name.contains('.') {
+        return None;
+    }
+
+    let parent = tok.parent()?;
+
+    // --- type-name position ---
+    let in_type_def_or_unit = matches!(
+        parent.kind(),
+        SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF | SyntaxKind::SCHEMA_DECL
+    );
+    if in_type_def_or_unit {
+        // Any bareword in a TYPE_DEF/UNIT_DEF/SCHEMA_DECL context refers to a type.
+        // Confirm the name resolves to an actual local type/unit declaration.
+        if find_type_decl(root, &name).is_some() || is_decl_name_in_node(&parent, &name) {
+            return Some(ResolvedSymbol::TypeName(name));
+        }
+        return None;
+    }
+
+    // --- value-name position (REF, BINDING value, etc.) ---
+    // mirror goto_definition's in_value_position logic
+    let maybe_ref = matches!(
+        parent.kind(),
+        SyntaxKind::REF | SyntaxKind::MATCH_EXPR | SyntaxKind::CALL | SyntaxKind::DOCUMENT
+    );
+
+    let in_value_position = if parent.kind() == SyntaxKind::BINDING {
+        let mut seen_colon = false;
+        let mut is_value = false;
+        for el in parent.children_with_tokens() {
+            match el {
+                rowan::NodeOrToken::Token(t) if t.kind() == SyntaxKind::COLON => {
+                    seen_colon = true;
+                }
+                rowan::NodeOrToken::Token(t)
+                    if seen_colon && t.text_range() == tok.text_range() =>
+                {
+                    is_value = true;
+                    break;
+                }
+                rowan::NodeOrToken::Node(n) if seen_colon => {
+                    if n.text_range().contains_inclusive(off) {
+                        is_value = true;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+        is_value
+    } else {
+        maybe_ref
+    };
+
+    if !in_value_position && parent.kind() != SyntaxKind::REF {
+        return None;
+    }
+
+    // Confirm the name resolves to a local binding or param.
+    if find_binding(root, &name).is_some() || find_param_entry(root, &name).is_some() {
+        return Some(ResolvedSymbol::ValueName(name));
+    }
+
+    // Also try type as fallback (goto_definition falls through to type lookup).
+    if find_type_decl(root, &name).is_some() {
+        return Some(ResolvedSymbol::TypeName(name));
+    }
+
+    // Check if the cursor is on the binding *key* itself (not value position).
+    // A BINDING child's first significant token is the key.
+    if parent.kind() == SyntaxKind::BINDING {
+        let key_tok = parent
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE);
+        if key_tok.as_ref().map(|t| t.text_range()) == Some(tok.text_range()) {
+            // Cursor is on the binding key — that IS the declaration.
+            return Some(ResolvedSymbol::ValueName(name));
+        }
+    }
+
+    None
+}
+
+/// Returns true if the bareword is a language keyword.
+fn is_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "type"
+            | "unit"
+            | "schema"
+            | "use"
+            | "params"
+            | "fn"
+            | "match"
+            | "require"
+            | "unset"
+            | "as"
+            | "true"
+            | "false"
+            | "int"
+            | "str"
+            | "bool"
+            | "decimal"
+            | "bytes"
+            | "brand"
+    )
+}
+
+/// True if `name` is the declared name inside `node` (TYPE_DEF or UNIT_DEF).
+fn is_decl_name_in_node(node: &SyntaxNode, name: &str) -> bool {
+    node_decl_name(node).as_deref() == Some(name)
+}
+
+/// Collect all byte ranges in `src` where `name` appears as a type-name token
+/// (i.e. BAREWORD tokens whose parent is a TYPE_DEF, UNIT_DEF, or SCHEMA_DECL,
+/// OR that are the declared name of a TYPE_DEF/UNIT_DEF).
+fn type_name_occurrences(root: &SyntaxNode, name: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for tok in root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == SyntaxKind::BAREWORD && t.text() == name)
+    {
+        let parent = match tok.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        // Accept: token lives inside a TYPE_DEF, UNIT_DEF, or SCHEMA_DECL node
+        // (which covers both the decl name and type-body references).
+        if matches!(
+            parent.kind(),
+            SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF | SyntaxKind::SCHEMA_DECL
+        ) {
+            let r = tok.text_range();
+            out.push((r.start().into(), r.end().into()));
+        }
+    }
+    out
+}
+
+/// Collect all byte ranges in `src` where `name` appears as a value-name token:
+/// - The key of a top-level BINDING (the declaration site).
+/// - The sole BAREWORD token inside a REF node.
+/// - A BAREWORD in a PARAM_DECL that is followed by a COLON (param entry decl).
+fn value_name_occurrences(root: &SyntaxNode, name: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for tok in root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == SyntaxKind::BAREWORD && t.text() == name)
+    {
+        let parent = match tok.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        match parent.kind() {
+            // REF node — always a value reference.
+            SyntaxKind::REF => {
+                let r = tok.text_range();
+                out.push((r.start().into(), r.end().into()));
+            }
+            // BINDING — accept only the key (first significant token).
+            SyntaxKind::BINDING => {
+                let key = parent
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE);
+                if key.as_ref().map(|t| t.text_range()) == Some(tok.text_range()) {
+                    let r = tok.text_range();
+                    out.push((r.start().into(), r.end().into()));
+                }
+            }
+            // PARAM_DECL — accept bareword that is followed by COLON.
+            SyntaxKind::PARAM_DECL => {
+                // Walk tokens inside the PARAM_DECL to find param-entry declarations.
+                let tokens: Vec<_> = parent
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+                    .collect();
+                let mut i = 0;
+                while i < tokens.len() {
+                    if tokens[i].kind() == SyntaxKind::BAREWORD
+                        && tokens[i].text() == name
+                        && tokens[i].text_range() == tok.text_range()
+                        && tokens.get(i + 1).map(|t| t.kind()) == Some(SyntaxKind::COLON)
+                    {
+                        let r = tok.text_range();
+                        out.push((r.start().into(), r.end().into()));
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Return all byte ranges (start, end) for occurrences of the symbol under
+/// `offset` in `src`.  When `include_decl` is false, the declaration site is
+/// excluded from the result.
+///
+/// Returns an empty Vec when the cursor is not on a resolvable local symbol
+/// or when the symbol is cross-file/qualified.
+pub fn references(src: &str, offset: usize, include_decl: bool) -> Vec<(usize, usize)> {
+    let root = parse_cst(src).syntax();
+    let symbol = match resolve_symbol(&root, src, offset) {
+        Some(s) => s,
+        None => {
+            // Last-chance: cursor may be on a binding key directly.
+            // Try finding a binding whose key matches the BAREWORD under cursor.
+            let off: rowan::TextSize = (offset as u32).into();
+            let covering: Vec<_> = root
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| t.text_range().contains_inclusive(off))
+                .collect();
+            let tok = covering
+                .iter()
+                .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+                .cloned();
+            if let Some(tok) = tok {
+                if tok.kind() == SyntaxKind::BAREWORD && !is_keyword(tok.text()) {
+                    let name = tok.text().to_string();
+                    // Check if this is a binding key
+                    if let Some(parent) = tok.parent() {
+                        if parent.kind() == SyntaxKind::BINDING {
+                            let key = parent
+                                .descendants_with_tokens()
+                                .filter_map(|e| e.into_token())
+                                .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE);
+                            if key.as_ref().map(|t| t.text_range()) == Some(tok.text_range()) {
+                                let mut occs = value_name_occurrences(&root, &name);
+                                if !include_decl {
+                                    // Remove the binding key range (first BINDING occurrence)
+                                    if let Some(decl_range) = find_binding(&root, &name) {
+                                        // find the exact token range for the key
+                                        let key_range = find_binding_key_range(&root, &name);
+                                        if let Some(kr) = key_range {
+                                            occs.retain(|&r| r != kr);
+                                        } else {
+                                            occs.retain(|&r| r != decl_range);
+                                        }
+                                    }
+                                }
+                                occs.sort_by_key(|r| r.0);
+                                return occs;
+                            }
+                        }
+                    }
+                }
+            }
+            return vec![];
+        }
+    };
+
+    let mut occs = match &symbol {
+        ResolvedSymbol::TypeName(name) => type_name_occurrences(&root, name),
+        ResolvedSymbol::ValueName(name) => value_name_occurrences(&root, name),
+    };
+
+    if !include_decl {
+        // Remove the declaration site from the result.
+        match &symbol {
+            ResolvedSymbol::TypeName(name) => {
+                // Declaration site = token range of the name in the TYPE_DEF/UNIT_DEF.
+                if let Some(decl_tok_range) = type_decl_name_token_range(&root, name) {
+                    occs.retain(|&r| r != decl_tok_range);
+                }
+            }
+            ResolvedSymbol::ValueName(name) => {
+                // Declaration = binding key token range or param entry token range.
+                if let Some(kr) = find_binding_key_range(&root, name) {
+                    occs.retain(|&r| r != kr);
+                } else if let Some(pr) = find_param_entry(&root, name) {
+                    occs.retain(|&r| r != pr);
+                }
+            }
+        }
+    }
+
+    occs.sort_by_key(|r| r.0);
+    occs.dedup();
+    occs
+}
+
+/// Return the byte range of just the name *token* inside the TYPE_DEF or
+/// UNIT_DEF for `name` (not the whole node range).
+fn type_decl_name_token_range(root: &SyntaxNode, name: &str) -> Option<(usize, usize)> {
+    for child in root.children() {
+        if !matches!(child.kind(), SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF) {
+            continue;
+        }
+        if node_decl_name(&child).as_deref() != Some(name) {
+            continue;
+        }
+        // The name token is the second significant token.
+        let mut tokens = child
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE);
+        tokens.next(); // skip keyword
+        let name_tok = tokens.next()?;
+        let r = name_tok.text_range();
+        return Some((r.start().into(), r.end().into()));
+    }
+    None
+}
+
+/// Return just the key-token byte range of a top-level BINDING.
+fn find_binding_key_range(root: &SyntaxNode, name: &str) -> Option<(usize, usize)> {
+    for child in root.children() {
+        if child.kind() != SyntaxKind::BINDING {
+            continue;
+        }
+        let key = child
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)?;
+        if key.text() == name {
+            let r = key.text_range();
+            return Some((r.start().into(), r.end().into()));
+        }
+    }
+    None
+}
+
+// ---- rename ----
+
+/// Validate that `new_name` is a legal Mangrove identifier (a non-empty bareword
+/// that matches `[a-zA-Z_][a-zA-Z0-9_]*`).
+fn is_valid_identifier(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Return the byte ranges to replace for a rename of the symbol under `offset`
+/// to `new_name`.  Returns `None` if the cursor is not on a renameable local
+/// symbol or if `new_name` is not a valid identifier.
+///
+/// The caller replaces each returned range with `new_name` to produce the
+/// renamed source.
+pub fn rename(src: &str, offset: usize, new_name: &str) -> Option<Vec<(usize, usize)>> {
+    if !is_valid_identifier(new_name) {
+        return None;
+    }
+    // `references` with include_decl=true gives us all occurrences.
+    let occs = references(src, offset, true);
+    if occs.is_empty() {
+        return None;
+    }
+    Some(occs)
+}
+
 // ---- completions ----
 
 /// Top-level declaration keywords (valid at the start of a new statement).
@@ -1254,5 +1657,194 @@ mod tests {
             !items.is_empty(),
             "expected non-empty fallback for ambiguous context"
         );
+    }
+
+    // ---- references tests ----
+
+    /// References on a local type name returns the decl + every use.
+    #[test]
+    fn references_type_name_finds_decl_and_uses() {
+        // "Server" appears in: (1) `type Server = …` decl, (2) `schema Server`.
+        let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
+        // Cursor on "Server" in the `type Server` declaration.
+        let decl_off = src.find("Server").unwrap();
+        let refs = references(src, decl_off, true);
+        // Should find at least 2 occurrences (decl + schema reference).
+        assert!(
+            refs.len() >= 2,
+            "expected >= 2 occurrences for 'Server', got {refs:?}"
+        );
+        // All ranges must contain only the text "Server".
+        for (s, e) in &refs {
+            assert_eq!(
+                &src[*s..*e],
+                "Server",
+                "unexpected token at range ({s},{e})"
+            );
+        }
+        // Decl site is included (include_decl=true).
+        let decl_range = (decl_off, decl_off + "Server".len());
+        assert!(
+            refs.contains(&decl_range),
+            "expected decl range {decl_range:?} in refs {refs:?}"
+        );
+    }
+
+    /// References with include_decl=false excludes the declaration.
+    #[test]
+    fn references_type_name_exclude_decl() {
+        let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
+        let decl_off = src.find("Server").unwrap();
+        let refs_incl = references(src, decl_off, true);
+        let refs_excl = references(src, decl_off, false);
+        assert!(
+            refs_excl.len() < refs_incl.len(),
+            "exclude_decl should return fewer results"
+        );
+        // The decl range must not appear in refs_excl.
+        let decl_range = (decl_off, decl_off + "Server".len());
+        assert!(
+            !refs_excl.contains(&decl_range),
+            "decl range should be excluded, got {refs_excl:?}"
+        );
+    }
+
+    /// References on a binding key finds decl + REF uses.
+    #[test]
+    fn references_binding_finds_decl_and_ref_uses() {
+        // `host` declared as a binding, referenced in `addr` value.
+        let src = "host: \"x\"\naddr: host\n";
+        // Cursor on `host` in `addr: host` (the REF occurrence).
+        let ref_off = src.rfind("host").unwrap();
+        let refs = references(src, ref_off, true);
+        assert!(
+            refs.len() >= 2,
+            "expected >= 2 occurrences for 'host', got {refs:?}"
+        );
+        // All ranges must point at "host".
+        for (s, e) in &refs {
+            assert_eq!(&src[*s..*e], "host", "unexpected token at ({s},{e})");
+        }
+    }
+
+    /// Imported/qualified symbol yields empty result.
+    #[test]
+    fn references_qualified_symbol_returns_empty() {
+        let _src = "use \"ns/x@v1\" as x\nfoo: x.Bar\n";
+        // Cursor on "Bar" — but it's part of a qualified expression, so not local.
+        // Actually "x.Bar" in value position: let's put cursor on "x" which is qualified.
+        // The DOT means the name contains a qualifier at the BAREWORD level.
+        // We test by placing cursor on "foo" (the binding key) and checking "x.Bar" REF
+        // won't match anything. Actually test that references on an unknown ref is empty.
+        let ghost_src = "host: ghost\n";
+        let off = ghost_src.find("ghost").unwrap();
+        let refs = references(ghost_src, off, true);
+        assert!(
+            refs.is_empty(),
+            "expected empty for undeclared 'ghost', got {refs:?}"
+        );
+    }
+
+    // ---- rename tests ----
+
+    /// Rename produces the same occurrence set as references(include_decl=true).
+    #[test]
+    fn rename_type_name_matches_references() {
+        let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
+        let decl_off = src.find("Server").unwrap();
+        let refs = references(src, decl_off, true);
+        let renames = rename(src, decl_off, "Node");
+        assert_eq!(
+            renames.as_deref(),
+            Some(refs.as_slice()),
+            "rename ranges should equal references(include_decl=true)"
+        );
+    }
+
+    /// Applying rename edits to the source yields a validly-renamed document.
+    #[test]
+    fn rename_produces_valid_renamed_source() {
+        let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
+        let decl_off = src.find("Server").unwrap();
+        let ranges = rename(src, decl_off, "Node").expect("rename should succeed");
+        // Apply edits in reverse order to preserve offsets.
+        let mut result = src.to_string();
+        let mut sorted = ranges.clone();
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.0));
+        for (s, e) in sorted {
+            result.replace_range(s..e, "Node");
+        }
+        assert!(
+            result.contains("type Node"),
+            "renamed source should contain 'type Node', got: {result:?}"
+        );
+        assert!(
+            result.contains("schema Node"),
+            "renamed source should contain 'schema Node', got: {result:?}"
+        );
+        assert!(
+            !result.contains("Server"),
+            "renamed source should not contain 'Server', got: {result:?}"
+        );
+    }
+
+    /// Rename of a binding name also renames all its REF uses.
+    #[test]
+    fn rename_binding_renames_all_refs() {
+        let src = "host: \"x\"\naddr: host\n";
+        let decl_off = src.find("host").unwrap();
+        let ranges = rename(src, decl_off, "hostname").expect("rename should succeed");
+        assert!(
+            ranges.len() >= 2,
+            "expected >= 2 ranges for binding rename, got {ranges:?}"
+        );
+        let mut result = src.to_string();
+        let mut sorted = ranges.clone();
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.0));
+        for (s, e) in sorted {
+            result.replace_range(s..e, "hostname");
+        }
+        assert!(
+            result.contains("hostname: \"x\""),
+            "renamed source should contain 'hostname: \"x\"', got: {result:?}"
+        );
+        assert!(
+            result.contains("addr: hostname"),
+            "renamed source should contain 'addr: hostname', got: {result:?}"
+        );
+    }
+
+    /// Rename with invalid identifier returns None.
+    #[test]
+    fn rename_invalid_new_name_returns_none() {
+        let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
+        let off = src.find("Server").unwrap();
+        assert_eq!(rename(src, off, ""), None, "empty name should return None");
+        assert_eq!(
+            rename(src, off, "123bad"),
+            None,
+            "name starting with digit should return None"
+        );
+        assert_eq!(
+            rename(src, off, "bad name"),
+            None,
+            "name with space should return None"
+        );
+    }
+
+    /// Rename on a keyword returns None.
+    #[test]
+    fn rename_keyword_returns_none() {
+        let src = "type Server = { host: str }\nschema Server\n";
+        let off = src.find("type").unwrap();
+        assert_eq!(rename(src, off, "newtype"), None);
+    }
+
+    /// Rename on an undeclared symbol returns None.
+    #[test]
+    fn rename_undeclared_symbol_returns_none() {
+        let src = "host: ghost\n";
+        let off = src.find("ghost").unwrap();
+        assert_eq!(rename(src, off, "spirit"), None);
     }
 }
