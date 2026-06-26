@@ -42,11 +42,13 @@ impl LineIndex {
             Err(next) => next - 1,
         };
         let line_start = self.line_starts[line];
-        // UTF-16 width of the slice [line_start, offset).
-        let character = self.text[line_start..offset]
-            .chars()
-            .map(char::len_utf16)
-            .sum::<usize>() as u32;
+        // UTF-16 width of the slice [line_start, offset), excluding a trailing
+        // `\r` so that an offset at the `\n` of a CRLF terminator reports the
+        // end-of-line column (line content) rather than one past it. The `\r\n`
+        // is a line terminator and is not counted as line content.
+        let slice = &self.text[line_start..offset];
+        let slice = slice.strip_suffix('\r').unwrap_or(slice);
+        let character = slice.chars().map(char::len_utf16).sum::<usize>() as u32;
         Pos {
             line: line as u32,
             character,
@@ -113,6 +115,103 @@ mod tests {
             Pos {
                 line: 0,
                 character: 2
+            }
+        );
+    }
+
+    #[test]
+    fn crlf_positions_are_correct() {
+        // Line 0: "a: 1\r\n" (6 bytes, line 1 starts at byte 6)
+        // Line 1: "b: 2\r\n"
+        let idx = LineIndex::new("a: 1\r\nb: 2\r\n");
+        assert_eq!(
+            idx.position(6),
+            Pos {
+                line: 1,
+                character: 0
+            }
+        );
+        // 'b: 2' — character 3 is '2'
+        assert_eq!(
+            idx.position(9),
+            Pos {
+                line: 1,
+                character: 3
+            }
+        );
+    }
+
+    #[test]
+    fn empty_document() {
+        let idx = LineIndex::new("");
+        assert_eq!(
+            idx.position(0),
+            Pos {
+                line: 0,
+                character: 0
+            }
+        );
+    }
+
+    #[test]
+    fn position_at_eol_before_crlf() {
+        // "abc\r\ndef": byte layout a(0) b(1) c(2) \r(3) \n(4) d(5) e(6) f(7)
+        let idx = LineIndex::new("abc\r\ndef");
+        // Offset at the `\r` (byte 3): prefix is "abc" → character 3.
+        assert_eq!(
+            idx.position(3),
+            Pos {
+                line: 0,
+                character: 3
+            }
+        );
+        // Offset at the `\n` (byte 4): prefix is "abc\r"; the trailing `\r` must
+        // NOT inflate the column — end-of-line is still character 3, not 4.
+        assert_eq!(
+            idx.position(4),
+            Pos {
+                line: 0,
+                character: 3
+            }
+        );
+        // byte 5 is 'd' → start of line 1.
+        assert_eq!(
+            idx.position(5),
+            Pos {
+                line: 1,
+                character: 0
+            }
+        );
+    }
+
+    #[test]
+    fn position_at_eol_after_astral_char_crlf() {
+        // An astral char before a CRLF: "𝄞\r\nx".
+        // bytes: 𝄞 = [0..4), \r = 4, \n = 5, x = 6.
+        // 𝄞 is 2 UTF-16 code units (surrogate pair).
+        let idx = LineIndex::new("𝄞\r\nx");
+        // After 𝄞 (byte 4 = the `\r`): prefix is "𝄞" → 2 UTF-16 units.
+        assert_eq!(
+            idx.position(4),
+            Pos {
+                line: 0,
+                character: 2
+            }
+        );
+        // At the `\n` (byte 5): prefix "𝄞\r"; trailing `\r` dropped → still 2.
+        assert_eq!(
+            idx.position(5),
+            Pos {
+                line: 0,
+                character: 2
+            }
+        );
+        // byte 6 is 'x' → start of line 1.
+        assert_eq!(
+            idx.position(6),
+            Pos {
+                line: 1,
+                character: 0
             }
         );
     }

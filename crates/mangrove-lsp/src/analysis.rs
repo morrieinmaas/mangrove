@@ -103,12 +103,12 @@ pub fn diagnostics(src: &str) -> Vec<Diagnostic> {
 
     // 2. Type/compose diagnostics — only for self-contained documents.
     //    Lowering delegates to the legacy parser; semantic errors carry their
-    //    own messages. We attach them to the whole document range (precise span
-    //    mapping for nested paths is a future enhancement).
+    //    own messages. We locate the offending declaration in the CST so the
+    //    squiggle lands on the right symbol rather than the whole document.
     if let Some(msg) = type_check(&root) {
-        let end = src.len();
+        let range = locate_span_for_type_error(&msg, &root, src.len());
         out.push(Diagnostic {
-            range: (0, end),
+            range,
             message: msg,
         });
     }
@@ -128,6 +128,75 @@ fn type_check(root: &SyntaxNode) -> Option<String> {
     // build() returning Err → schema error.
     let env = mangrove_typed::TypeEnv::build(&doc.typedefs, &doc.unitdefs).err()?;
     Some(format!("schema error: {env}"))
+}
+
+/// Given a type/schema error message from `TypeEnv::build`, locate the
+/// offending declaration in the CST and return its byte range. Falls back to
+/// `(0, src_len)` when the message can't be mapped to a node.
+///
+/// Handled patterns:
+///   "duplicate type definition: NAME"             → first TYPE_DEF with name == NAME
+///   "duplicate type/unit definition: NAME"        → first UNIT_DEF or TYPE_DEF with name == NAME
+///   "non-productive recursive type involving `NAME`" → TYPE_DEF with name == NAME
+///   "unknown type: NAME"                          → first TYPE_DEF body containing BAREWORD NAME
+fn locate_span_for_type_error(msg: &str, root: &SyntaxNode, src_len: usize) -> (usize, usize) {
+    let fallback = (0, src_len);
+    // The message arrives as "schema error: <TypeEnv message>"; strip the prefix.
+    let inner = msg.strip_prefix("schema error: ").unwrap_or(msg);
+
+    let symbol: Option<&str> = if let Some(rest) = inner.strip_prefix("duplicate type definition: ")
+    {
+        Some(rest.trim())
+    } else if let Some(rest) = inner.strip_prefix("duplicate type/unit definition: ") {
+        Some(rest.trim())
+    } else if let Some(rest) = inner.strip_prefix("non-productive recursive type involving `") {
+        rest.strip_suffix('`').map(str::trim)
+    } else {
+        None
+    };
+
+    if let Some(name) = symbol {
+        for node in root.children() {
+            if !matches!(node.kind(), SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF) {
+                continue;
+            }
+            if node_decl_name(&node).as_deref() == Some(name) {
+                let r = node.text_range();
+                return (r.start().into(), r.end().into());
+            }
+        }
+        return fallback;
+    }
+
+    if let Some(rest) = inner.strip_prefix("unknown type: ") {
+        let name = rest.trim();
+        for node in root.children() {
+            if node.kind() != SyntaxKind::TYPE_DEF {
+                continue;
+            }
+            let has_ref = node
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .any(|t| t.kind() == SyntaxKind::BAREWORD && t.text() == name);
+            if has_ref {
+                let r = node.text_range();
+                return (r.start().into(), r.end().into());
+            }
+        }
+    }
+
+    fallback
+}
+
+/// Extract the declared name of a TYPE_DEF or UNIT_DEF node: skip the keyword
+/// token, return the text of the first non-trivia, non-NEWLINE token.
+fn node_decl_name(node: &SyntaxNode) -> Option<String> {
+    let mut tokens = node
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE);
+    tokens.next(); // skip keyword
+    tokens.next().map(|t| t.text().to_string())
 }
 
 /// Top-level declaration outline.
@@ -402,5 +471,57 @@ mod tests {
         let h = hover(src, off).expect("hover");
         assert!(h.contains("type"), "hover: {h}");
         assert!(h.contains("the server schema"), "doc missing: {h}");
+    }
+
+    #[test]
+    fn duplicate_type_diagnostic_points_at_declaration_not_whole_doc() {
+        let src = "type T = int\ntype T = str\nschema T\nx: 1\n";
+        let diags = diagnostics(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("schema error")),
+            "expected a schema-error diagnostic, got {diags:?}"
+        );
+        let d = diags
+            .iter()
+            .find(|d| d.message.contains("schema error"))
+            .unwrap();
+        // Range must be narrower than the whole document
+        assert!(
+            d.range.1 < src.len(),
+            "diagnostic range should not span the whole document (got {:?})",
+            d.range
+        );
+        // Range should be on a line containing "type T"
+        let snip = &src[d.range.0..d.range.1];
+        assert!(
+            snip.contains('T')
+                || src[..d.range.1]
+                    .lines()
+                    .last()
+                    .unwrap_or("")
+                    .contains("type T"),
+            "diagnostic range should land on a type T declaration, snip={snip:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_type_diagnostic_points_at_referencing_declaration() {
+        // type A references unknown Foo
+        let src = "type A = Foo\nschema A\nx: 1\n";
+        let diags = diagnostics(src);
+        assert!(
+            diags.iter().any(|d| d.message.contains("schema error")),
+            "expected a schema-error diagnostic, got {diags:?}"
+        );
+        let d = diags
+            .iter()
+            .find(|d| d.message.contains("schema error"))
+            .unwrap();
+        // Range must be narrower than the whole document
+        assert!(
+            d.range.1 < src.len(),
+            "diagnostic range should not span the whole document (got {:?})",
+            d.range
+        );
     }
 }
