@@ -257,6 +257,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mangrove-fmt"
+version = "0.1.0"
+dependencies = [
+ "mangrove-syntax",
+ "rowan",
+]
+
+[[package]]
 name = "mangrove-openapi"
 version = "0.1.0"
 dependencies = [
