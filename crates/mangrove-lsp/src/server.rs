@@ -4,7 +4,7 @@
 
 use crate::analysis::{self, SemKind, SymbolKind};
 use crate::line_index::LineIndex;
-use lsp_server::{Connection, ExtractError, Message, Request, RequestId, Response};
+use lsp_server::{Connection, ErrorCode, ExtractError, Message, Request, RequestId, Response};
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, DocumentSymbol, Hover, HoverContents, HoverProviderCapability,
     MarkupContent, MarkupKind, OneOf, Position, PublishDiagnosticsParams, Range, SemanticToken,
@@ -117,13 +117,27 @@ fn handle_request(
     state: &State,
     req: Request,
 ) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-    let resp = match req.method.as_str() {
-        HoverRequest::METHOD => on_hover(state, req),
-        DocumentSymbolRequest::METHOD => on_document_symbol(state, req),
-        SemanticTokensFullRequest::METHOD => on_semantic_tokens(state, req),
-        Formatting::METHOD => on_formatting(state, req),
-        _ => Response::new_ok(req.id, serde_json::Value::Null),
-    };
+    // Capture the id before dispatching so we can reply on panic.
+    let req_id = req.id.clone();
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match req.method.as_str() {
+            HoverRequest::METHOD => on_hover(state, req),
+            DocumentSymbolRequest::METHOD => on_document_symbol(state, req),
+            SemanticTokensFullRequest::METHOD => on_semantic_tokens(state, req),
+            Formatting::METHOD => on_formatting(state, req),
+            _ => Response::new_err(
+                req.id,
+                ErrorCode::MethodNotFound as i32,
+                format!("method not found: {}", req.method),
+            ),
+        }));
+    let resp = result.unwrap_or_else(|_| {
+        Response::new_err(
+            req_id,
+            ErrorCode::InternalError as i32,
+            "internal server error".to_string(),
+        )
+    });
     connection.sender.send(Message::Response(resp))?;
     Ok(())
 }
@@ -278,7 +292,10 @@ fn encode_semantic_tokens(text: &str) -> Vec<SemanticToken> {
     let (mut prev_line, mut prev_char) = (0u32, 0u32);
     for t in analysis::semantic_tokens(text) {
         let start = idx.position(t.range.0);
-        let len = (t.range.1 - t.range.0) as u32;
+        let end = idx.position(t.range.1);
+        // A single token is always on one line, so the UTF-16 length is the
+        // column delta between end and start — not the byte delta.
+        let len = end.character - start.character;
         let delta_line = start.line - prev_line;
         let delta_start = if delta_line == 0 {
             start.character - prev_char
@@ -386,11 +403,14 @@ fn cast<R>(req: Request) -> Result<(RequestId, R::Params), Response>
 where
     R: lsp_types::request::Request,
 {
+    // Capture id before consuming req — JsonError loses it otherwise.
+    let id = req.id.clone();
     match req.extract::<R::Params>(R::METHOD) {
         Ok((id, params)) => Ok((id, params)),
-        Err(ExtractError::JsonError { .. }) => Err(Response::new_ok(
-            RequestId::from(0),
-            serde_json::Value::Null,
+        Err(ExtractError::JsonError { error, .. }) => Err(Response::new_err(
+            id,
+            ErrorCode::InvalidParams as i32,
+            error.to_string(),
         )),
         Err(ExtractError::MethodMismatch(req)) => {
             Err(Response::new_ok(req.id, serde_json::Value::Null))
@@ -435,5 +455,43 @@ mod tests {
         assert_eq!(data[0].delta_start, 0);
         assert_eq!(data[0].length, 4);
         assert_eq!(data[0].token_type, 0); // keyword
+    }
+
+    /// C1: semantic-token `length` must be UTF-16 code units, not bytes.
+    ///
+    /// "café" has 5 chars, 6 bytes (é = 2 bytes), but 5 UTF-16 code units.
+    /// With surrounding quotes the string token `"café"` is 6 UTF-16 units (7 bytes).
+    /// An emoji like 🎉 (U+1F389) is 4 bytes UTF-8 but 2 UTF-16 code units.
+    #[test]
+    fn semantic_token_length_is_utf16_not_bytes() {
+        // "café" → 6 bytes for the quoted string but 6 UTF-16 code units (correct)
+        // because é is 2 UTF-8 bytes but 1 UTF-16 code unit.
+        // "🎉" → 6 bytes (2 for quotes + 4 for emoji) but 4 UTF-16 units (2 quotes + 2 surrogates).
+        let src = "host: \"café\"\n";
+        let data = encode_semantic_tokens(src);
+        // find the string token
+        let string_tok = data
+            .iter()
+            .find(|t| t.token_type == 2) // STRING = index 2
+            .expect("expected a string token");
+        // "café" with quotes: 6 chars = 6 UTF-16 code units (é is BMP), 7 bytes
+        assert_eq!(
+            string_tok.length, 6,
+            "UTF-16 length of \"café\" should be 6, not byte-length 7"
+        );
+
+        // Now test with an emoji (surrogate pair in UTF-16)
+        let src2 = "host: \"🎉\"\n";
+        let data2 = encode_semantic_tokens(src2);
+        let string_tok2 = data2
+            .iter()
+            .find(|t| t.token_type == 2)
+            .expect("expected a string token");
+        // "🎉" with quotes: 2 quotes (2 UTF-16) + 🎉 (2 UTF-16 surrogates) = 4 UTF-16 units
+        // but in bytes: 2 + 4 = 6 bytes
+        assert_eq!(
+            string_tok2.length, 4,
+            "UTF-16 length of \"🎉\" should be 4 (2 surrogates + 2 quotes), not byte-length 6"
+        );
     }
 }

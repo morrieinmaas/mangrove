@@ -10,7 +10,6 @@ repository.workspace = true
 mangrove-syntax = { path = "../mangrove-syntax" }
 mangrove-fmt = { path = "../mangrove-fmt" }
 mangrove-typed = { path = "../mangrove-typed" }
-mangrove-compose = { path = "../mangrove-compose" }
 rowan = { workspace = true }
 lsp-server = "0.8.0"
 lsp-types = "0.97.0"

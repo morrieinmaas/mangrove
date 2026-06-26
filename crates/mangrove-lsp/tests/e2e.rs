@@ -123,6 +123,154 @@ fn initialize_open_diagnostics_hover_shutdown() {
     server_thread.join().unwrap();
 }
 
+/// C2: a request with malformed params must be answered to the CORRECT request id.
+/// If the server replies to id 0 instead of the real id, the client hangs.
+#[test]
+fn malformed_params_reply_uses_correct_request_id() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        mangrove_lsp::server::run_on(&server).unwrap();
+    });
+
+    // handshake
+    let init_id = RequestId::from(1);
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            init_id.clone(),
+            Initialize::METHOD.to_string(),
+            serde_json::to_value(InitializeParams::default()).unwrap(),
+        )))
+        .unwrap();
+    recv_response(&client, &init_id);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            Initialized::METHOD.to_string(),
+            serde_json::to_value(InitializedParams {}).unwrap(),
+        )))
+        .unwrap();
+
+    // Send hover request with intentionally malformed params (empty object instead of HoverParams)
+    let bad_id = RequestId::from(42);
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            bad_id.clone(),
+            HoverRequest::METHOD.to_string(),
+            serde_json::json!({}), // missing all required fields → JsonError on deserialization
+        )))
+        .unwrap();
+
+    // The server must reply to id 42, NOT id 0.
+    // recv_response waits for id 42; if the server sends id 0 we'd wait forever (timeout via join).
+    let resp = recv_response(&client, &bad_id);
+    // It should be an error response (not Ok(null))
+    assert!(
+        resp.error.is_some(),
+        "expected an error response for malformed params, got: {:?}",
+        resp.result
+    );
+
+    // shutdown
+    let shutdown_id = RequestId::from(99);
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            shutdown_id.clone(),
+            Shutdown::METHOD.to_string(),
+            serde_json::Value::Null,
+        )))
+        .unwrap();
+    recv_response(&client, &shutdown_id);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            Exit::METHOD.to_string(),
+            serde_json::Value::Null,
+        )))
+        .unwrap();
+    server_thread.join().unwrap();
+}
+
+/// Security invariant: a document containing a namespaced import (`use "ns/pkg@v1" as p`)
+/// must not panic and must produce zero type-check diagnostics (the read-only skip guard holds).
+#[test]
+fn namespaced_import_skips_typecheck_no_panic() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        mangrove_lsp::server::run_on(&server).unwrap();
+    });
+
+    // handshake
+    let init_id = RequestId::from(1);
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            init_id.clone(),
+            Initialize::METHOD.to_string(),
+            serde_json::to_value(InitializeParams::default()).unwrap(),
+        )))
+        .unwrap();
+    recv_response(&client, &init_id);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            Initialized::METHOD.to_string(),
+            serde_json::to_value(InitializedParams {}).unwrap(),
+        )))
+        .unwrap();
+
+    // Document with a namespaced import + valid content
+    let src = "use \"ns/pkg@v1\" as p\ntype Server = { host: str }\nschema Server\nhost: \"x\"\n";
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            DidOpenTextDocument::METHOD.to_string(),
+            serde_json::to_value(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri(),
+                    language_id: "mangrove".to_string(),
+                    version: 1,
+                    text: src.to_string(),
+                },
+            })
+            .unwrap(),
+        )))
+        .unwrap();
+
+    // (a) server must not panic — if it did, the thread would exit and recv would fail
+    // (b) diagnostics must be empty — no type-check errors from the import
+    let diag_note = recv_notification(&client, "textDocument/publishDiagnostics");
+    let params: lsp_types::PublishDiagnosticsParams =
+        serde_json::from_value(diag_note.params).unwrap();
+    assert!(
+        params.diagnostics.is_empty(),
+        "namespaced import doc must yield no diagnostics, got: {:?}",
+        params.diagnostics
+    );
+
+    // shutdown
+    let shutdown_id = RequestId::from(99);
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            shutdown_id.clone(),
+            Shutdown::METHOD.to_string(),
+            serde_json::Value::Null,
+        )))
+        .unwrap();
+    recv_response(&client, &shutdown_id);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            Exit::METHOD.to_string(),
+            serde_json::Value::Null,
+        )))
+        .unwrap();
+    server_thread.join().unwrap();
+}
+
 // ---- receive helpers: drain until the expected message arrives ----
 
 fn recv_response(client: &Connection, id: &RequestId) -> lsp_server::Response {

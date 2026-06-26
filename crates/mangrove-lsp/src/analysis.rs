@@ -61,22 +61,37 @@ pub fn diagnostics(src: &str) -> Vec<Diagnostic> {
     let mut out = Vec::new();
 
     // 1. Parse errors → one diagnostic per ERROR node, ranged by the node.
-    for node in root.descendants() {
-        if node.kind() == SyntaxKind::ERROR {
-            let r = node.text_range();
-            out.push(Diagnostic {
-                range: (r.start().into(), r.end().into()),
-                message: "syntax error".to_string(),
-            });
-        }
+    //    Use the actual parser error messages where available (matched by index).
+    let error_nodes: Vec<_> = root
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::ERROR)
+        .collect();
+    for (i, node) in error_nodes.iter().enumerate() {
+        let r = node.text_range();
+        // Prefer the parser's own message for this node if it has one.
+        let message = parse
+            .errors
+            .get(i)
+            .map(|e| e.message.clone())
+            .unwrap_or_else(|| "syntax error".to_string());
+        out.push(Diagnostic {
+            range: (r.start().into(), r.end().into()),
+            message,
+        });
     }
     // If the parser recorded messages but produced no ERROR node (e.g. a missing
-    // closer at EOF), still surface them at the end of the document.
+    // closer at EOF), still surface them. Use a visible range: from the start of
+    // the last non-empty line to the end of the source.
     if out.is_empty() && !parse.errors.is_empty() {
         let end = src.len();
+        // Find the start of the last non-empty line so the range is visible.
+        let range_start = src
+            .rfind(|c: char| !c.is_whitespace())
+            .and_then(|pos| src[..pos].rfind('\n').map(|nl| nl + 1))
+            .unwrap_or(0);
         for e in &parse.errors {
             out.push(Diagnostic {
-                range: (end, end),
+                range: (range_start, end),
                 message: e.message.clone(),
             });
         }
