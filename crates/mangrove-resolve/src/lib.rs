@@ -59,6 +59,45 @@ fn find_upward(start: &Path, rel: &str) -> Option<(PathBuf, PathBuf)> {
 }
 
 impl Resolvers {
+    /// Resolve a namespaced reference to a local file path WITHOUT fetching.
+    ///
+    /// Returns `Err` for git backends (no network operation is ever performed).
+    /// This is the only safe resolution path for read-only contexts (e.g. an LSP).
+    pub fn resolve_local_path(&self, reference: &str) -> Result<PathBuf, String> {
+        let (ns_path, tag) = reference.rsplit_once('@').ok_or_else(|| {
+            format!("namespaced import `{reference}` must be `<namespace>@<tag>`")
+        })?;
+        let (first, rest) = match ns_path.split_once('/') {
+            Some((a, b)) => (a, b),
+            None => (ns_path, ""),
+        };
+        validate_component(first, "namespace")?;
+        validate_component(tag, "tag")?;
+        if !rest.is_empty() {
+            validate_component(rest, "path")?;
+        }
+        let backend = self.map.get(first).ok_or_else(|| {
+            format!("no resolver for namespace `{first}` (.mangrove/resolvers.toml)")
+        })?;
+        let rel = if rest.is_empty() {
+            format!("{first}.mang")
+        } else {
+            format!("{rest}.mang")
+        };
+        match backend {
+            Backend::Local(remote) => {
+                let base = match &self.config_dir {
+                    Some(d) => d.join(remote),
+                    None => remote.clone(),
+                };
+                Ok(base.join(rel))
+            }
+            Backend::Git { .. } => Err(format!(
+                "namespace `{first}` uses a git backend; local resolution only in this context"
+            )),
+        }
+    }
+
     /// Find `.mangrove/resolvers.toml` from `root_dir` upward and load it; an
     /// empty resolver set if none exists.
     pub fn find_and_load(root_dir: &Path) -> Result<Resolvers, String> {
@@ -509,6 +548,39 @@ mod tests {
         let p = r.resolve_path("pkg/x@v1").unwrap();
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "name: \"real\"\n");
         assert!(p.parent().unwrap().join(".git").exists()); // a real checkout now
+    }
+
+    #[test]
+    fn resolve_local_path_does_not_fetch_git() {
+        // A git backend — resolve_local_path must return Err without running git.
+        let dir = scratch();
+        write(
+            &dir.join(".mangrove/resolvers.toml"),
+            "[namespace.pkg]\ngit = \"https://example.com/repo.git\"\n",
+        );
+        let r = Resolvers::find_and_load(&dir).unwrap();
+        let result = r.resolve_local_path("pkg/x@v1");
+        assert!(
+            result.is_err(),
+            "resolve_local_path on git backend must return Err (no fetch)"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("git backend"),
+            "error message should mention git backend, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_local_path_works_for_local_backend() {
+        let dir = scratch();
+        write(
+            &dir.join(".mangrove/resolvers.toml"),
+            "[namespace.infra]\nremote = \"vendor/infra\"\n",
+        );
+        let r = Resolvers::find_and_load(&dir).unwrap();
+        let p = r.resolve_local_path("infra/k8s/core@v5.0").unwrap();
+        assert_eq!(p, dir.join("vendor/infra").join("k8s/core.mang"));
     }
 
     #[test]

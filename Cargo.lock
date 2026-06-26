@@ -337,6 +337,7 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "mangrove-fmt",
+ "mangrove-resolve",
  "mangrove-syntax",
  "mangrove-typed",
  "rowan",

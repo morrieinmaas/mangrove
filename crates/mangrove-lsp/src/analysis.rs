@@ -602,6 +602,113 @@ fn find_param_entry(root: &SyntaxNode, name: &str) -> Option<(usize, usize)> {
     None
 }
 
+// ---- cross-file go-to-definition ----
+
+/// Attempt cross-file go-to-definition for a qualified reference `alias.TypeName`.
+///
+/// Returns `Some((file_path, (start, end), file_text))` where the byte range is
+/// within `file_text`. Returns `None` if:
+/// - The cursor is not on a qualified reference (`alias.TypeName` pattern).
+/// - The alias doesn't match any `use` declaration in the document.
+/// - The package is not locally available (git backend, missing file, etc.).
+/// - Anything would require a fetch or network operation.
+///
+/// `doc_path` is the on-disk path of the document being edited (from the file URI).
+pub fn goto_definition_cross_file(
+    src: &str,
+    offset: usize,
+    doc_path: &std::path::Path,
+) -> Option<(std::path::PathBuf, (usize, usize), String)> {
+    let root = parse_cst(src).syntax();
+    let off: rowan::TextSize = (offset as u32).into();
+
+    // Find significant token under cursor.
+    // Prefer tokens that start at or before `off` and end AFTER `off` (strict
+    // containment). Fall back to tokens that merely end at `off` (inclusive end).
+    // This avoids picking a DOT when the cursor is on the first character of the
+    // following BAREWORD (both have `contains_inclusive(off)` true).
+    let covering: Vec<_> = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.text_range().contains_inclusive(off))
+        .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+        .collect();
+    // Prefer a token that strictly contains the offset (end > off), then fall
+    // back to one that just ends at off.
+    let tok = covering
+        .iter()
+        .find(|t| t.text_range().end() > off)
+        .or_else(|| covering.first())
+        .cloned()?;
+
+    if tok.kind() != SyntaxKind::BAREWORD {
+        return None;
+    }
+
+    // Check for qualified ref pattern: alias.TypeName
+    let (alias, type_name) = detect_qualified_ref(&root, &tok)?;
+
+    // Find the `use "ref" as alias` declaration.
+    let doc = lower(&root).ok()?;
+    let use_decl = doc.uses.iter().find(|u| u.alias == alias)?;
+    let reference = use_decl.path.clone();
+
+    // Resolve to local path (no-fetch).
+    let doc_dir = doc_path.parent()?;
+    let resolvers = mangrove_resolve::Resolvers::find_and_load(doc_dir).ok()?;
+    let pkg_path = resolvers.resolve_local_path(&reference).ok()?;
+
+    // Only proceed if the file exists locally.
+    if !pkg_path.exists() {
+        return None;
+    }
+
+    // Read the file (read-only).
+    let pkg_text = std::fs::read_to_string(&pkg_path).ok()?;
+
+    // Parse and find the type/unit declaration.
+    let pkg_root = parse_cst(&pkg_text).syntax();
+    let byte_range = find_type_decl(&pkg_root, &type_name)?;
+
+    Some((pkg_path, byte_range, pkg_text))
+}
+
+/// Detect if the token is part of an `alias.TypeName` pattern.
+/// Returns `(alias, type_name)` if so.
+fn detect_qualified_ref(
+    root: &SyntaxNode,
+    tok: &mangrove_syntax::cst::SyntaxToken,
+) -> Option<(String, String)> {
+    // Collect all significant (non-trivia, non-newline) tokens in document order.
+    let all_toks: Vec<_> = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+        .collect();
+
+    let pos = all_toks
+        .iter()
+        .position(|t| t.text_range() == tok.text_range())?;
+
+    // Case A: cursor on alias — next token is DOT, then a BAREWORD (the type name).
+    if let (Some(next), Some(after)) = (all_toks.get(pos + 1), all_toks.get(pos + 2)) {
+        if next.kind() == SyntaxKind::DOT && after.kind() == SyntaxKind::BAREWORD {
+            return Some((tok.text().to_string(), after.text().to_string()));
+        }
+    }
+
+    // Case B: cursor on TypeName — prev token is DOT, prev-prev is a BAREWORD (alias).
+    if pos >= 2 {
+        let prev = &all_toks[pos - 1];
+        let before = &all_toks[pos - 2];
+        if prev.kind() == SyntaxKind::DOT && before.kind() == SyntaxKind::BAREWORD {
+            return Some((before.text().to_string(), tok.text().to_string()));
+        }
+    }
+
+    None
+}
+
 /// Find a TYPE_DEF or UNIT_DEF whose declared name equals `name`.
 fn find_type_decl(root: &SyntaxNode, name: &str) -> Option<(usize, usize)> {
     for child in root.children() {
@@ -1846,5 +1953,122 @@ mod tests {
         let src = "host: ghost\n";
         let off = src.find("ghost").unwrap();
         assert_eq!(rename(src, off, "spirit"), None);
+    }
+
+    // ---- cross-file go-to-definition tests ----
+
+    fn write_fixture(dir: &std::path::Path, rel: &str, contents: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+
+    fn scratch_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("mangrove_lsp_xfile_{}_{id}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn goto_definition_cross_file_resolves_to_imported_type() {
+        let dir = scratch_dir();
+        // .mangrove/resolvers.toml
+        write_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        // vendor/pkg.mang — the target file
+        write_fixture(&dir, "vendor/pkg.mang", "type SomeType = int\n");
+        // main.mang — the source document
+        let main_src = "use \"ns/pkg@v1\" as k\ntype Local = k.SomeType\n";
+        let main_path = dir.join("main.mang");
+        // cursor on "SomeType" in "k.SomeType"
+        let off = main_src.rfind("SomeType").unwrap();
+        let result = goto_definition_cross_file(main_src, off, &main_path);
+        assert!(
+            result.is_some(),
+            "expected cross-file goto to resolve, got None"
+        );
+        let (file_path, (start, end), file_text) = result.unwrap();
+        assert!(
+            file_path.ends_with("pkg.mang"),
+            "expected to resolve to pkg.mang, got {file_path:?}"
+        );
+        let snip = &file_text[start..end];
+        assert!(
+            snip.contains("SomeType"),
+            "expected definition range to cover SomeType, got {snip:?}"
+        );
+    }
+
+    #[test]
+    fn goto_definition_cross_file_resolves_from_alias_part() {
+        let dir = scratch_dir();
+        write_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_fixture(&dir, "vendor/pkg.mang", "type SomeType = int\n");
+        let main_src = "use \"ns/pkg@v1\" as k\ntype Local = k.SomeType\n";
+        let main_path = dir.join("main.mang");
+        // cursor on "k" (the alias) in "k.SomeType"
+        let off = main_src.rfind("k.SomeType").unwrap();
+        let result = goto_definition_cross_file(main_src, off, &main_path);
+        assert!(
+            result.is_some(),
+            "expected cross-file goto from alias part to resolve, got None"
+        );
+        let (file_path, (start, end), file_text) = result.unwrap();
+        assert!(
+            file_path.ends_with("pkg.mang"),
+            "expected to resolve to pkg.mang, got {file_path:?}"
+        );
+        let snip = &file_text[start..end];
+        assert!(
+            snip.contains("SomeType"),
+            "expected definition range to cover SomeType, got {snip:?}"
+        );
+    }
+
+    #[test]
+    fn goto_definition_cross_file_missing_package_returns_none() {
+        let dir = scratch_dir();
+        // resolvers.toml points to vendor/ but no files exist there
+        write_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        // vendor/pkg.mang intentionally NOT created
+        let main_src = "use \"ns/pkg@v1\" as k\ntype Local = k.SomeType\n";
+        let main_path = dir.join("main.mang");
+        let off = main_src.rfind("SomeType").unwrap();
+        let result = goto_definition_cross_file(main_src, off, &main_path);
+        assert!(
+            result.is_none(),
+            "expected None for missing package, got {:?}",
+            result.as_ref().map(|(p, _, _)| p)
+        );
+    }
+
+    #[test]
+    fn goto_definition_local_still_works_after_cross_file_added() {
+        // existing local goto test: type Server, schema Server — still resolves
+        let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
+        let schema_off = src.rfind("Server").unwrap();
+        let result = goto_definition(src, schema_off);
+        assert!(result.is_some(), "local goto_definition should still work");
+        let (start, _end) = result.unwrap();
+        let snip = &src[start..];
+        assert!(
+            snip.starts_with("type Server") || snip.contains("type Server"),
+            "expected to land on type declaration, got start={start}: {snip:.40?}"
+        );
     }
 }

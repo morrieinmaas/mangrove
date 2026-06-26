@@ -378,19 +378,46 @@ fn on_goto_definition(state: &State, req: Request) -> Response {
         return Response::new_ok(id, serde_json::Value::Null);
     };
     let offset = offset_of(text, params.text_document_position_params.position);
-    let result: Option<GotoDefinitionResponse> =
-        analysis::goto_definition(text, offset).and_then(|(start, end)| {
+
+    // First try local (same-file) resolution.
+    let result: Option<GotoDefinitionResponse> = analysis::goto_definition(text, offset)
+        .and_then(|(start, end)| {
             let idx = LineIndex::new(text);
             let parsed: Uri = uri.parse().ok()?;
             Some(GotoDefinitionResponse::Scalar(Location {
                 uri: parsed,
                 range: to_range(&idx, (start, end)),
             }))
+        })
+        // Then try cross-file resolution for qualified references (alias.Type).
+        .or_else(|| {
+            let doc_path = uri_to_path(&uri)?;
+            let (file_path, byte_range, file_text) =
+                analysis::goto_definition_cross_file(text, offset, &doc_path)?;
+            let target_uri = path_to_uri(&file_path)?;
+            let idx = LineIndex::new(&file_text);
+            Some(GotoDefinitionResponse::Scalar(Location {
+                uri: target_uri,
+                range: to_range(&idx, byte_range),
+            }))
         });
+
     Response::new_ok(
         id,
         serde_json::to_value(result).unwrap_or(serde_json::Value::Null),
     )
+}
+
+/// Convert a `file://` URI string to a filesystem path.
+fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let path_str = uri.strip_prefix("file://")?;
+    Some(std::path::PathBuf::from(path_str))
+}
+
+/// Convert a filesystem path to a `file://` URI.
+fn path_to_uri(path: &std::path::Path) -> Option<Uri> {
+    let s = format!("file://{}", path.to_str()?);
+    s.parse().ok()
 }
 
 fn on_completion(state: &State, req: Request) -> Response {
