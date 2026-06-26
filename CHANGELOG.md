@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.2.1
+
+A formatter and a migration guide; sets the workspace version to match the
+release (it had lagged at 0.1.0 through the prior tags).
 
 ### Tooling
 - **`mangrove fmt`:** a deterministic, comment- and meaning-preserving formatter
@@ -9,6 +12,11 @@
   place, `fmt --check <file>…` exits 1 if any file would change (writes nothing,
   for CI gates), `fmt -` formats stdin → stdout. Built on a lossless CST front
   end, so it produces best-effort output even on parse errors.
+
+### Docs
+- **Migration guide** (`docs/MIGRATING.md` + `docs/migrate.just`): a phased,
+  hash-verified path for moving Kubernetes/Helm/pyinfra YAML onto Mangrove, with
+  drop-in `just` recipes.
 
 ## v0.2.0
 
