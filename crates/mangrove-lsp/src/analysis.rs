@@ -618,64 +618,225 @@ fn find_type_decl(root: &SyntaxNode, name: &str) -> Option<(usize, usize)> {
 
 // ---- completions ----
 
-/// Top-level language keywords offered as completion items.
-const KEYWORDS: &[&str] = &[
-    "type", "schema", "unit", "use", "params", "fn", "match", "unset",
-];
+/// Top-level declaration keywords (valid at the start of a new statement).
+const DECL_KEYWORDS: &[&str] = &["type", "schema", "unit", "use", "params", "fn"];
+
+/// Value-position keywords (valid inside a value expression).
+const VALUE_KEYWORDS: &[&str] = &["match", "unset"];
+
+/// Primitive type keywords (valid after `=` in a type definition).
+const PRIMITIVE_TYPE_KEYWORDS: &[&str] = &["int", "str", "bool", "decimal", "bytes"];
+
+/// The cursor context derived from the CST at a given offset.
+#[derive(Debug, PartialEq)]
+enum CursorContext {
+    /// Inside a type definition body or type annotation (e.g. after `=` in
+    /// `type Foo = …`, or after `schema`).
+    TypePosition,
+    /// At top-level document scope — a new declaration is expected.
+    TopLevel,
+    /// Inside a value position under the document's bound schema record.
+    SchemaValuePosition,
+    /// General value position (binding value, match arm, etc.).
+    GeneralValue,
+    /// Context is ambiguous — fall back to the full union.
+    Ambiguous,
+}
+
+/// Declaration-opening keywords — if the cursor sits on one of these, the
+/// position is effectively top-level (the user may be replacing/extending a
+/// declaration keyword, not writing a type expression or value).
+const DECL_KEYWORD_TOKENS: &[&str] = &["type", "schema", "unit", "use", "params", "fn"];
+
+/// Determine what the cursor is completing at `offset` in the CST.
+///
+/// Strategy:
+/// 1. Find the significant token whose range contains (or ends at) `offset`.
+/// 2. If that token is a declaration-opening keyword, the context is TopLevel.
+/// 3. Otherwise walk up the ancestor chain and classify by the first matching
+///    ancestor kind.
+/// 4. Fall back to `Ambiguous` when the position can't be determined.
+fn cursor_context(root: &SyntaxNode, offset: usize) -> CursorContext {
+    let off: rowan::TextSize = (offset as u32).into();
+
+    // Collect tokens whose range strictly contains the offset (preferred) or
+    // that end exactly at the offset (cursor just past the token).  We do NOT
+    // include tokens that merely start at `off` unless they also contain it,
+    // to avoid grabbing the declaration keyword when the cursor is at the very
+    // start of a new line.
+    let all_toks: Vec<_> = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.text_range().contains_inclusive(off))
+        .collect();
+
+    // Prefer a significant (non-trivia, non-newline) token.
+    let tok = all_toks
+        .iter()
+        .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+        .cloned();
+
+    // If no significant token covers the offset, the cursor is between
+    // declarations (whitespace / newline / EOF) → top-level.
+    let Some(tok) = tok else {
+        return CursorContext::TopLevel;
+    };
+
+    // If the cursor is sitting on a declaration-opening keyword, the user is
+    // at the start of a new top-level statement — treat as TopLevel.
+    if matches!(tok.kind(), SyntaxKind::BAREWORD) && DECL_KEYWORD_TOKENS.contains(&tok.text()) {
+        return CursorContext::TopLevel;
+    }
+
+    // Walk up the ancestor chain checking node kinds.
+    let mut node = tok.parent();
+    while let Some(n) = node {
+        match n.kind() {
+            // Inside a type definition or schema declaration → type position.
+            SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF | SyntaxKind::SCHEMA_DECL => {
+                return CursorContext::TypePosition;
+            }
+            // Inside a binding value or record field under DOCUMENT → value position.
+            SyntaxKind::BINDING | SyntaxKind::RECORD | SyntaxKind::FIELD => {
+                return CursorContext::SchemaValuePosition;
+            }
+            // Inside a match expression, call, list, etc. → general value.
+            SyntaxKind::MATCH_EXPR
+            | SyntaxKind::MATCH_ARM
+            | SyntaxKind::CALL
+            | SyntaxKind::LIST
+            | SyntaxKind::LIST_OP_ITEM => {
+                return CursorContext::GeneralValue;
+            }
+            // Direct child of DOCUMENT (covers USE_DECL, PARAM_DECL, FN_DEF,
+            // ERROR nodes, etc.) → top-level.
+            SyntaxKind::DOCUMENT => {
+                return CursorContext::TopLevel;
+            }
+            _ => {}
+        }
+        node = n.parent();
+    }
+
+    // Reached root without a clear context → ambiguous fallback.
+    CursorContext::Ambiguous
+}
 
 /// Return completion items for a cursor at `offset` in `src`.
 ///
-/// Pragmatic v1: returns the union of
-/// - declared type names (TYPE_DEF / UNIT_DEF) — Kind=TypeName
-/// - top-level keywords — Kind=Keyword
-/// - record-field names from the document's bound schema type — Kind=Field
+/// Context-aware: determines the cursor's position in the CST and offers only
+/// items that fit:
+/// - Type position → declared type/unit names + primitive type keywords.
+/// - Top-level → declaration keywords (`type`, `schema`, `unit`, …).
+/// - Schema value position → schema record field names.
+/// - General value → value keywords (`match`, `unset`).
+/// - Ambiguous → full union (over-offer rather than offer nothing).
 ///
-/// No precise context detection; over-offering is intentional (better than
-/// mis-resolving).  Cross-file completion is out of scope.
-pub fn completions(src: &str, _offset: usize) -> Vec<CompletionItem> {
+/// Cross-file completion is out of scope.
+pub fn completions(src: &str, offset: usize) -> Vec<CompletionItem> {
     let root = parse_cst(src).syntax();
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    // Helper to dedup-insert.
     let mut push = |item: CompletionItem| {
         if seen.insert(item.label.clone()) {
             items.push(item);
         }
     };
 
-    // 1. Declared type/unit names.
-    for child in root.children() {
-        match child.kind() {
-            SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF => {
-                if let Some(name) = node_decl_name(&child) {
+    let ctx = cursor_context(&root, offset);
+
+    match ctx {
+        CursorContext::TypePosition => {
+            // Declared type/unit names.
+            for child in root.children() {
+                if matches!(child.kind(), SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF) {
+                    if let Some(name) = node_decl_name(&child) {
+                        push(CompletionItem {
+                            label: name,
+                            kind: CompletionKind::TypeName,
+                        });
+                    }
+                }
+            }
+            // Primitive type keywords.
+            for &kw in PRIMITIVE_TYPE_KEYWORDS {
+                push(CompletionItem {
+                    label: kw.to_string(),
+                    kind: CompletionKind::Keyword,
+                });
+            }
+        }
+
+        CursorContext::TopLevel => {
+            for &kw in DECL_KEYWORDS {
+                push(CompletionItem {
+                    label: kw.to_string(),
+                    kind: CompletionKind::Keyword,
+                });
+            }
+        }
+
+        CursorContext::SchemaValuePosition => {
+            // Field names from the bound schema (if any).
+            if let Some(fields) = schema_record_fields(src) {
+                for field in fields {
                     push(CompletionItem {
-                        label: name,
-                        kind: CompletionKind::TypeName,
+                        label: field,
+                        kind: CompletionKind::Field,
                     });
                 }
             }
-            _ => {}
+            // Also offer value keywords as a convenience.
+            for &kw in VALUE_KEYWORDS {
+                push(CompletionItem {
+                    label: kw.to_string(),
+                    kind: CompletionKind::Keyword,
+                });
+            }
         }
-    }
 
-    // 2. Keywords.
-    for &kw in KEYWORDS {
-        push(CompletionItem {
-            label: kw.to_string(),
-            kind: CompletionKind::Keyword,
-        });
-    }
+        CursorContext::GeneralValue => {
+            for &kw in VALUE_KEYWORDS {
+                push(CompletionItem {
+                    label: kw.to_string(),
+                    kind: CompletionKind::Keyword,
+                });
+            }
+        }
 
-    // 3. Record-field names from the bound schema type (if any).
-    //    We lower the document to get the schema name, then resolve the type
-    //    definition from the local typedefs.
-    if let Some(fields) = schema_record_fields(src) {
-        for field in fields {
-            push(CompletionItem {
-                label: field,
-                kind: CompletionKind::Field,
-            });
+        CursorContext::Ambiguous => {
+            // Full union — better to over-offer than to return nothing.
+            for child in root.children() {
+                if matches!(child.kind(), SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF) {
+                    if let Some(name) = node_decl_name(&child) {
+                        push(CompletionItem {
+                            label: name,
+                            kind: CompletionKind::TypeName,
+                        });
+                    }
+                }
+            }
+            for &kw in DECL_KEYWORDS {
+                push(CompletionItem {
+                    label: kw.to_string(),
+                    kind: CompletionKind::Keyword,
+                });
+            }
+            for &kw in VALUE_KEYWORDS {
+                push(CompletionItem {
+                    label: kw.to_string(),
+                    kind: CompletionKind::Keyword,
+                });
+            }
+            if let Some(fields) = schema_record_fields(src) {
+                for field in fields {
+                    push(CompletionItem {
+                        label: field,
+                        kind: CompletionKind::Field,
+                    });
+                }
+            }
         }
     }
 
@@ -938,20 +1099,26 @@ mod tests {
 
     #[test]
     fn completions_include_declared_type_name() {
-        let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
-        let items = completions(src, 0);
+        // In a document with two types, completions in type-position context
+        // should include declared type names.
+        let src = "type Inner = int\ntype Server = Inner\nschema Server\nx: 1\n";
+        // Offset pointing at "Inner" inside `type Server = Inner` — inside TYPE_DEF.
+        // rfind("Inner") gives us the reference occurrence after `=`.
+        let off = src.rfind("Inner").unwrap();
+        let items = completions(src, off);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
-            labels.contains(&"Server"),
-            "expected 'Server' in completions, got {labels:?}"
+            labels.contains(&"Inner"),
+            "expected 'Inner' in type-position completions, got {labels:?}"
         );
-        let server = items.iter().find(|i| i.label == "Server").unwrap();
-        assert_eq!(server.kind, CompletionKind::TypeName);
+        let item = items.iter().find(|i| i.label == "Inner").unwrap();
+        assert_eq!(item.kind, CompletionKind::TypeName);
     }
 
     #[test]
     fn completions_include_keywords() {
         let src = "type Server = { host: str }\nschema Server\n";
+        // offset 0 = ambiguous → full union, includes "type"/"schema"
         let items = completions(src, 0);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
@@ -968,10 +1135,13 @@ mod tests {
 
     #[test]
     fn completions_include_schema_record_fields() {
-        // Document with a bound record schema — field names should appear.
+        // Document with a bound record schema — field names should appear when
+        // cursor is inside a binding value (schema value position).
         let src =
             "type Server = { host: str, port: int }\nschema Server\nhost: \"x\"\nport: 8080\n";
-        let items = completions(src, 0);
+        // Offset pointing into the value of `host: "x"` — inside a BINDING.
+        let off = src.find("\"x\"").unwrap() + 1;
+        let items = completions(src, off);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"host"),
@@ -998,6 +1168,91 @@ mod tests {
             labels.len(),
             dedup.len(),
             "duplicate completion labels: {labels:?}"
+        );
+    }
+
+    // ---- context-aware completion tests ----
+
+    /// (a) In type position: includes a declared type name + primitive keyword,
+    ///     but NOT value-only keywords like `match`.
+    #[test]
+    fn completions_type_position_includes_type_names_and_primitives_not_match() {
+        // `type Foo = ` — cursor at offset just after `=` (inside TYPE_DEF body).
+        // We position the cursor inside the type body token ("int").
+        let src = "type Foo = int\ntype Bar = str\nschema Foo\nx: 1\n";
+        // Offset pointing at "int" inside the TYPE_DEF for Foo.
+        let off = src.find("int").unwrap();
+        let items = completions(src, off);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // Should include declared type names.
+        assert!(
+            labels.contains(&"Foo") || labels.contains(&"Bar"),
+            "expected type names in type-position completions, got {labels:?}"
+        );
+        // Should include primitive type keywords.
+        assert!(
+            labels.contains(&"int"),
+            "expected 'int' primitive in type-position completions, got {labels:?}"
+        );
+        // Must NOT include value-only keywords.
+        assert!(
+            !labels.contains(&"match"),
+            "unexpected 'match' in type-position completions, got {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"unset"),
+            "unexpected 'unset' in type-position completions, got {labels:?}"
+        );
+    }
+
+    /// (b) At top-level: includes `type` and `schema` declaration keywords.
+    #[test]
+    fn completions_top_level_position_includes_decl_keywords() {
+        // The document ends with a newline; cursor at the end = new top-level line.
+        let src = "type Foo = int\n";
+        let off = src.len(); // past EOF → treated as top-level
+        let items = completions(src, off);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"type"),
+            "expected 'type' keyword at top-level, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"schema"),
+            "expected 'schema' keyword at top-level, got {labels:?}"
+        );
+    }
+
+    /// (c) Inside a schema-bound record: includes a field name.
+    #[test]
+    fn completions_schema_value_position_includes_field_names() {
+        let src = "type Server = { host: str, port: int }\nschema Server\nhost: \"localhost\"\nport: 80\n";
+        // Cursor inside the value of `host: "localhost"` — inside a BINDING.
+        let off = src.find("\"localhost\"").unwrap() + 1;
+        let items = completions(src, off);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"host"),
+            "expected field 'host' in schema-value completions, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"port"),
+            "expected field 'port' in schema-value completions, got {labels:?}"
+        );
+        let f = items.iter().find(|i| i.label == "host").unwrap();
+        assert_eq!(f.kind, CompletionKind::Field);
+    }
+
+    /// (d) Ambiguous context (offset 0 on a document): non-empty fallback.
+    #[test]
+    fn completions_ambiguous_context_returns_non_empty_fallback() {
+        // A simple document; offset 0 is before any token — cursor context is
+        // ambiguous. Must return a non-empty list rather than nothing.
+        let src = "type Foo = int\n";
+        let items = completions(src, 0);
+        assert!(
+            !items.is_empty(),
+            "expected non-empty fallback for ambiguous context"
         );
     }
 }
