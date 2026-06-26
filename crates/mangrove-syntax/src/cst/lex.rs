@@ -4,7 +4,6 @@
 
 use super::kind::SyntaxKind;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LosslessTok {
     pub kind: SyntaxKind,
@@ -12,7 +11,6 @@ pub struct LosslessTok {
     pub end: usize,
 }
 
-#[allow(dead_code)]
 pub fn lex_lossless(src: &str) -> Vec<LosslessTok> {
     let bytes = src.as_bytes();
     let mut out = Vec::new();
@@ -67,7 +65,6 @@ pub fn lex_lossless(src: &str) -> Vec<LosslessTok> {
 /// Recognize one significant (non-trivia) token starting at byte offset `at`.
 /// Returns `(SyntaxKind, end_byte_offset)`. Never panics — unrecognized bytes
 /// become a single-byte `ERROR` token.
-#[allow(dead_code)]
 pub fn scan_significant(src: &str, at: usize) -> (SyntaxKind, usize) {
     let bytes = src.as_bytes();
     let b = bytes[at];
@@ -157,7 +154,6 @@ fn is_ident_start(c: u8) -> bool {
     c.is_ascii_alphabetic() || c == b'_'
 }
 
-#[allow(dead_code)]
 fn is_ident_continue(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'-'
 }

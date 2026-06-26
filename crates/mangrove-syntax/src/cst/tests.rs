@@ -365,8 +365,6 @@ fn parse_cst_never_panics_on_fuzzed_garbage() {
     }
 }
 
-use super::kind::SyntaxKind;
-
 #[test]
 fn syntaxkind_all_matches_discriminants() {
     // ALL must list every variant in discriminant order, and have length __LAST.

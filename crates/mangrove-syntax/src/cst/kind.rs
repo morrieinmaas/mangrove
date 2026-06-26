@@ -92,7 +92,6 @@ pub enum SyntaxKind {
 
 impl SyntaxKind {
     /// Safe inverse of `as u16`. Returns `None` if out of range.
-    #[allow(dead_code)]
     pub fn from_u16(n: u16) -> Option<SyntaxKind> {
         (n < SyntaxKind::__LAST as u16).then(|| {
             // repr(u16), contiguous from 0 — index into the variant list.
@@ -101,7 +100,6 @@ impl SyntaxKind {
     }
 
     /// All variants in discriminant order, for `from_u16`.
-    #[allow(dead_code)]
     pub const ALL: &'static [SyntaxKind] = &[
         SyntaxKind::WHITESPACE,
         SyntaxKind::COMMENT,
@@ -181,7 +179,6 @@ impl SyntaxKind {
         SyntaxKind::PRED,
     ];
 
-    #[allow(dead_code)]
     pub fn is_trivia(self) -> bool {
         matches!(self, SyntaxKind::WHITESPACE | SyntaxKind::COMMENT)
     }
@@ -189,7 +186,6 @@ impl SyntaxKind {
 
 /// The rowan `Language` marker for Mangrove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[allow(dead_code)]
 pub enum MangroveLang {}
 
 impl rowan::Language for MangroveLang {
@@ -202,9 +198,6 @@ impl rowan::Language for MangroveLang {
     }
 }
 
-#[allow(dead_code)]
 pub type SyntaxNode = rowan::SyntaxNode<MangroveLang>;
-#[allow(dead_code)]
 pub type SyntaxToken = rowan::SyntaxToken<MangroveLang>;
-#[allow(dead_code)]
 pub type SyntaxElement = rowan::SyntaxElement<MangroveLang>;
