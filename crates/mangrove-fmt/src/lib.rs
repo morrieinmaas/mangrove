@@ -22,7 +22,7 @@ fn space_between(prev: Option<K>, next: K) -> &'static str {
     // no space before these tokens:
     if matches!(
         next,
-        COLON | COMMA | R_PAREN | L_PAREN | QUESTION // R_BRACE / R_BRACKET handled by caller (empty-block peek)
+        COLON | COMMA | R_PAREN | L_PAREN | QUESTION | DOT // R_BRACE / R_BRACKET handled by caller (empty-block peek)
     ) {
         return "";
     }
@@ -31,7 +31,7 @@ fn space_between(prev: Option<K>, next: K) -> &'static str {
     // the inner space for non-empty blocks — space_between must not double it.
     if matches!(
         prev,
-        L_PAREN | L_BRACE | L_BRACKET | AT | DOT_DOT_DOT | BANG
+        L_PAREN | L_BRACE | L_BRACKET | AT | DOT_DOT_DOT | BANG | DOT
     ) {
         return "";
     }
@@ -240,6 +240,15 @@ mod tests {
         "# lead\na: \"x\"  # trailing\n",
         "a: [1,2,3,]\n", // trailing comma — evaluable, so hash branch is used
     ];
+
+    #[test]
+    fn keeps_qualified_refs_tight() {
+        assert_eq!(format_str("a: k.Deployment\n").text, "a: k.Deployment\n");
+        assert_eq!(
+            format_str("type T = k.Probe\nschema T\nx: 1\n").text,
+            "type T = k.Probe\nschema T\nx: 1\n"
+        );
+    }
 
     #[test]
     fn normalizes_inline_spacing() {
