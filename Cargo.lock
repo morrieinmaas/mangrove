@@ -260,6 +260,7 @@ dependencies = [
 name = "mangrove-fmt"
 version = "0.1.0"
 dependencies = [
+ "mangrove-canonical",
  "mangrove-syntax",
  "rowan",
 ]
