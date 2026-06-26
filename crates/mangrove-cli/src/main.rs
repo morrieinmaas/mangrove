@@ -1,7 +1,12 @@
 //! The `mangrove` command-line tool.
-//!   `mangrove --version`       — print the version
-//!   `mangrove hash <file>`     — print the BLAKE3 content address of an L0 document
-//!   `mangrove check <file>`    — validate a document against its bound schema
+//!   `mangrove --version`            — print the version
+//!   `mangrove hash <file>`          — print the BLAKE3 content address of an L0 document
+//!   `mangrove check <file>`         — validate a document against its bound schema
+//!   `mangrove update <file>`        — resolve + pin namespaced imports into mangrove.lock
+//!   `mangrove import <file>`        — convert a YAML/TOML file to a Mangrove document
+//!   `mangrove export <file> --to`   — evaluate a document and emit YAML/TOML
+//!   `mangrove gen-openapi <spec>`   — generate Mangrove types from an OpenAPI spec
+//!   `mangrove fmt <file>…`          — format documents (--check to gate; - for stdin)
 
 use mangrove_core::error::ValidationError;
 use std::process::ExitCode;

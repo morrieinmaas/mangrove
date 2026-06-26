@@ -8,7 +8,7 @@ reduces to a single canonical value with a stable BLAKE3 content hash, so two do
 *mean* the same thing hash the same.
 
 > **Status:** v0.2.0 — an experimental, solo, spec-complete implementation. Not used in
-> production yet. The ideas (below) are the point; the polish (LSP, formatter, docs site) is not there.
+> production yet. The ideas (below) are the point; some polish (LSP, docs site) is not there.
 
 ## Why
 
@@ -92,6 +92,14 @@ port: 8443
 
 See [`examples/`](examples/) for a Kubernetes Deployment (with units, refinements, `@key` lists),
 a templated per-environment Deployment (`params` + `match` + interpolation), and a `pyproject`.
+
+## Migrating an existing project
+
+Moving a project's Kubernetes YAML, Helm charts, or pyinfra/YAML configs onto
+Mangrove is incremental and hash-verified at every step (equal `b3:` hashes ⇒
+provably the same config). See [`docs/MIGRATING.md`](docs/MIGRATING.md) for the
+phased path and [`docs/migrate.just`](docs/migrate.just) for drop-in `just`
+recipes (`import-all`, `check`, `fmt-check`, `render`, `verify`).
 
 ## Building
 

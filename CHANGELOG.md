@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Tooling
+- **`mangrove fmt`:** a deterministic, comment- and meaning-preserving formatter
+  (normalizes inline spacing and 2-space depth indentation, collapses blank
+  runs, drops trailing commas) wired into the CLI: `fmt <file>…` rewrites in
+  place, `fmt --check <file>…` exits 1 if any file would change (writes nothing,
+  for CI gates), `fmt -` formats stdin → stdout. Built on a lossless CST front
+  end, so it produces best-effort output even on parse errors.
+
 ## v0.2.0
 
 Cross-file types, recursive types, and Kubernetes interop — each milestone
