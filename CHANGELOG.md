@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.4.0
+
+The Mangrove language server — the last of the v0.3.x tooling series.
+
+### Tooling
+- **`mangrove lsp`:** a read-only, network-free language server over stdio
+  (`lsp-server`, sync), built on the lossless CST and the existing type
+  pipeline. Features: parse + schema **diagnostics**, **hover** (the declaration
+  under the cursor plus its `##` doc comment), **document symbols** (outline of
+  types / units / schema / params / fns / bindings), **semantic-token
+  highlighting** (no tree-sitter grammar — classification comes straight from the
+  CST), and **formatting** (delegates to `mangrove fmt`). Full reparse on change;
+  in-memory document store.
+- **Read-only invariant:** documents that `use` namespaced imports skip the
+  type-check stage; the server never resolves imports, fetches, or writes files.
+- **Editor integration:** a Neovim plugin (`editors/nvim/` — filetype detection
+  + native `vim.lsp` setup) and `editors/README.md`.
+
 ## v0.3.0
 
 A lossless CST front end and the `mangrove fmt` formatter built on it, plus a
