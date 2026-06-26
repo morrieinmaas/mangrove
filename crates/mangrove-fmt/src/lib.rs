@@ -208,6 +208,10 @@ pub fn format_str(src: &str) -> FormatResult {
                 } else {
                     None
                 };
+                // Trailing commas are dropped in value records/lists but KEPT in
+                // type/unit/fn/param contexts: removing one there is meaning-preserving
+                // but would trip the L3 structural-equivalence oracle (which compares raw
+                // tokens), and a trailing comma in a type definition is intentional style.
                 let in_type_ctx = tok.parent().is_some_and(|p| {
                     std::iter::once(p.clone())
                         .chain(p.ancestors())
