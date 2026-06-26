@@ -331,6 +331,40 @@ fn multiline_type_def_losslessness() {
     );
 }
 
+// ---- Task 11: error recovery ----
+
+#[test]
+fn recovers_from_a_bad_binding_and_keeps_parsing() {
+    let src = "a: @@@\nb: 2\n"; // `@@@` is garbage in value position
+    let parse = super::parse::parse_cst(src);
+    assert_eq!(parse.syntax().text().to_string(), src); // still lossless
+    assert!(!parse.errors.is_empty()); // error recorded
+    // `b: 2` still parsed as a BINDING (resynced after the newline)
+    let bindings = parse
+        .syntax()
+        .descendants()
+        .filter(|n| n.kind() == super::kind::SyntaxKind::BINDING)
+        .count();
+    assert_eq!(bindings, 2);
+}
+
+#[test]
+fn parse_cst_never_panics_on_fuzzed_garbage() {
+    for src in [
+        "",
+        "{{{{",
+        "type =",
+        ": : :",
+        "\"unterminated",
+        "a: [1, 2",
+        "}}}}",
+        "@@@\n@@@",
+    ] {
+        let p = super::parse::parse_cst(src);
+        assert_eq!(p.syntax().text().to_string(), src); // lossless even when broken
+    }
+}
+
 use super::kind::SyntaxKind;
 
 #[test]

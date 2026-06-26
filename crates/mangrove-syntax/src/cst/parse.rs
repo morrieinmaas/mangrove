@@ -77,6 +77,57 @@ impl<'a> Parser<'a> {
     fn finish(&mut self) {
         self.builder.finish_node();
     }
+
+    /// Record a parse error at the current position (line/col 0 — LSP recomputes
+    /// from byte offsets; exact position is non-critical for v0.3.0).
+    fn push_error(&mut self, msg: &str) {
+        self.errors.push(ParseError {
+            message: msg.to_string(),
+            line: 0,
+            col: 0,
+        });
+    }
+
+    /// Push an error, wrap the offending tokens in an ERROR node, and resync.
+    ///
+    /// Resync strategy:
+    /// - If `stop_at_closer` is true (inside a record/list): consume until
+    ///   NEWLINE, EOF, R_BRACE, or R_BRACKET — but do NOT consume the closer
+    ///   itself; the caller's loop will handle it.
+    /// - Otherwise (top-level / atom context): consume until NEWLINE or EOF,
+    ///   including the NEWLINE.
+    ///
+    /// Recovery always consumes ≥1 token when there is a non-closer, non-EOF
+    /// token to consume. At an immediate sync point the ERROR node may be
+    /// empty, but `parse_atom`'s caller (e.g. `parse_binding`) has already
+    /// advanced past the key/colon, so the outer loop still makes progress.
+    fn error_and_recover(&mut self, msg: &str, stop_at_closer: bool) {
+        self.push_error(msg);
+        self.start(SyntaxKind::ERROR);
+        loop {
+            match self.current() {
+                SyntaxKind::EOF => break,
+                SyntaxKind::NEWLINE => {
+                    if stop_at_closer {
+                        // Don't consume the newline — leave it as separator for
+                        // the enclosing container loop.
+                        break;
+                    } else {
+                        self.bump(); // consume the newline, then stop
+                        break;
+                    }
+                }
+                SyntaxKind::R_BRACE | SyntaxKind::R_BRACKET if stop_at_closer => {
+                    // Don't consume the closer — the container loop owns it.
+                    break;
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        self.finish(); // ERROR node
+    }
 }
 
 fn rowan_kind(k: SyntaxKind) -> rowan::SyntaxKind {
@@ -286,11 +337,16 @@ fn parse_binding(p: &mut Parser) {
     if p.current() == SyntaxKind::COLON {
         p.bump();
     }
-    parse_atom(p);
+    parse_atom(p, false);
     p.finish();
 }
 
-fn parse_atom(p: &mut Parser) {
+/// Parse a value expression.
+///
+/// `stop_at_closer`: when `true` (inside a record or list), the error-recovery
+/// sync boundary also includes `R_BRACE` and `R_BRACKET` — the container's
+/// closer must NOT be consumed by recovery.
+fn parse_atom(p: &mut Parser, stop_at_closer: bool) {
     match p.current() {
         SyntaxKind::L_BRACE => parse_record(p),
         SyntaxKind::L_BRACKET => parse_list(p),
@@ -328,8 +384,7 @@ fn parse_atom(p: &mut Parser) {
             }
         }
         _ => {
-            // Task 11 turns this into recovery; for now consume one token as ERROR-ish.
-            p.bump();
+            p.error_and_recover("unexpected token in value position", stop_at_closer);
         }
     }
 }
@@ -349,12 +404,11 @@ fn parse_record(p: &mut Parser) {
                 if p.current() == SyntaxKind::COLON {
                     p.bump(); // COLON
                 }
-                parse_atom(p); // value
+                parse_atom(p, true); // value — stop_at_closer=true: don't eat }
                 p.finish(); // FIELD
             }
             _ => {
-                // Unknown token — bump to avoid infinite loop; Task 11 adds recovery.
-                p.bump();
+                p.error_and_recover("unexpected token in record", true);
             }
         }
     }
@@ -372,7 +426,7 @@ fn parse_list(p: &mut Parser) {
                 p.bump(); // separator — stays in tree for losslessness
             }
             _ => {
-                parse_atom(p); // element value (recurses for nested composites)
+                parse_atom(p, true); // element value — stop_at_closer=true: don't eat ]
             }
         }
     }
@@ -395,7 +449,7 @@ fn parse_list_op_item(p: &mut Parser) {
     match p.current() {
         SyntaxKind::PLUS_EQ => {
             p.bump(); // +=
-            parse_atom(p); // value (typically a list)
+            parse_atom(p, false); // value (typically a list)
         }
         SyntaxKind::L_BRACE => {
             // key { patch/append/remove ops } — consume the whole brace block + newline
