@@ -200,6 +200,78 @@ pub(crate) fn parse_typedef_str(src: &str) -> Result<TypeDef, ParseError> {
     Parser { tokens, pos: 0 }.parse_typedef()
 }
 
+/// Parse a single value expression from a text slice.
+/// Used by CST lowering to decode templating constructs.
+pub(crate) fn parse_value_str(src: &str) -> Result<Value, ParseError> {
+    let tokens = lex(src).map_err(|e| ParseError {
+        message: e.message,
+        line: e.line,
+        col: e.col,
+    })?;
+    Parser { tokens, pos: 0 }.parse_value(0)
+}
+
+/// Parse a single body statement (`key: v`, `...alias`, `key += v`, `key { ops }`)
+/// from a text slice. Used by CST lowering to decode LIST_OP_ITEM and SPREAD nodes.
+pub(crate) fn parse_stmt_str(src: &str) -> Result<Stmt, ParseError> {
+    let tokens = lex(src).map_err(|e| ParseError {
+        message: e.message,
+        line: e.line,
+        col: e.col,
+    })?;
+    let mut p = Parser { tokens, pos: 0 };
+    p.skip_seps();
+    if p.at_eof() {
+        return Err(ParseError {
+            message: "empty statement".into(),
+            line: 0,
+            col: 0,
+        });
+    }
+    if p.check(&Tok::DotDotDot) {
+        p.advance();
+        match p.peek().tok.clone() {
+            Tok::Bareword(n) => {
+                p.advance();
+                return Ok(Stmt::Spread(n));
+            }
+            other => {
+                return Err(p.error(format!("expected spread alias, found {other:?}")));
+            }
+        }
+    }
+    let key = match p.peek().tok.clone() {
+        Tok::Bareword(n) => {
+            p.advance();
+            n
+        }
+        Tok::Str(n) => {
+            p.advance();
+            n
+        }
+        other => return Err(p.error(format!("expected key, found {other:?}"))),
+    };
+    match p.peek().tok.clone() {
+        Tok::Colon => {
+            p.advance();
+            let value = p.parse_value(0)?;
+            Ok(Stmt::Bind(key, value))
+        }
+        Tok::PlusEq => {
+            p.advance();
+            let value = p.parse_value(0)?;
+            Ok(Stmt::Append(key, value))
+        }
+        Tok::LBrace => {
+            let items = p.parse_list_op_block()?;
+            Ok(Stmt::ListOp(key, items))
+        }
+        other => Err(p.error(format!(
+            "expected ':', '+=', or '{{' after key, found {other:?}"
+        ))),
+    }
+}
+
 /// Parse a complete document (typedefs + schema + body).
 pub fn parse_document(src: &str) -> Result<Document, ParseError> {
     let tokens = lex(src).map_err(|e| ParseError {

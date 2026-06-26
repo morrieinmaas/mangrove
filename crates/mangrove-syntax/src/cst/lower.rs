@@ -3,7 +3,8 @@
 
 use super::super::parser::{
     Document, FnDef, Param, ParseError, Stmt, TypeDef, UnitDef, Use, parse_fndef_str,
-    parse_params_str, parse_type, parse_typedef_str, parse_unitdef_str, parse_use_str,
+    parse_params_str, parse_stmt_str, parse_type, parse_typedef_str, parse_unitdef_str,
+    parse_use_str, parse_value_str,
 };
 use super::kind::{SyntaxKind, SyntaxNode, SyntaxToken};
 use crate::ty::Type;
@@ -31,6 +32,18 @@ pub fn lower(node: &SyntaxNode) -> Result<Document, ParseError> {
                 if !matches!(value, Value::Unset) {
                     map.insert(key, value);
                 }
+            }
+            SyntaxKind::SPREAD => {
+                let text = node_text(&child);
+                let stmt = parse_stmt_str(text.trim())?;
+                stmts.push(stmt);
+                // NOT folded into body map
+            }
+            SyntaxKind::LIST_OP_ITEM => {
+                let text = node_text(&child);
+                let stmt = parse_stmt_str(text.trim())?;
+                stmts.push(stmt);
+                // NOT folded into body map
             }
             SyntaxKind::USE_DECL => {
                 let text = node_text(&child);
@@ -179,9 +192,13 @@ fn lower_binding(node: &SyntaxNode) -> Result<(String, Value), ParseError> {
     })
 }
 
-/// Lower a RECORD or LIST node into a `Value`.
+/// Lower a RECORD, LIST, or templating-construct node into a `Value`.
 fn lower_composite(node: &SyntaxNode) -> Result<Value, ParseError> {
     match node.kind() {
+        SyntaxKind::REF | SyntaxKind::UNSET | SyntaxKind::MATCH_EXPR | SyntaxKind::CALL => {
+            let text = node_text(node);
+            parse_value_str(text.trim())
+        }
         SyntaxKind::RECORD => {
             let mut map = BTreeMap::new();
             for child in node.children() {

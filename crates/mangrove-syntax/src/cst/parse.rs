@@ -117,8 +117,17 @@ fn parse_document(p: &mut Parser) {
             parse_fn_def(p);
         } else if is_decl_keyword(p, "schema") && lookahead_is_bareword(p) {
             parse_schema_decl(p);
+        } else if p.current() == SyntaxKind::DOT_DOT_DOT {
+            parse_spread(p);
         } else {
-            parse_binding(p);
+            let second = nth_sig(p, 1);
+            if (p.current() == SyntaxKind::BAREWORD || p.current() == SyntaxKind::STR)
+                && (second == SyntaxKind::PLUS_EQ || second == SyntaxKind::L_BRACE)
+            {
+                parse_list_op_item(p);
+            } else {
+                parse_binding(p);
+            }
         }
     }
 }
@@ -292,6 +301,32 @@ fn parse_atom(p: &mut Parser) {
         | SyntaxKind::UNIT_LIT
         | SyntaxKind::INTERP_STR
         | SyntaxKind::BYTES => p.bump(),
+        SyntaxKind::BAREWORD => {
+            let bw_text = current_bareword_text(p);
+            match bw_text.as_deref() {
+                Some("unset") => {
+                    p.start(SyntaxKind::UNSET);
+                    p.bump();
+                    p.finish();
+                }
+                Some("match") => {
+                    p.start(SyntaxKind::MATCH_EXPR);
+                    consume_through_newline_at_depth_0(p);
+                    p.finish();
+                }
+                _ if nth_sig(p, 1) == SyntaxKind::L_PAREN => {
+                    p.start(SyntaxKind::CALL);
+                    p.bump(); // name
+                    consume_paren_block(p);
+                    p.finish();
+                }
+                _ => {
+                    p.start(SyntaxKind::REF);
+                    p.bump();
+                    p.finish();
+                }
+            }
+        }
         _ => {
             // Task 11 turns this into recovery; for now consume one token as ERROR-ish.
             p.bump();
@@ -343,4 +378,68 @@ fn parse_list(p: &mut Parser) {
     }
     p.bump(); // R_BRACKET (or no-op at EOF)
     p.finish(); // LIST
+}
+
+fn parse_spread(p: &mut Parser) {
+    p.start(SyntaxKind::SPREAD);
+    p.bump(); // DOT_DOT_DOT
+    if p.current() == SyntaxKind::BAREWORD {
+        p.bump(); // alias
+    }
+    p.finish();
+}
+
+fn parse_list_op_item(p: &mut Parser) {
+    p.start(SyntaxKind::LIST_OP_ITEM);
+    p.bump(); // key (BAREWORD or STR)
+    match p.current() {
+        SyntaxKind::PLUS_EQ => {
+            p.bump(); // +=
+            parse_atom(p); // value (typically a list)
+        }
+        SyntaxKind::L_BRACE => {
+            // key { patch/append/remove ops } — consume the whole brace block + newline
+            consume_through_newline_at_depth_0(p);
+        }
+        _ => {}
+    }
+    p.finish();
+}
+
+/// Get the text of the current significant BAREWORD token, without consuming it.
+fn current_bareword_text(p: &Parser) -> Option<String> {
+    let mut i = p.pos;
+    while i < p.toks.len() && p.toks[i].kind.is_trivia() {
+        i += 1;
+    }
+    if i < p.toks.len() && p.toks[i].kind == SyntaxKind::BAREWORD {
+        Some(p.src[p.toks[i].start..p.toks[i].end].to_string())
+    } else {
+        None
+    }
+}
+
+/// Consume a parenthesized block `(...)`, already positioned at the opening `(`.
+fn consume_paren_block(p: &mut Parser) {
+    p.bump(); // `(`
+    let mut depth = 1usize;
+    loop {
+        match p.current() {
+            SyntaxKind::EOF => break,
+            SyntaxKind::L_PAREN => {
+                depth += 1;
+                p.bump();
+            }
+            SyntaxKind::R_PAREN => {
+                depth -= 1;
+                p.bump();
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {
+                p.bump();
+            }
+        }
+    }
 }

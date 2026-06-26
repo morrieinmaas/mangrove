@@ -169,9 +169,70 @@ fn oracle_example_pyproject() {
     assert_document_equivalent(&src);
 }
 
-// k8s-templated.mang uses Value::Ref, Value::Match, and params — deferred to Task 10.
-// #[test]
-// fn oracle_example_k8s_templated() { ... }
+// ---- Task 10: templating constructs + corpus gate ----
+
+fn assert_document_equivalent_file(path: &std::path::Path, src: &str) {
+    let legacy = super::super::parse_document(src);
+    let cst = super::lower::lower(&super::parse::parse_cst(src).syntax());
+    match (legacy, cst) {
+        (Ok(l), Ok(c)) => assert_eq!(l, c, "document mismatch for file {:?}", path),
+        (Err(_), Err(_)) => {}
+        (l, r) => panic!("legacy vs cst disagree for file {:?}: {l:?} / {r:?}", path),
+    }
+}
+
+#[test]
+fn oracle_example_k8s_templated() {
+    let p =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/k8s-templated.mang");
+    let src = std::fs::read_to_string(&p).unwrap();
+    assert_document_equivalent(&src);
+}
+
+#[test]
+fn oracle_templating_constructs() {
+    // reference: b references a
+    assert_document_equivalent("a: 1\nb: a\n");
+    // unset
+    assert_document_equivalent("a: unset\n");
+    // spread (from parser.rs test at line 1538)
+    assert_document_equivalent("use \"./base.mang\" as base\n...base\nport: 9090\ndebug: unset\n");
+    // match expression (from k8s-templated.mang)
+    assert_document_equivalent(
+        "params {\n  env: \"dev\" | \"staging\" | \"prod\" = \"prod\"\n}\nschema Deployment\nreplicas: match env { dev: 1, staging: 2, prod: 6 }\n",
+    );
+    // ref inside a record
+    assert_document_equivalent(
+        "params {\n  env: str = \"prod\"\n}\nschema T\nmetadata: {\n  labels: { env: env }\n}\n",
+    );
+}
+
+#[test]
+fn oracle_list_ops() {
+    // Append: key += [value, ...]
+    assert_document_equivalent(
+        "use \"./base.mang\" as base\n...base\nports += [ { containerPort: 9090, name: \"grpc\" } ]\n",
+    );
+    // ListOp block (patch/append/remove)
+    assert_document_equivalent(
+        "use \"./base.mang\" as base\n...base\ncontainers { append: { name: \"sidecar\", image: \"envoy:1\" } }\n",
+    );
+}
+
+#[test]
+fn cst_matches_legacy_over_the_example_corpus() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut n = 0;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().and_then(|s| s.to_str()) == Some("mang") {
+            let src = std::fs::read_to_string(&p).unwrap();
+            assert_document_equivalent_file(&p, &src);
+            n += 1;
+        }
+    }
+    assert!(n >= 3, "expected the example corpus, found {n}");
+}
 
 // ---- Task 9: full type-grammar equivalence coverage ----
 
