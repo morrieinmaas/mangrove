@@ -8,7 +8,6 @@ repository.workspace = true
 
 [dependencies]
 mangrove-syntax = { path = "../mangrove-syntax" }
-rowan = { workspace = true }
 
 [dev-dependencies]
 mangrove-canonical = { path = "../mangrove-canonical" }

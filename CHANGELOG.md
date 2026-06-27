@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.5.1
+
+Robustness fixes for the CST front end (and therefore `mangrove fmt` and the
+LSP), found by an adversarial whole-arc review.
+
+### Fixed
+- **No panic on non-ASCII tokens.** The lossless lexer's error-recovery fallback
+  advanced one byte at a time, slicing multi-byte UTF-8 (e.g. a stray `é` or an
+  emoji in token position) at a non-char boundary and panicking. It now advances a
+  whole codepoint. `mangrove fmt` on such a file formats cleanly instead of crashing.
+- **No infinite loop on mismatched closers.** A foreign closer inside a container
+  (e.g. `x: [ } ]`) made error recovery break while consuming zero tokens, spinning
+  forever. Records and lists now consume a foreign closer into an error node,
+  guaranteeing progress; the tree stays lossless.
+
+### Internal
+- Added a corpus-wide assertion that the CST's per-token `SyntaxKind` matches the
+  legacy lexer (closes an equivalence-oracle blind spot, since the LSP branches on
+  token kinds). Dropped an unused `rowan` dependency from `mangrove-fmt`.
+
 ## v0.5.0
 
 LSP feature round: completion gets smarter and the server gains navigation and
