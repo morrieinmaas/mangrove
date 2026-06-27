@@ -144,9 +144,13 @@ pub fn scan_significant(src: &str, at: usize) -> (SyntaxKind, usize) {
         b'b' if bytes.get(at..at + 4) == Some(b"b64\"") => scan_bytes_literal(bytes, at),
         b'-' | b'0'..=b'9' => scan_number(bytes, at),
         c if is_ident_start(c) => scan_bareword(bytes, at),
-        // Any unrecognized byte (incl. multi-byte UTF-8 lead bytes) → ERROR for that byte.
-        // We step one byte at a time to stay lossless.
-        _ => (SyntaxKind::ERROR, at + 1),
+        // Any unrecognized codepoint → ERROR spanning the whole codepoint so we
+        // never slice a `str` mid-char boundary. Multi-byte UTF-8 lead bytes must
+        // advance by the full char width, not just 1 byte.
+        _ => {
+            let w = src[at..].chars().next().map_or(1, |c| c.len_utf8());
+            (SyntaxKind::ERROR, at + w)
+        }
     }
 }
 

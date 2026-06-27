@@ -407,6 +407,16 @@ fn parse_record(p: &mut Parser) {
                 parse_atom(p, true); // value — stop_at_closer=true: don't eat }
                 p.finish(); // FIELD
             }
+            // Foreign closers (R_BRACKET, R_PAREN) inside a record: error_and_recover
+            // with stop_at_closer=true would break without consuming them, causing an
+            // infinite loop. Consume the token explicitly into an ERROR node so the
+            // loop always makes progress.
+            SyntaxKind::R_BRACKET | SyntaxKind::R_PAREN => {
+                p.push_error("unexpected closer in record");
+                p.start(SyntaxKind::ERROR);
+                p.bump(); // consume the foreign closer
+                p.finish();
+            }
             _ => {
                 p.error_and_recover("unexpected token in record", true);
             }
@@ -424,6 +434,16 @@ fn parse_list(p: &mut Parser) {
             SyntaxKind::R_BRACKET | SyntaxKind::EOF => break,
             SyntaxKind::COMMA | SyntaxKind::NEWLINE => {
                 p.bump(); // separator — stays in tree for losslessness
+            }
+            // Foreign closers (R_BRACE, R_PAREN) inside a list: parse_atom calls
+            // error_and_recover with stop_at_closer=true, which breaks without
+            // consuming them, causing an infinite loop. Consume the token explicitly
+            // into an ERROR node so the loop always makes progress.
+            SyntaxKind::R_BRACE | SyntaxKind::R_PAREN => {
+                p.push_error("unexpected closer in list");
+                p.start(SyntaxKind::ERROR);
+                p.bump(); // consume the foreign closer
+                p.finish();
             }
             _ => {
                 parse_atom(p, true); // element value — stop_at_closer=true: don't eat ]

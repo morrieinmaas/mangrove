@@ -359,9 +359,166 @@ fn parse_cst_never_panics_on_fuzzed_garbage() {
         "a: [1, 2",
         "}}}}",
         "@@@\n@@@",
+        // C1 inputs: foreign closer inside container — previously caused infinite loop.
+        // RED evidence: before the fix, these hang; run under timeout to confirm.
+        "x: [ } ]\n",
+        "x: { ] }\n",
+        "[ }",
+        "{ ]",
     ] {
         let p = super::parse::parse_cst(src);
         assert_eq!(p.syntax().text().to_string(), src); // lossless even when broken
+    }
+}
+
+// ---- C2: non-ASCII tokens must not panic ----
+
+/// C2: parse_cst must NOT panic and must be lossless for inputs containing non-ASCII
+/// characters in token position (multi-byte UTF-8 lead bytes hit the ERROR fallback in
+/// scan_significant; the fix advances by the full char width instead of 1 byte).
+#[test]
+fn parse_cst_non_ascii_tokens_no_panic_and_lossless() {
+    for src in [
+        "é: 1\n",    // 2-byte UTF-8 lead byte (U+00E9) as key
+        "café: 1\n", // multi-char key with non-ASCII
+        "💀: 1\n",   // 4-byte astral codepoint (U+1F480)
+        "a: ☃\n",    // non-ASCII in value position (U+2603)
+    ] {
+        let p = super::parse::parse_cst(src);
+        assert_eq!(
+            p.syntax().text().to_string(),
+            src,
+            "parse_cst must be lossless for non-ASCII input {src:?}"
+        );
+    }
+}
+
+// ---- I1: CST SyntaxKind must match legacy lexer Tok kind for significant tokens ----
+
+/// I1: For each significant (non-trivia) CST token, its SyntaxKind must agree with
+/// the kind that the legacy lexer assigns to that same text when re-lexed in isolation.
+/// This catches wrong-SyntaxKind bugs that the document-equivalence oracle misses
+/// (because lower.rs delegates leaf decoding back to the legacy lexer).
+#[test]
+fn cst_token_kinds_match_legacy_lexer_over_corpus() {
+    use super::super::lexer::{Tok, lex};
+    use super::kind::SyntaxKind;
+
+    fn tok_to_expected_syntax_kind(tok: &Tok) -> Option<SyntaxKind> {
+        match tok {
+            Tok::LBrace => Some(SyntaxKind::L_BRACE),
+            Tok::RBrace => Some(SyntaxKind::R_BRACE),
+            Tok::LBracket => Some(SyntaxKind::L_BRACKET),
+            Tok::RBracket => Some(SyntaxKind::R_BRACKET),
+            Tok::LParen => Some(SyntaxKind::L_PAREN),
+            Tok::RParen => Some(SyntaxKind::R_PAREN),
+            Tok::Colon => Some(SyntaxKind::COLON),
+            Tok::Comma => Some(SyntaxKind::COMMA),
+            Tok::Newline => Some(SyntaxKind::NEWLINE),
+            Tok::Amp => Some(SyntaxKind::AMP),
+            Tok::Pipe => Some(SyntaxKind::PIPE),
+            Tok::Eq => Some(SyntaxKind::EQ),
+            Tok::Match => Some(SyntaxKind::MATCH),
+            Tok::Question => Some(SyntaxKind::QUESTION),
+            Tok::Ge => Some(SyntaxKind::GE),
+            Tok::Le => Some(SyntaxKind::LE),
+            Tok::Gt => Some(SyntaxKind::GT),
+            Tok::Lt => Some(SyntaxKind::LT),
+            Tok::Star => Some(SyntaxKind::STAR),
+            Tok::At => Some(SyntaxKind::AT),
+            Tok::Dot => Some(SyntaxKind::DOT),
+            Tok::DotDotDot => Some(SyntaxKind::DOT_DOT_DOT),
+            Tok::EqEq => Some(SyntaxKind::EQ_EQ),
+            Tok::Ne => Some(SyntaxKind::NE),
+            Tok::Bang => Some(SyntaxKind::BANG),
+            Tok::AmpAmp => Some(SyntaxKind::AMP_AMP),
+            Tok::PipePipe => Some(SyntaxKind::PIPE_PIPE),
+            Tok::PlusEq => Some(SyntaxKind::PLUS_EQ),
+            Tok::Int(_) => Some(SyntaxKind::INT),
+            Tok::Decimal(_) => Some(SyntaxKind::DECIMAL),
+            Tok::UnitLit(_, _) => Some(SyntaxKind::UNIT_LIT),
+            Tok::Str(_) => Some(SyntaxKind::STR),
+            Tok::InterpStr(_) => Some(SyntaxKind::STR), // CST emits STR for interp strings too
+            Tok::Bool(_) => Some(SyntaxKind::BOOL),
+            Tok::Bytes(_) => Some(SyntaxKind::BYTES),
+            Tok::Bareword(_) => Some(SyntaxKind::BAREWORD),
+            Tok::Doc(_) => Some(SyntaxKind::DOC),
+            Tok::Directive(_) => Some(SyntaxKind::DIRECTIVE),
+            Tok::Eof => None, // skip
+        }
+    }
+
+    fn check_src(src: &str) {
+        // Walk CST significant tokens and re-lex each token text in isolation.
+        let parse = super::parse::parse_cst(src);
+        let root = parse.syntax();
+        for tok in root
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+        {
+            let sk = tok.kind();
+            if sk.is_trivia() || sk == SyntaxKind::EOF || sk == SyntaxKind::ERROR {
+                continue;
+            }
+            // Skip node-level kinds and structural kinds that the legacy lexer
+            // doesn't produce as standalone tokens (NEWLINE is produced but
+            // skip it as it appears in both CST and legacy consistently).
+            let text = tok.text();
+            // Re-lex the token text in isolation via the legacy lexer.
+            // The legacy lexer skips whitespace, so we need the raw text.
+            // Append a space to prevent the legacy lexer from merging tokens.
+            let probe = format!("{text} ");
+            let Ok(legacy_toks) = lex(&probe) else {
+                // Legacy lexer errors on unknown bytes — that's fine, CST emits ERROR for those.
+                // If CST emitted a non-ERROR kind for something the legacy lexer rejects, skip.
+                continue;
+            };
+            // legacy_toks: [significant_token, Eof] (whitespace skipped)
+            // or [Newline, Eof] for newlines
+            let first_legacy = legacy_toks.first().map(|t| &t.tok);
+            let Some(first_legacy) = first_legacy else {
+                continue;
+            };
+            if matches!(first_legacy, Tok::Eof) {
+                continue;
+            }
+
+            if let Some(expected_sk) = tok_to_expected_syntax_kind(first_legacy) {
+                assert_eq!(
+                    sk, expected_sk,
+                    "CST token kind mismatch for text {text:?}: CST={sk:?}, legacy expects {expected_sk:?}"
+                );
+            }
+        }
+    }
+
+    // Inline fixtures covering each significant token kind
+    for src in [
+        "port: 8443\n",
+        "x: 0.25\n",
+        "x: 512Mi\n",
+        "x: \"hello\"\n",
+        "x: true\n",
+        "x: false\n",
+        "x: b64\"aGVsbG8=\"\n",
+        "x: schema\n",
+        "x: [ 1, 2 ]\n",
+        "x: { a: 1 }\n",
+        "type T = int & >= 1\n",
+        "x: y\n",
+        "x: unset\n",
+    ] {
+        check_src(src);
+    }
+
+    // Corpus: all example .mang files
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().and_then(|s| s.to_str()) == Some("mang") {
+            let src = std::fs::read_to_string(&p).unwrap();
+            check_src(&src);
+        }
     }
 }
 
