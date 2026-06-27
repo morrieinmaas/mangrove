@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.5.0
+
+LSP feature round: completion gets smarter and the server gains navigation and
+refactoring. All additions are pure CST/Document analysis — the read-only,
+no-network invariant still holds (cross-file navigation only *reads* local files
+resolved via the committed lockfile; it never fetches).
+
+### Tooling — `mangrove lsp`
+- **Context-aware completion:** offers items by cursor position — type/unit names
+  in type position, declaration keywords at top level, the bound schema's record
+  fields inside a record, value keywords in value position (with a non-empty union
+  fallback when context is ambiguous).
+- **Find-references** and **rename** (local / same-file): both confined to the
+  symbol under the cursor — type/unit names vs value bindings/params are kept
+  disjoint by CST context, so a rename never touches a same-named record field key.
+  Rename returns a `WorkspaceEdit`; the server writes nothing.
+- **Cross-file go-to-definition:** jumps into an imported package's type/unit
+  declaration (`alias.Type`) by resolving the import to a local file via the
+  committed lockfile (read-only) — returns nothing rather than fetching when the
+  package isn't present locally; git-backed namespaces are never fetched.
+
 ## v0.4.0
 
 The Mangrove language server — the last of the v0.3.x tooling series.

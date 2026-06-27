@@ -2,7 +2,8 @@
 
 The Mangrove language server (`mangrove lsp`) is a read-only, network-free LSP
 over stdio. It provides diagnostics (parse + schema errors), hover, document
-symbols, semantic-token highlighting, go-to-definition, completion, and formatting (via `mangrove fmt`).
+symbols, semantic-token highlighting, context-aware completion, go-to-definition
+(local and cross-file into imported types), find-references, rename, and formatting (via `mangrove fmt`).
 
 > Highlighting note: Mangrove ships **no tree-sitter grammar** — syntax
 > highlighting comes from the LSP's semantic tokens. A `.mang` file has no
@@ -23,7 +24,7 @@ symbols, semantic-token highlighting, go-to-definition, completion, and formatti
    ```
 
 That starts `mangrove lsp` for every `.mang` buffer. Diagnostics, hover
-(`K`), document symbols, go-to-definition, completion, and `vim.lsp.buf.format()` work out of the box;
+(`K`), document symbols, go-to-definition, find-references, rename, completion, and `vim.lsp.buf.format()` work out of the box;
 semantic-token highlighting is enabled automatically.
 
 Custom binary path:

@@ -7,7 +7,7 @@ and **templating** (L3), on top of a supply-chain layer for verified imports. Ev
 reduces to a single canonical value with a stable BLAKE3 content hash, so two documents that
 *mean* the same thing hash the same.
 
-> **Status:** v0.4.0 — an experimental, solo, spec-complete implementation with a
+> **Status:** v0.5.0 — an experimental, solo, spec-complete implementation with a
 > formatter and a language server. Not used in production yet. The ideas (below) are
 > the point; a hosted docs site and broad editor packaging are still to come.
 
@@ -77,7 +77,8 @@ mangrove lsp                           # run the language server over stdio (for
 
 `mangrove lsp` is a read-only, network-free [language server](editors/README.md):
 diagnostics (parse + schema errors), hover, document symbols, semantic-token
-highlighting, and formatting. A Neovim setup lives in [`editors/nvim/`](editors/nvim/);
+highlighting, formatting, context-aware completion, go-to-definition (local and
+cross-file into imported types), find-references, and rename. A Neovim setup lives in [`editors/nvim/`](editors/nvim/);
 any LSP client can launch `mangrove lsp`. (No tree-sitter grammar — highlighting
 comes from the server's semantic tokens.)
 
