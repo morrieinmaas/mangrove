@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.7.1
+
+Robustness fix from a whole-arc adversarial review.
+
+### Fixed
+- **No stack overflow on deeply nested values.** The CST's value parser recursed
+  without a depth limit, so a deeply nested input (e.g. `x: ` followed by tens of
+  thousands of `[`) overflowed the stack and aborted the process — uncatchable, so
+  it would crash `mangrove fmt` and the LSP server. Value nesting is now bounded
+  (depth 128, matching the evaluator's limit); past the cap the remainder is
+  consumed into an error node, keeping the tree lossless. Normal documents are
+  unaffected.
+
+### Docs
+- README status line corrected to the current version; fixed the Zed
+  `brackets` config (it must be an array of bracket pairs, not a boolean).
+
 ## v0.7.0
 
 LSP completion polish, an import-read cache, and a Zed editor extension. Still
