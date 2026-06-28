@@ -7,6 +7,6 @@ pub mod ty;
 
 pub use parser::{
     Document, FnDef, ListOpItem, Param, ParseError, Stmt, TypeDef, UnitDef, Use, parse,
-    parse_document, parse_type,
+    parse_document, parse_type, parse_use_str,
 };
 pub use ty::{Annotation, CmpOp, FieldDef, Operand, Pred, Require, Type};

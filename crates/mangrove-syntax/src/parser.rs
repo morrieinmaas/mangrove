@@ -150,7 +150,7 @@ pub struct Document {
 // on the full source (which would make the oracle tautological).
 
 /// Parse a `use "path" as alias` declaration from a node's text slice.
-pub(crate) fn parse_use_str(src: &str) -> Result<Use, ParseError> {
+pub fn parse_use_str(src: &str) -> Result<Use, ParseError> {
     let tokens = lex(src).map_err(|e| ParseError {
         message: e.message,
         line: e.line,

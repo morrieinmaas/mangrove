@@ -648,10 +648,9 @@ pub fn goto_definition_cross_file(
     // Check for qualified ref pattern: alias.TypeName
     let (alias, type_name) = detect_qualified_ref(&root, &tok)?;
 
-    // Find the `use "ref" as alias` declaration.
-    let doc = lower(&root).ok()?;
-    let use_decl = doc.uses.iter().find(|u| u.alias == alias)?;
-    let reference = use_decl.path.clone();
+    // Resolve the use alias directly from the CST so that documents which fail
+    // to lower (e.g. a bareword in value position: `x: inf.Widget`) still work.
+    let reference = use_reference_for_alias(&root, &alias)?;
 
     // Resolve to local path (no-fetch).
     let doc_dir = doc_path.parent()?;
@@ -671,6 +670,23 @@ pub fn goto_definition_cross_file(
     let byte_range = find_type_decl(&pkg_root, &type_name)?;
 
     Some((pkg_path, byte_range, pkg_text))
+}
+
+/// Walk `USE_DECL` nodes in the CST and return the path of the one whose alias
+/// matches. This avoids calling `lower()`, which fails on partially-invalid
+/// documents (e.g. a bareword in value position such as `x: inf.Widget`).
+fn use_reference_for_alias(root: &SyntaxNode, alias: &str) -> Option<String> {
+    for child in root.children() {
+        if child.kind() == SyntaxKind::USE_DECL {
+            let text = child.text().to_string();
+            if let Ok(u) = mangrove_syntax::parse_use_str(text.trim()) {
+                if u.alias == alias {
+                    return Some(u.path);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Detect if the token is part of an `alias.TypeName` pattern.
@@ -2176,6 +2192,43 @@ mod tests {
             result.is_none(),
             "expected None for missing package, got {:?}",
             result.as_ref().map(|(p, _, _)| p)
+        );
+    }
+
+    // RED test: a document that has a use decl plus a value-position qualified ref
+    // (`x: inf.Widget`) causes lower() to fail because barewords are not valid
+    // scalar values.  The cursor is on a *different* `inf.SomeType` occurrence in
+    // type position; the CST-based alias lookup must find the use decl regardless.
+    #[test]
+    fn goto_definition_cross_file_works_when_lower_fails() {
+        let dir = scratch_dir();
+        write_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_fixture(&dir, "vendor/pkg.mang", "type SomeType = int\n");
+        // The binding `x: inf.Widget` puts a bareword in value position — lower()
+        // cannot decode `inf` as a scalar and returns Err, so the old
+        // lower(&root).ok()? path would return None for the whole goto call.
+        let main_src = "use \"ns/pkg@v1\" as inf\nx: inf.Widget\ntype Local = inf.SomeType\n";
+        let main_path = dir.join("main.mang");
+        // Cursor on "SomeType" in the type-position occurrence.
+        let off = main_src.rfind("SomeType").unwrap();
+        let result = goto_definition_cross_file(main_src, off, &main_path);
+        assert!(
+            result.is_some(),
+            "expected cross-file goto to resolve even when lower() fails, got None"
+        );
+        let (file_path, (start, end), file_text) = result.unwrap();
+        assert!(
+            file_path.ends_with("pkg.mang"),
+            "expected to resolve to pkg.mang, got {file_path:?}"
+        );
+        let snip = &file_text[start..end];
+        assert!(
+            snip.contains("SomeType"),
+            "expected definition range to cover SomeType, got {snip:?}"
         );
     }
 
