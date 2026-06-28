@@ -275,7 +275,7 @@ pub fn semantic_tokens(src: &str) -> Vec<SemToken> {
         let k = tok.kind();
         let kind = match k {
             SyntaxKind::COMMENT | SyntaxKind::DOC | SyntaxKind::DIRECTIVE => SemKind::Comment,
-            SyntaxKind::STR | SyntaxKind::INTERP_STR | SyntaxKind::BYTES => SemKind::String,
+            SyntaxKind::STR => SemKind::String, // INTERP_STR / BYTES are reserved — never emitted
             SyntaxKind::INT | SyntaxKind::DECIMAL => SemKind::Number,
             SyntaxKind::UNIT_LIT => SemKind::Unit,
             SyntaxKind::BOOL => SemKind::Keyword,
@@ -1242,6 +1242,8 @@ fn cursor_context(root: &SyntaxNode, offset: usize) -> CursorContext {
                 return CursorContext::SchemaValuePosition;
             }
             // Inside a match expression, call, list, etc. → general value.
+            // (MATCH_ARM is reserved/unemitted in v0.3.0; kept here so the match
+            // stays extensible when the structured parser lands it.)
             SyntaxKind::MATCH_EXPR
             | SyntaxKind::MATCH_ARM
             | SyntaxKind::CALL

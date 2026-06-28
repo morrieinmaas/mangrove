@@ -3,11 +3,11 @@
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{
-    DidOpenTextDocumentParams, HoverParams, InitializeParams, InitializedParams, Position,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
-    WorkDoneProgressParams,
+    DidOpenTextDocumentParams, GotoDefinitionParams, HoverParams, InitializeParams,
+    InitializedParams, Position, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Uri, WorkDoneProgressParams,
     notification::{DidOpenTextDocument, Exit, Initialized, Notification as _},
-    request::{HoverRequest, Initialize, Request as _, Shutdown},
+    request::{GotoDefinition, HoverRequest, Initialize, Request as _, Shutdown},
 };
 use std::thread;
 
@@ -248,6 +248,140 @@ fn namespaced_import_skips_typecheck_no_panic() {
         params.diagnostics.is_empty(),
         "namespaced import doc must yield no diagnostics, got: {:?}",
         params.diagnostics
+    );
+
+    // shutdown
+    let shutdown_id = RequestId::from(99);
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            shutdown_id.clone(),
+            Shutdown::METHOD.to_string(),
+            serde_json::Value::Null,
+        )))
+        .unwrap();
+    recv_response(&client, &shutdown_id);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            Exit::METHOD.to_string(),
+            serde_json::Value::Null,
+        )))
+        .unwrap();
+    server_thread.join().unwrap();
+}
+
+/// Item 2: LSP-level contract — go-to-definition on a qualified ref whose namespace
+/// uses a git backend returns null (no fetch, no panic).
+///
+/// The read-only / no-network invariant is asserted at the handler boundary: even
+/// if `resolve_local_path` returns Err for a git backend, the server must respond
+/// with null rather than panicking or blocking on a network call.
+#[test]
+fn goto_definition_git_backend_namespace_returns_null() {
+    // Build a temp project with a git-backend namespace.
+    let dir = {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let d =
+            std::env::temp_dir().join(format!("mangrove_lsp_e2e_git_{}_{id}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    };
+
+    // Write .mangrove/resolvers.toml with a git backend.
+    let resolvers_dir = dir.join(".mangrove");
+    std::fs::create_dir_all(&resolvers_dir).unwrap();
+    std::fs::write(
+        resolvers_dir.join("resolvers.toml"),
+        "[namespace.myns]\ngit = \"https://example.com/repo.git\"\n",
+    )
+    .unwrap();
+
+    // The document — a qualified ref `g.SomeType` whose namespace is git-backed.
+    let doc_src = "use \"myns/pkg@v1\" as g\ntype Local = g.SomeType\n";
+    // URI points into our temp dir so the server can find resolvers.toml via upward search.
+    let doc_path = dir.join("main.mang");
+    let doc_uri: Uri = format!("file://{}", doc_path.to_str().unwrap())
+        .parse()
+        .unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        mangrove_lsp::server::run_on(&server).unwrap();
+    });
+
+    // handshake
+    let init_id = RequestId::from(1);
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            init_id.clone(),
+            Initialize::METHOD.to_string(),
+            serde_json::to_value(InitializeParams::default()).unwrap(),
+        )))
+        .unwrap();
+    recv_response(&client, &init_id);
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            Initialized::METHOD.to_string(),
+            serde_json::to_value(InitializedParams {}).unwrap(),
+        )))
+        .unwrap();
+
+    // didOpen the document (diagnostics may follow — drain them)
+    client
+        .sender
+        .send(Message::Notification(Notification::new(
+            DidOpenTextDocument::METHOD.to_string(),
+            serde_json::to_value(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: doc_uri.clone(),
+                    language_id: "mangrove".to_string(),
+                    version: 1,
+                    text: doc_src.to_string(),
+                },
+            })
+            .unwrap(),
+        )))
+        .unwrap();
+
+    // Drain the publishDiagnostics notification.
+    recv_notification(&client, "textDocument/publishDiagnostics");
+
+    // Send go-to-definition on the `g.SomeType` reference (cursor on `SomeType`).
+    let goto_id = RequestId::from(2);
+    // "SomeType" starts at offset 33 in the source — use line 1, char 13 (0-indexed).
+    client
+        .sender
+        .send(Message::Request(Request::new(
+            goto_id.clone(),
+            GotoDefinition::METHOD.to_string(),
+            serde_json::to_value(GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: doc_uri },
+                    position: Position::new(1, 13), // "SomeType" in "type Local = g.SomeType"
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
+            })
+            .unwrap(),
+        )))
+        .unwrap();
+
+    let resp = recv_response(&client, &goto_id);
+    // Must respond (no panic / no hang) and result must be null (no fetch performed).
+    assert!(
+        resp.error.is_none(),
+        "server must not return an error for git-backend goto, got: {:?}",
+        resp.error
+    );
+    assert!(
+        resp.result.as_ref().is_none_or(|v| v.is_null()),
+        "git-backend goto must return null (no fetch), got: {:?}",
+        resp.result
     );
 
     // shutdown

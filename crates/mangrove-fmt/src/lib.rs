@@ -500,4 +500,58 @@ mod tests {
             );
         }
     }
+
+    // ---- Item 3: targeted spacing tests for @, ?, !, ... operators ----
+
+    #[test]
+    fn annotation_at_stays_tight() {
+        // `@key(name)` — AT has no space after; L_PAREN has no space before.
+        // Full field: `ports: [ Port ] @key(name)` — one space before `@` (after `]`).
+        let src = "type Port = { containerPort: int & >= 1 & <= 65535, name: str }\ntype Cont = { ports: [ Port ] @key(name) }\nschema Cont\nports: [ { containerPort: 8080, name: \"http\" } ]\n";
+        let out = format_str(src).text;
+        assert!(
+            out.contains("] @key(name)"),
+            "expected `] @key(name)` (one space before @), got: {out:?}"
+        );
+        assert!(
+            !out.contains("@ key") && !out.contains("@key ("),
+            "unexpected spacing around @key in: {out:?}"
+        );
+    }
+
+    #[test]
+    fn optional_field_stays_tight() {
+        // `tls?: bool` — QUESTION and COLON both have no space before them.
+        let src = "type Cfg = { host: str, tls?: bool }\nschema Cfg\nhost: \"x\"\n";
+        let out = format_str(src).text;
+        assert!(
+            out.contains("tls?: bool"),
+            "expected `tls?: bool` (no space before ? or :), got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn spread_dots_stay_tight() {
+        // `...base` — DOT_DOT_DOT has no space after.
+        let src = "use \"./base.mang\" as base\n...base\nport: 9090\n";
+        let out = format_str(src).text;
+        assert!(
+            out.contains("...base"),
+            "expected `...base` (no space after ...), got: {out:?}"
+        );
+        assert!(
+            !out.contains("... base"),
+            "unexpected space after ... in: {out:?}"
+        );
+    }
+
+    #[test]
+    fn bang_stays_tight() {
+        // BANG has no space after (tight prefix). Mangrove uses `!` for unset markers.
+        // space_between rule: BANG in "no space after" list → `!x` not `! x`.
+        // We test via the space_between function directly rather than a full document
+        // (BANG appears in internal parser contexts, not top-level user source).
+        assert_eq!(space_between(Some(K::BANG), K::BAREWORD), "");
+        assert_eq!(space_between(Some(K::BAREWORD), K::BANG), " ");
+    }
 }

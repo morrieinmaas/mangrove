@@ -408,10 +408,47 @@ fn on_goto_definition(state: &State, req: Request) -> Response {
     )
 }
 
+/// Decode `%XX` percent-encoded sequences in a URI path component.
+/// Decodes byte-by-byte; if the resulting bytes are not valid UTF-8, returns None.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// Convert a `file://` URI string to a filesystem path.
-fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+///
+/// Percent-decodes `%XX` sequences in the path component. Also handles the
+/// Windows triple-slash form `file:///C:/...` by stripping the leading `/`
+/// before a drive letter. Falls back to `None` if decoding fails.
+pub(crate) fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
     let path_str = uri.strip_prefix("file://")?;
-    Some(std::path::PathBuf::from(path_str))
+    let decoded = percent_decode(path_str)?;
+    // Windows: `file:///C:/...` → strip the leading `/` before the drive letter.
+    let final_path = if let Some(rest) = decoded.strip_prefix('/') {
+        // Drive letter pattern: single ASCII letter followed by `:`
+        if rest.len() >= 2 && rest.as_bytes()[0].is_ascii_alphabetic() && rest.as_bytes()[1] == b':'
+        {
+            rest.to_string()
+        } else {
+            decoded
+        }
+    } else {
+        decoded
+    };
+    Some(std::path::PathBuf::from(final_path))
 }
 
 /// Convert a filesystem path to a `file://` URI.
@@ -599,6 +636,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- uri_to_path unit tests (Item 1) ----
+
+    #[test]
+    fn uri_to_path_decodes_space() {
+        let p = uri_to_path("file:///Users/me/My%20Configs/main.mang").unwrap();
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/Users/me/My Configs/main.mang")
+        );
+    }
+
+    #[test]
+    fn uri_to_path_decodes_unicode_sequence() {
+        // %C3%A9 = U+00E9 é (UTF-8 two-byte sequence)
+        let p = uri_to_path("file:///home/user/caf%C3%A9/doc.mang").unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/home/user/café/doc.mang"));
+    }
+
+    #[test]
+    fn uri_to_path_plain_path_unchanged() {
+        let p = uri_to_path("file:///simple/path.mang").unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/simple/path.mang"));
+    }
+
+    #[test]
+    fn uri_to_path_windows_drive_strips_leading_slash() {
+        let p = uri_to_path("file:///C:/Users/me/file.mang").unwrap();
+        assert_eq!(p, std::path::PathBuf::from("C:/Users/me/file.mang"));
+    }
+
+    #[test]
+    fn uri_to_path_non_file_scheme_returns_none() {
+        assert!(uri_to_path("https://example.com/file.mang").is_none());
+    }
+
+    // ---- offset helper ----
 
     #[test]
     fn offset_maps_line_and_utf16_char_to_byte() {
