@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.5.2
+
+LSP polish from the whole-arc review.
+
+### Fixed
+- **Cross-file go-to-definition on paths with spaces/unicode.** The LSP now
+  percent-decodes `file://` URIs (and handles the Windows `file:///C:/…` drive
+  form), so navigating into imported types works for documents under paths like
+  `…/Application Support/…`. Previously the wrong path was computed and the jump
+  silently did nothing.
+
+### Internal
+- Added an LSP-level test pinning the no-fetch contract (cross-file goto into a
+  git-backed namespace returns nothing, never fetches), targeted formatter
+  spacing tests for `@`/`?`/`!`/`...`, and removed dead match arms for
+  reserved-but-unemitted syntax kinds.
+
 ## v0.5.1
 
 Robustness fixes for the CST front end (and therefore `mangrove fmt` and the
