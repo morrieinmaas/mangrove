@@ -1285,14 +1285,22 @@ fn cursor_context(root: &SyntaxNode, offset: usize) -> CursorContext {
 ///
 /// Context-aware: determines the cursor's position in the CST and offers only
 /// items that fit:
-/// - Type position → declared type/unit names + primitive type keywords.
+/// - Type position → declared type/unit names + primitive type keywords +
+///   imported `alias.TypeName` completions (when `doc_path` is `Some`).
 /// - Top-level → declaration keywords (`type`, `schema`, `unit`, …).
 /// - Schema value position → schema record field names.
 /// - General value → value keywords (`match`, `unset`).
 /// - Ambiguous → full union (over-offer rather than offer nothing).
 ///
-/// Cross-file completion is out of scope.
-pub fn completions(src: &str, offset: usize) -> Vec<CompletionItem> {
+/// `doc_path` is the on-disk path of the document being edited; when `Some`
+/// the function also offers imported types from `use` declarations by resolving
+/// them exactly like `goto_definition_cross_file` (local-only, no-fetch).
+/// When `None` (untitled buffer), imported-type completion is skipped.
+pub fn completions(
+    src: &str,
+    offset: usize,
+    doc_path: Option<&std::path::Path>,
+) -> Vec<CompletionItem> {
     let root = parse_cst(src).syntax();
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1317,6 +1325,12 @@ pub fn completions(src: &str, offset: usize) -> Vec<CompletionItem> {
                         });
                     }
                 }
+            }
+            // Imported types: for each `use "<ref>" as alias`, offer `alias.TypeName`
+            // for every top-level type/unit declared in the imported file.
+            // ponytail: reads each imported file once per completion request; cache if it matters
+            for imported in imported_type_completions(&root, doc_path) {
+                push(imported);
             }
             // Primitive type keywords.
             for &kw in PRIMITIVE_TYPE_KEYWORDS {
@@ -1400,6 +1414,74 @@ pub fn completions(src: &str, offset: usize) -> Vec<CompletionItem> {
     }
 
     items
+}
+
+/// Collect `alias.TypeName` completion items for every `use` declaration in the
+/// document, reading each imported file once per call (no-fetch, local-only).
+///
+/// Skips any package that isn't locally present or uses a git backend — never
+/// panics or fetches. Resolution reuses the same chain as
+/// `goto_definition_cross_file`: `use_reference_for_alias` → `Resolvers::find_and_load`
+/// → `resolve_local_path` → `.exists()` → `read_to_string` → `parse_cst`.
+fn imported_type_completions(
+    root: &SyntaxNode,
+    doc_path: Option<&std::path::Path>,
+) -> Vec<CompletionItem> {
+    let Some(doc_path) = doc_path else {
+        return vec![];
+    };
+    let Some(doc_dir) = doc_path.parent() else {
+        return vec![];
+    };
+    let Ok(resolvers) = mangrove_resolve::Resolvers::find_and_load(doc_dir) else {
+        return vec![];
+    };
+
+    let mut out = Vec::new();
+
+    // Walk USE_DECL nodes to collect (alias, path) pairs.
+    for child in root.children() {
+        if child.kind() != SyntaxKind::USE_DECL {
+            continue;
+        }
+        let text = child.text().to_string();
+        let Ok(u) = mangrove_syntax::parse_use_str(text.trim()) else {
+            continue;
+        };
+        let alias = u.alias.clone();
+        let reference = u.path.clone();
+
+        // Resolve to a local path — skip git backends and unknown namespaces.
+        let Ok(pkg_path) = resolvers.resolve_local_path(&reference) else {
+            continue;
+        };
+        if !pkg_path.exists() {
+            continue;
+        }
+
+        // Read and parse the imported file (once per use decl per request).
+        let Ok(pkg_text) = std::fs::read_to_string(&pkg_path) else {
+            continue;
+        };
+        let pkg_root = parse_cst(&pkg_text).syntax();
+
+        // Enumerate top-level type/unit declarations.
+        for pkg_child in pkg_root.children() {
+            if matches!(
+                pkg_child.kind(),
+                SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF
+            ) {
+                if let Some(type_name) = node_decl_name(&pkg_child) {
+                    out.push(CompletionItem {
+                        label: format!("{alias}.{type_name}"),
+                        kind: CompletionKind::TypeName,
+                    });
+                }
+            }
+        }
+    }
+
+    out
 }
 
 /// If the document has a `schema X` and `X` resolves locally to a record type,
@@ -1664,7 +1746,7 @@ mod tests {
         // Offset pointing at "Inner" inside `type Server = Inner` — inside TYPE_DEF.
         // rfind("Inner") gives us the reference occurrence after `=`.
         let off = src.rfind("Inner").unwrap();
-        let items = completions(src, off);
+        let items = completions(src, off, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"Inner"),
@@ -1678,7 +1760,7 @@ mod tests {
     fn completions_include_keywords() {
         let src = "type Server = { host: str }\nschema Server\n";
         // offset 0 = ambiguous → full union, includes "type"/"schema"
-        let items = completions(src, 0);
+        let items = completions(src, 0, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"type"),
@@ -1700,7 +1782,7 @@ mod tests {
             "type Server = { host: str, port: int }\nschema Server\nhost: \"x\"\nport: 8080\n";
         // Offset pointing into the value of `host: "x"` — inside a BINDING.
         let off = src.find("\"x\"").unwrap() + 1;
-        let items = completions(src, off);
+        let items = completions(src, off, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"host"),
@@ -1718,7 +1800,7 @@ mod tests {
     fn completions_no_duplicate_labels() {
         // A name that could appear as both a type and a binding should appear once.
         let src = "type Server = { host: str }\nschema Server\nhost: \"x\"\n";
-        let items = completions(src, 0);
+        let items = completions(src, 0, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         let mut dedup = labels.clone();
         dedup.sort();
@@ -1741,7 +1823,7 @@ mod tests {
         let src = "type Foo = int\ntype Bar = str\nschema Foo\nx: 1\n";
         // Offset pointing at "int" inside the TYPE_DEF for Foo.
         let off = src.find("int").unwrap();
-        let items = completions(src, off);
+        let items = completions(src, off, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         // Should include declared type names.
         assert!(
@@ -1770,7 +1852,7 @@ mod tests {
         // The document ends with a newline; cursor at the end = new top-level line.
         let src = "type Foo = int\n";
         let off = src.len(); // past EOF → treated as top-level
-        let items = completions(src, off);
+        let items = completions(src, off, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"type"),
@@ -1788,7 +1870,7 @@ mod tests {
         let src = "type Server = { host: str, port: int }\nschema Server\nhost: \"localhost\"\nport: 80\n";
         // Cursor inside the value of `host: "localhost"` — inside a BINDING.
         let off = src.find("\"localhost\"").unwrap() + 1;
-        let items = completions(src, off);
+        let items = completions(src, off, None);
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
             labels.contains(&"host"),
@@ -1808,10 +1890,107 @@ mod tests {
         // A simple document; offset 0 is before any token — cursor context is
         // ambiguous. Must return a non-empty list rather than nothing.
         let src = "type Foo = int\n";
-        let items = completions(src, 0);
+        let items = completions(src, 0, None);
         assert!(
             !items.is_empty(),
             "expected non-empty fallback for ambiguous context"
+        );
+    }
+
+    // ---- imported-type completion tests (cross-file, local-only) ----
+
+    /// Helper: write a file relative to `dir`.
+    fn write_completion_fixture(dir: &std::path::Path, rel: &str, contents: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+
+    /// RED → GREEN: a document with `use "ns/pkg@v1" as k` in type position
+    /// should offer `k.SomeType` and `k.OtherUnit` as completions.
+    #[test]
+    fn completions_imported_types_offered_in_type_position() {
+        let dir = scratch_dir();
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_completion_fixture(
+            &dir,
+            "vendor/pkg.mang",
+            "type SomeType = int\nunit OtherUnit : int\n",
+        );
+        let main_src = "use \"ns/pkg@v1\" as k\ntype Local = k.SomeType\n";
+        let main_path = dir.join("main.mang");
+        // Cursor inside "k.SomeType" in the TYPE_DEF body — type position.
+        let off = main_src.rfind("SomeType").unwrap();
+        let items = completions(main_src, off, Some(&main_path));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"k.SomeType"),
+            "expected 'k.SomeType' in completions, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"k.OtherUnit"),
+            "expected 'k.OtherUnit' in completions, got {labels:?}"
+        );
+        // All imported items should be typed as TypeName.
+        for lbl in &["k.SomeType", "k.OtherUnit"] {
+            let item = items.iter().find(|i| i.label == *lbl).unwrap();
+            assert_eq!(
+                item.kind,
+                CompletionKind::TypeName,
+                "imported item {lbl} should have TypeName kind"
+            );
+        }
+    }
+
+    /// A package that is NOT locally present must contribute nothing — no panic,
+    /// no fetch, just silently skipped.
+    #[test]
+    fn completions_missing_package_contributes_nothing() {
+        let dir = scratch_dir();
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        // vendor/pkg.mang intentionally NOT created.
+        let main_src = "use \"ns/pkg@v1\" as k\ntype Local = k.Missing\n";
+        let main_path = dir.join("main.mang");
+        let off = main_src.rfind("Missing").unwrap();
+        // Must not panic; missing package is silently skipped.
+        let items = completions(main_src, off, Some(&main_path));
+        let imported: Vec<&str> = items
+            .iter()
+            .filter(|i| i.label.starts_with("k."))
+            .map(|i| i.label.as_str())
+            .collect();
+        assert!(
+            imported.is_empty(),
+            "expected no imported completions for missing package, got {imported:?}"
+        );
+    }
+
+    /// When doc_path is None (untitled buffer), imported types are skipped and
+    /// local completions still work.
+    #[test]
+    fn completions_no_doc_path_skips_imports_keeps_local() {
+        let src = "type Inner = int\ntype Server = Inner\nschema Server\nx: 1\n";
+        let off = src.rfind("Inner").unwrap();
+        let items = completions(src, off, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // Local types still offered.
+        assert!(
+            labels.contains(&"Inner"),
+            "expected 'Inner' in completions with None doc_path, got {labels:?}"
+        );
+        // No dotted labels (no imported types).
+        let dotted: Vec<_> = labels.iter().filter(|l| l.contains('.')).collect();
+        assert!(
+            dotted.is_empty(),
+            "expected no dotted labels with None doc_path, got {dotted:?}"
         );
     }
 

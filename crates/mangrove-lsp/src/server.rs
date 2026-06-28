@@ -467,7 +467,8 @@ fn on_completion(state: &State, req: Request) -> Response {
         return Response::new_ok(id, serde_json::Value::Null);
     };
     let offset = offset_of(text, params.text_document_position.position);
-    let items: Vec<CompletionItem> = analysis::completions(text, offset)
+    let doc_path = uri_to_path(&uri);
+    let items: Vec<CompletionItem> = analysis::completions(text, offset, doc_path.as_deref())
         .into_iter()
         .map(|c| CompletionItem {
             label: c.label,
