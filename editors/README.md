@@ -33,8 +33,52 @@ Custom binary path:
 require("mangrove").setup({ cmd = { "/abs/path/to/mangrove", "lsp" } })
 ```
 
+## Zed
+
+`editors/zed/` is a Zed dev extension. It registers the `Mangrove` language
+(`.mang` files) and wires up `mangrove lsp` as the language server.
+
+### Prerequisites
+
+Put the `mangrove` binary on your `$PATH`:
+
+```sh
+cargo install --path crates/mangrove-cli
+```
+
+### Install as a dev extension
+
+1. Open Zed.
+2. Open the Extensions panel (`Cmd+Shift+X` / `Ctrl+Shift+X`).
+3. Click **Install Dev Extension** and select the `editors/zed/` directory.
+4. Zed compiles the extension (wasm32 build) and activates it automatically.
+
+### Confirming it works
+
+Open any `.mang` file. You should see:
+
+- Diagnostics (red squiggles) for parse/schema errors.
+- Hover (`Cmd+K Cmd+I`) showing type information.
+- Completions as you type.
+- Semantic-token highlighting (Mangrove has no tree-sitter grammar; colour
+  comes from LSP semantic tokens only — the file will appear uncoloured until
+  the server attaches, which is expected).
+- Go-to-definition (`F12` / `Cmd+Click`) for local and imported symbols.
+- Document outline in the Outline panel.
+
+### Troubleshooting
+
+If the language server fails to start, check that `mangrove` is on `$PATH`:
+
+```sh
+which mangrove
+mangrove lsp --version   # should print something and exit cleanly
+```
+
+Zed's log panel (`View > Toggle Log`) shows LSP stderr output.
+
 ## Other editors
 
 Any LSP client can launch `mangrove lsp` over stdio. Point your client's
 language-server command at `mangrove lsp` and associate it with the `.mang`
-extension. A Zed extension is a planned follow-up.
+extension.
