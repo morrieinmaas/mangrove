@@ -1315,29 +1315,40 @@ pub fn completions(
 
     match ctx {
         CursorContext::TypePosition => {
-            // Declared type/unit names.
-            for child in root.children() {
-                if matches!(child.kind(), SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF) {
-                    if let Some(name) = node_decl_name(&child) {
-                        push(CompletionItem {
-                            label: name,
-                            kind: CompletionKind::TypeName,
-                        });
+            // Detect whether the cursor is positioned after an `alias.` prefix
+            // (e.g. user typed `k.` or is inside `k.SomeName`).
+            //
+            // V3 behaviour change from V2: when no alias-prefix is present, we do
+            // NOT offer the full imported-type set (`alias.TypeName` for all
+            // packages). That set can be thousands of items in real projects and
+            // provides poor UX. Imported types are only shown when the user
+            // explicitly types an alias prefix.
+            if let Some(alias) = detect_alias_prefix(&root, offset) {
+                // Alias-prefix present: offer only types from that alias's package,
+                // using bare TypeName labels (not alias.TypeName, since the user
+                // already typed alias.).
+                for imported in imported_type_completions_for_alias(&root, doc_path, &alias) {
+                    push(imported);
+                }
+            } else {
+                // No alias-prefix: offer local type/unit names only.
+                for child in root.children() {
+                    if matches!(child.kind(), SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF) {
+                        if let Some(name) = node_decl_name(&child) {
+                            push(CompletionItem {
+                                label: name,
+                                kind: CompletionKind::TypeName,
+                            });
+                        }
                     }
                 }
-            }
-            // Imported types: for each `use "<ref>" as alias`, offer `alias.TypeName`
-            // for every top-level type/unit declared in the imported file.
-            // ponytail: reads each imported file once per completion request; cache if it matters
-            for imported in imported_type_completions(&root, doc_path) {
-                push(imported);
-            }
-            // Primitive type keywords.
-            for &kw in PRIMITIVE_TYPE_KEYWORDS {
-                push(CompletionItem {
-                    label: kw.to_string(),
-                    kind: CompletionKind::Keyword,
-                });
+                // Primitive type keywords.
+                for &kw in PRIMITIVE_TYPE_KEYWORDS {
+                    push(CompletionItem {
+                        label: kw.to_string(),
+                        kind: CompletionKind::Keyword,
+                    });
+                }
             }
         }
 
@@ -1352,7 +1363,7 @@ pub fn completions(
 
         CursorContext::SchemaValuePosition => {
             // Field names from the bound schema (if any).
-            if let Some(fields) = schema_record_fields(src) {
+            if let Some(fields) = schema_record_fields(src, doc_path) {
                 for field in fields {
                     push(CompletionItem {
                         label: field,
@@ -1402,7 +1413,7 @@ pub fn completions(
                     kind: CompletionKind::Keyword,
                 });
             }
-            if let Some(fields) = schema_record_fields(src) {
+            if let Some(fields) = schema_record_fields(src, doc_path) {
                 for field in fields {
                     push(CompletionItem {
                         label: field,
@@ -1416,16 +1427,70 @@ pub fn completions(
     items
 }
 
-/// Collect `alias.TypeName` completion items for every `use` declaration in the
-/// document, reading each imported file once per call (no-fetch, local-only).
+/// Detect whether the cursor at `offset` is positioned after an `alias.` prefix,
+/// meaning the user typed or is completing something like `k.` or `k.Som`.
 ///
-/// Skips any package that isn't locally present or uses a git backend — never
-/// panics or fetches. Resolution reuses the same chain as
-/// `goto_definition_cross_file`: `use_reference_for_alias` → `Resolvers::find_and_load`
-/// → `resolve_local_path` → `.exists()` → `read_to_string` → `parse_cst`.
-fn imported_type_completions(
+/// Returns `Some(alias)` when a BAREWORD DOT [BAREWORD] pattern is found around
+/// the cursor. Returns `None` when the cursor is not in an alias-prefix context.
+fn detect_alias_prefix(root: &SyntaxNode, offset: usize) -> Option<String> {
+    let off: rowan::TextSize = (offset as u32).into();
+
+    // Collect all significant (non-trivia, non-newline) tokens in document order.
+    let all_toks: Vec<_> = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+        .collect();
+
+    // Find the index of the token that contains or ends at `offset`.
+    // We also check the token BEFORE the cursor position for the case where the
+    // cursor is exactly between tokens (e.g. just after a DOT).
+    let cursor_tok_idx = all_toks.iter().position(|t| {
+        let r = t.text_range();
+        r.contains_inclusive(off)
+    });
+
+    // If no token contains the offset, look for the last token ending at or
+    // before the offset (cursor is in whitespace or at end of line).
+    let idx = if let Some(i) = cursor_tok_idx {
+        i
+    } else {
+        // Find the last token that ends at or before `off`.
+        all_toks.iter().rposition(|t| t.text_range().end() <= off)?
+    };
+
+    let tok = &all_toks[idx];
+
+    // Case A: cursor is ON a BAREWORD and the previous two tokens are BAREWORD DOT
+    // → the BAREWORD before DOT is the alias.
+    if tok.kind() == SyntaxKind::BAREWORD && idx >= 2 {
+        let prev = &all_toks[idx - 1];
+        let before = &all_toks[idx - 2];
+        if prev.kind() == SyntaxKind::DOT && before.kind() == SyntaxKind::BAREWORD {
+            return Some(before.text().to_string());
+        }
+    }
+
+    // Case B: cursor is ON a DOT and the previous token is a BAREWORD (alias)
+    // → alias-prefix with empty partial suffix.
+    if tok.kind() == SyntaxKind::DOT && idx >= 1 {
+        let before = &all_toks[idx - 1];
+        if before.kind() == SyntaxKind::BAREWORD {
+            return Some(before.text().to_string());
+        }
+    }
+
+    None
+}
+
+/// Offer completion items for a specific alias's package, using bare TypeName
+/// labels (not `alias.TypeName`) — the caller already typed the `alias.` prefix.
+///
+/// No-fetch, local-only: same resolution chain as `imported_type_completions`.
+fn imported_type_completions_for_alias(
     root: &SyntaxNode,
     doc_path: Option<&std::path::Path>,
+    alias: &str,
 ) -> Vec<CompletionItem> {
     let Some(doc_path) = doc_path else {
         return vec![];
@@ -1433,70 +1498,137 @@ fn imported_type_completions(
     let Some(doc_dir) = doc_path.parent() else {
         return vec![];
     };
+    let Some(reference) = use_reference_for_alias(root, alias) else {
+        return vec![];
+    };
     let Ok(resolvers) = mangrove_resolve::Resolvers::find_and_load(doc_dir) else {
         return vec![];
     };
+    let Ok(pkg_path) = resolvers.resolve_local_path(&reference) else {
+        return vec![];
+    };
+    if !pkg_path.exists() {
+        return vec![];
+    }
+    let Ok(pkg_text) = std::fs::read_to_string(&pkg_path) else {
+        return vec![];
+    };
+    let pkg_root = parse_cst(&pkg_text).syntax();
 
     let mut out = Vec::new();
-
-    // Walk USE_DECL nodes to collect (alias, path) pairs.
-    for child in root.children() {
-        if child.kind() != SyntaxKind::USE_DECL {
-            continue;
-        }
-        let text = child.text().to_string();
-        let Ok(u) = mangrove_syntax::parse_use_str(text.trim()) else {
-            continue;
-        };
-        let alias = u.alias.clone();
-        let reference = u.path.clone();
-
-        // Resolve to a local path — skip git backends and unknown namespaces.
-        let Ok(pkg_path) = resolvers.resolve_local_path(&reference) else {
-            continue;
-        };
-        if !pkg_path.exists() {
-            continue;
-        }
-
-        // Read and parse the imported file (once per use decl per request).
-        let Ok(pkg_text) = std::fs::read_to_string(&pkg_path) else {
-            continue;
-        };
-        let pkg_root = parse_cst(&pkg_text).syntax();
-
-        // Enumerate top-level type/unit declarations.
-        for pkg_child in pkg_root.children() {
-            if matches!(
-                pkg_child.kind(),
-                SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF
-            ) {
-                if let Some(type_name) = node_decl_name(&pkg_child) {
-                    out.push(CompletionItem {
-                        label: format!("{alias}.{type_name}"),
-                        kind: CompletionKind::TypeName,
-                    });
-                }
+    for pkg_child in pkg_root.children() {
+        if matches!(
+            pkg_child.kind(),
+            SyntaxKind::TYPE_DEF | SyntaxKind::UNIT_DEF
+        ) {
+            if let Some(type_name) = node_decl_name(&pkg_child) {
+                // Bare TypeName label — the user already typed `alias.`
+                out.push(CompletionItem {
+                    label: type_name,
+                    kind: CompletionKind::TypeName,
+                });
             }
         }
     }
-
     out
 }
 
-/// If the document has a `schema X` and `X` resolves locally to a record type,
-/// return that record's field names.  Returns `None` if the schema is absent,
-/// unresolvable, or not a plain record.
-fn schema_record_fields(src: &str) -> Option<Vec<String>> {
+/// If the document has a `schema X` and `X` resolves to a record type (either
+/// locally or from an imported package), return that record's field names.
+///
+/// Two cases:
+/// 1. Local schema (`schema LocalType`) — resolve through `doc.typedefs`, works
+///    even when `doc.uses` is non-empty (fixes the regression where any `use` decl
+///    blocked local-schema field completions).
+/// 2. Imported schema (`schema alias.RecordName`) — resolve the alias via CST
+///    `use_reference_for_alias`, load the imported file, and extract its fields.
+///
+/// Returns `None` when the schema is absent, unresolvable, or not a record type.
+/// Never panics, never fetches.
+fn schema_record_fields(src: &str, doc_path: Option<&std::path::Path>) -> Option<Vec<String>> {
     let root = parse_cst(src).syntax();
-    let doc = lower(&root).ok()?;
-    // skip cross-file imports (can't resolve locally)
-    if !doc.uses.is_empty() {
+
+    // Determine the schema name: prefer lower() but fall back to CST scan when
+    // lower() fails (e.g. document contains a bareword in value position like
+    // `x: alias.Widget` which isn't a valid scalar).
+    let schema_name: String = if let Ok(doc) = lower(&root) {
+        doc.schema?.clone()
+    } else {
+        // Fall back: find the SCHEMA_DECL node and extract the name tokens.
+        schema_name_from_cst(&root)?
+    };
+
+    if schema_name.contains('.') {
+        // Imported schema: `alias.TypeName`
+        schema_record_fields_imported(&root, &schema_name, doc_path)
+    } else {
+        // Local schema: resolve through the document's own typedefs.
+        // Re-lower to get typedefs (or retry after the branch above).
+        let doc = lower(&root).ok()?;
+        let fields = resolve_record_fields(&schema_name, &doc.typedefs)?;
+        Some(fields.iter().map(|f| f.name.clone()).collect())
+    }
+}
+
+/// Extract the schema name from the CST SCHEMA_DECL node when `lower()` fails.
+/// Returns the raw text after the `schema` keyword (e.g. `"k.RecordType"`).
+fn schema_name_from_cst(root: &SyntaxNode) -> Option<String> {
+    for child in root.children() {
+        if child.kind() != SyntaxKind::SCHEMA_DECL {
+            continue;
+        }
+        // Tokens in a SCHEMA_DECL: BAREWORD("schema") WS BAREWORD(name) [DOT BAREWORD(type)] NEWLINE
+        let mut tokens = child
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE);
+        tokens.next(); // skip `schema` keyword
+        let name_tok = tokens.next()?;
+        let mut name = name_tok.text().to_string();
+        // If followed by DOT BAREWORD, it's a qualified name.
+        if let Some(dot) = tokens.next() {
+            if dot.kind() == SyntaxKind::DOT {
+                if let Some(type_tok) = tokens.next() {
+                    name.push('.');
+                    name.push_str(type_tok.text());
+                }
+            }
+        }
+        return Some(name);
+    }
+    None
+}
+
+/// Resolve fields for an imported schema `alias.TypeName`.
+/// Walks USE_DECL nodes to find the alias, loads the imported file,
+/// lowers it, and resolves the record fields. No-fetch, local-only.
+fn schema_record_fields_imported(
+    root: &SyntaxNode,
+    schema_name: &str,
+    doc_path: Option<&std::path::Path>,
+) -> Option<Vec<String>> {
+    let doc_path = doc_path?;
+    let doc_dir = doc_path.parent()?;
+
+    let (alias, type_name) = schema_name.split_once('.')?;
+
+    let reference = use_reference_for_alias(root, alias)?;
+    let Ok(resolvers) = mangrove_resolve::Resolvers::find_and_load(doc_dir) else {
+        return None;
+    };
+    let Ok(pkg_path) = resolvers.resolve_local_path(&reference) else {
+        return None;
+    };
+    if !pkg_path.exists() {
         return None;
     }
-    let schema_name = doc.schema.as_deref()?;
-    // Resolve the schema name through typedefs.
-    let fields = resolve_record_fields(schema_name, &doc.typedefs)?;
+    let Ok(pkg_text) = std::fs::read_to_string(&pkg_path) else {
+        return None;
+    };
+    let pkg_root = parse_cst(&pkg_text).syntax();
+    // Lower the imported file — it's self-contained so lower() works.
+    let pkg_doc = lower(&pkg_root).ok()?;
+    let fields = resolve_record_fields(type_name, &pkg_doc.typedefs)?;
     Some(fields.iter().map(|f| f.name.clone()).collect())
 }
 
@@ -1906,8 +2038,9 @@ mod tests {
         std::fs::write(&path, contents).unwrap();
     }
 
-    /// RED → GREEN: a document with `use "ns/pkg@v1" as k` in type position
-    /// should offer `k.SomeType` and `k.OtherUnit` as completions.
+    /// A document with `use "ns/pkg@v1" as k` where the cursor is inside
+    /// `k.SomeType` (alias-prefix detected) should offer bare TypeName labels
+    /// (`SomeType`, `OtherUnit`) not `k.SomeType` (V3 behavior: prefix already typed).
     #[test]
     fn completions_imported_types_offered_in_type_position() {
         let dir = scratch_dir();
@@ -1923,20 +2056,21 @@ mod tests {
         );
         let main_src = "use \"ns/pkg@v1\" as k\ntype Local = k.SomeType\n";
         let main_path = dir.join("main.mang");
-        // Cursor inside "k.SomeType" in the TYPE_DEF body — type position.
+        // Cursor inside "k.SomeType" in the TYPE_DEF body — alias-prefix `k.` detected.
+        // V3: labels are bare (SomeType, OtherUnit) not prefixed (k.SomeType, k.OtherUnit).
         let off = main_src.rfind("SomeType").unwrap();
         let items = completions(main_src, off, Some(&main_path));
         let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
         assert!(
-            labels.contains(&"k.SomeType"),
-            "expected 'k.SomeType' in completions, got {labels:?}"
+            labels.contains(&"SomeType"),
+            "expected bare 'SomeType' in completions (alias-prefix already typed), got {labels:?}"
         );
         assert!(
-            labels.contains(&"k.OtherUnit"),
-            "expected 'k.OtherUnit' in completions, got {labels:?}"
+            labels.contains(&"OtherUnit"),
+            "expected bare 'OtherUnit' in completions, got {labels:?}"
         );
-        // All imported items should be typed as TypeName.
-        for lbl in &["k.SomeType", "k.OtherUnit"] {
+        // Imported items should be typed as TypeName.
+        for lbl in &["SomeType", "OtherUnit"] {
             let item = items.iter().find(|i| i.label == *lbl).unwrap();
             assert_eq!(
                 item.kind,
@@ -1944,6 +2078,11 @@ mod tests {
                 "imported item {lbl} should have TypeName kind"
             );
         }
+        // Must NOT offer k.SomeType (that would double the alias in the editor).
+        assert!(
+            !labels.contains(&"k.SomeType"),
+            "must not offer k.SomeType when alias-prefix already typed, got {labels:?}"
+        );
     }
 
     /// A package that is NOT locally present must contribute nothing — no panic,
@@ -2423,6 +2562,224 @@ mod tests {
         assert!(
             snip.starts_with("type Server") || snip.contains("type Server"),
             "expected to land on type declaration, got start={start}: {snip:.40?}"
+        );
+    }
+
+    // ---- Feature A: imported-schema field completion tests ----
+
+    /// Cursor inside a schema-bound record value where the schema is `alias.RecordType`
+    /// (imported via `use`). Field names from the imported record must be offered.
+    #[test]
+    fn completions_imported_schema_fields_offered() {
+        let dir = scratch_dir();
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_completion_fixture(
+            &dir,
+            "vendor/pkg.mang",
+            "type RecordType = { x: str, y: int }\n",
+        );
+        // schema k.RecordType — imported record type
+        let main_src = "use \"ns/pkg@v1\" as k\nschema k.RecordType\nx: \"hello\"\n";
+        let main_path = dir.join("main.mang");
+        // Cursor inside the value of `x: "hello"` — schema value position.
+        let off = main_src.find("\"hello\"").unwrap() + 1;
+        let items = completions(main_src, off, Some(&main_path));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"x"),
+            "expected field 'x' from imported schema, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"y"),
+            "expected field 'y' from imported schema, got {labels:?}"
+        );
+        let field_x = items.iter().find(|i| i.label == "x").unwrap();
+        assert_eq!(
+            field_x.kind,
+            CompletionKind::Field,
+            "field 'x' must have kind Field"
+        );
+    }
+
+    /// If the imported schema resolves to a non-record type, no field completions
+    /// should be offered, and no panic must occur.
+    #[test]
+    fn completions_imported_non_record_schema_no_fields() {
+        let dir = scratch_dir();
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_completion_fixture(&dir, "vendor/pkg.mang", "type SimpleType = int\n");
+        let main_src = "use \"ns/pkg@v1\" as k\nschema k.SimpleType\nx: 1\n";
+        let main_path = dir.join("main.mang");
+        let off = main_src.find("1\n").unwrap(); // inside value of `x: 1`
+        let items = completions(main_src, off, Some(&main_path));
+        let field_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == CompletionKind::Field)
+            .collect();
+        assert!(
+            field_items.is_empty(),
+            "expected no Field completions for non-record schema, got {field_items:?}"
+        );
+    }
+
+    /// Cursor in schema value position where the alias can't be resolved (e.g. not
+    /// in resolvers.toml). Must return non-empty items (keywords), no panic, no Field items.
+    #[test]
+    fn completions_imported_schema_unresolvable_alias_no_fields() {
+        let dir = scratch_dir();
+        // resolvers.toml has no namespace — alias won't resolve
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.other]\nremote = \"vendor\"\n",
+        );
+        let main_src = "use \"ns/pkg@v1\" as k\nschema k.RecordType\nx: 1\n";
+        let main_path = dir.join("main.mang");
+        let off = main_src.find("1\n").unwrap();
+        // Must not panic; must return at least keyword items
+        let items = completions(main_src, off, Some(&main_path));
+        assert!(!items.is_empty(), "expected at least keyword items");
+        let field_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == CompletionKind::Field)
+            .collect();
+        assert!(
+            field_items.is_empty(),
+            "expected no Field items when alias unresolvable, got {field_items:?}"
+        );
+    }
+
+    /// A document that has both `use` decls AND a LOCAL schema (not imported) must
+    /// still offer the local schema's field completions. Regression for the
+    /// `doc.uses.is_empty()` early-bail that broke this.
+    #[test]
+    fn completions_local_schema_with_use_decls_still_works() {
+        let dir = scratch_dir();
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_completion_fixture(&dir, "vendor/pkg.mang", "type PkgType = int\n");
+        // Local schema LocalRec, but the document also has a `use` decl.
+        let main_src = "use \"ns/pkg@v1\" as k\ntype LocalRec = { a: str, b: int }\nschema LocalRec\na: \"x\"\n";
+        let main_path = dir.join("main.mang");
+        let off = main_src.find("\"x\"").unwrap() + 1;
+        let items = completions(main_src, off, Some(&main_path));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"a"),
+            "expected field 'a' for local schema in doc with use decls, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"b"),
+            "expected field 'b' for local schema in doc with use decls, got {labels:?}"
+        );
+    }
+
+    // ---- Feature B: alias-prefix filtering tests ----
+
+    /// Cursor positioned inside `k.TypeK` in type position — only types from
+    /// alias `k`'s package must be offered, not those from `other`, and the labels
+    /// must be bare TypeNames (not `k.TypeK`).
+    #[test]
+    fn completions_alias_prefix_filters_to_that_alias_only() {
+        let dir = scratch_dir();
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_completion_fixture(&dir, "vendor/k.mang", "type TypeK = int\n");
+        write_completion_fixture(&dir, "vendor/other.mang", "type TypeOther = str\n");
+        // Two use decls; cursor inside k.TypeK in a TYPE_DEF body.
+        let main_src = "use \"ns/k@v1\" as k\nuse \"ns/other@v1\" as other\ntype X = k.TypeK\n";
+        let main_path = dir.join("main.mang");
+        // Cursor on "TypeK" inside "k.TypeK" — alias-prefix detected.
+        let off = main_src.rfind("TypeK").unwrap();
+        let items = completions(main_src, off, Some(&main_path));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // TypeK must appear as bare name (not k.TypeK)
+        assert!(
+            labels.contains(&"TypeK"),
+            "expected bare 'TypeK' label when alias-prefix present, got {labels:?}"
+        );
+        // Must NOT contain the other alias's types
+        assert!(
+            !labels.contains(&"other.TypeOther"),
+            "must not offer other.TypeOther when alias-prefix is k, got {labels:?}"
+        );
+        // Must NOT contain k.TypeK (double-alias)
+        assert!(
+            !labels.contains(&"k.TypeK"),
+            "must not offer k.TypeK (double alias), got {labels:?}"
+        );
+    }
+
+    /// When NO alias-prefix is present in type position, imported types must NOT
+    /// be offered — only local types and primitives.
+    #[test]
+    fn completions_no_alias_prefix_omits_imported_types() {
+        let dir = scratch_dir();
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_completion_fixture(&dir, "vendor/pkg.mang", "type SomeType = int\n");
+        // Cursor on `int` in `type X = int` — no alias prefix, type position.
+        let main_src = "use \"ns/pkg@v1\" as k\ntype X = int\n";
+        let main_path = dir.join("main.mang");
+        let off = main_src.find("int").unwrap();
+        let items = completions(main_src, off, Some(&main_path));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // Local type must still be present
+        assert!(
+            labels.contains(&"int"),
+            "expected primitive 'int' in completions, got {labels:?}"
+        );
+        // No dotted (imported) labels
+        let dotted: Vec<_> = labels.iter().filter(|l| l.contains('.')).collect();
+        assert!(
+            dotted.is_empty(),
+            "expected no imported types when no alias-prefix, got {dotted:?}"
+        );
+    }
+
+    /// When the cursor is inside `k.Som` (partial type name after alias dot), the
+    /// alias-prefix is still detected and only types from `k`'s package are offered.
+    #[test]
+    fn completions_alias_prefix_partial_text_still_filters() {
+        let dir = scratch_dir();
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_completion_fixture(&dir, "vendor/pkg.mang", "type SomeType = int\n");
+        // The CST will parse `k.Som` as `k` DOT `Som` in type position (BAREWORD DOT BAREWORD).
+        let main_src = "use \"ns/pkg@v1\" as k\ntype X = k.SomeType\n";
+        let main_path = dir.join("main.mang");
+        // Cursor on "SomeType" — partial text after `k.`
+        let off = main_src.rfind("SomeType").unwrap();
+        let items = completions(main_src, off, Some(&main_path));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // Must offer bare SomeType (not k.SomeType)
+        assert!(
+            labels.contains(&"SomeType"),
+            "expected bare 'SomeType' when partial alias-prefix, got {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"k.SomeType"),
+            "must not offer k.SomeType (double-alias), got {labels:?}"
         );
     }
 }
