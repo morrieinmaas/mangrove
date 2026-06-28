@@ -79,7 +79,7 @@ mangrove lsp                           # run the language server over stdio (for
 diagnostics (parse + schema errors), hover, document symbols, semantic-token
 highlighting, formatting, context-aware completion (including imported/`gen-openapi`
 types), go-to-definition (local and cross-file into imported types), find-references,
-and rename. A Neovim setup lives in [`editors/nvim/`](editors/nvim/);
+and rename. Neovim ([`editors/nvim/`](editors/nvim/)) and Zed ([`editors/zed/`](editors/zed/)) setups are provided;
 any LSP client can launch `mangrove lsp`. (No tree-sitter grammar — highlighting
 comes from the server's semantic tokens.)
 

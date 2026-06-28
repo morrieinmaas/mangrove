@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.7.0
+
+LSP completion polish, an import-read cache, and a Zed editor extension. Still
+read-only and network-free — imported files are read from disk (resolved via the
+committed lockfile); git-backed namespaces are never fetched.
+
+### Tooling — `mangrove lsp`
+- **Imported-schema field completion.** A document bound to an imported record
+  schema (`schema alias.Record`) now gets that record's field-name completions
+  (read read-only from the resolved file). Also fixes a bug where a `use` decl
+  disabled field completion for a *local* schema.
+- **Alias-prefix completion filtering.** After typing `alias.`, completion offers
+  only that package's types (as bare names); without a prefix it no longer dumps
+  the entire imported type set — so a large `gen-openapi` import stays usable.
+- **Import-read cache.** Imported files are cached (keyed by mtime + length), so
+  cross-file go-to-definition and imported-type completion don't re-read and
+  re-parse from disk on every keystroke; a changed file is re-read automatically.
+
+### Editors
+- **Zed extension** (`editors/zed/`) registering the `Mangrove` language and
+  wiring up `mangrove lsp`. Install as a Zed dev extension (see `editors/README.md`).
+
 ## v0.6.0
 
 LSP cross-file awareness: navigate into and complete against imported types
