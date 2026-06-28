@@ -77,8 +77,9 @@ mangrove lsp                           # run the language server over stdio (for
 
 `mangrove lsp` is a read-only, network-free [language server](editors/README.md):
 diagnostics (parse + schema errors), hover, document symbols, semantic-token
-highlighting, formatting, context-aware completion, go-to-definition (local and
-cross-file into imported types), find-references, and rename. A Neovim setup lives in [`editors/nvim/`](editors/nvim/);
+highlighting, formatting, context-aware completion (including imported/`gen-openapi`
+types), go-to-definition (local and cross-file into imported types), find-references,
+and rename. A Neovim setup lives in [`editors/nvim/`](editors/nvim/);
 any LSP client can launch `mangrove lsp`. (No tree-sitter grammar — highlighting
 comes from the server's semantic tokens.)
 
