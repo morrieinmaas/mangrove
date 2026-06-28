@@ -104,6 +104,10 @@ fn server_capabilities() -> ServerCapabilities {
 #[derive(Default)]
 struct State {
     docs: HashMap<String, String>,
+    /// Session-scoped cache for imported-file reads (mtime/len-keyed).
+    /// Lives for the lifetime of the server; avoids re-reading unchanged files
+    /// on every completion/goto request.
+    import_cache: analysis::ImportCache,
 }
 
 fn main_loop(connection: &Connection) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
@@ -392,8 +396,12 @@ fn on_goto_definition(state: &State, req: Request) -> Response {
         // Then try cross-file resolution for qualified references (alias.Type).
         .or_else(|| {
             let doc_path = uri_to_path(&uri)?;
-            let (file_path, byte_range, file_text) =
-                analysis::goto_definition_cross_file(text, offset, &doc_path)?;
+            let (file_path, byte_range, file_text) = analysis::goto_definition_cross_file_cached(
+                text,
+                offset,
+                &doc_path,
+                &state.import_cache,
+            )?;
             let target_uri = path_to_uri(&file_path)?;
             let idx = LineIndex::new(&file_text);
             Some(GotoDefinitionResponse::Scalar(Location {
@@ -468,14 +476,15 @@ fn on_completion(state: &State, req: Request) -> Response {
     };
     let offset = offset_of(text, params.text_document_position.position);
     let doc_path = uri_to_path(&uri);
-    let items: Vec<CompletionItem> = analysis::completions(text, offset, doc_path.as_deref())
-        .into_iter()
-        .map(|c| CompletionItem {
-            label: c.label,
-            kind: Some(completion_item_kind(c.kind)),
-            ..CompletionItem::default()
-        })
-        .collect();
+    let items: Vec<CompletionItem> =
+        analysis::completions_cached(text, offset, doc_path.as_deref(), &state.import_cache)
+            .into_iter()
+            .map(|c| CompletionItem {
+                label: c.label,
+                kind: Some(completion_item_kind(c.kind)),
+                ..CompletionItem::default()
+            })
+            .collect();
     let result = CompletionResponse::List(CompletionList {
         is_incomplete: false,
         items,

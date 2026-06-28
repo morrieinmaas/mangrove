@@ -10,6 +10,91 @@
 use mangrove_syntax::cst::{SyntaxKind, SyntaxNode, lower, parse_cst};
 use mangrove_syntax::ty::Type;
 use rowan::TextRange;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
+
+// ---------------------------------------------------------------------------
+// ImportCache — mtime/len-keyed, session-scoped cache for imported-file reads.
+// Interior-mutability (RefCell/Cell) keeps the borrow signature `&self` so
+// callers can hold a shared reference for the lifetime of the event loop.
+// The LSP is single-threaded; a RefCell is safe and a Mutex would add
+// needless overhead.
+// ---------------------------------------------------------------------------
+
+/// Version key: (last-modified time, file length in bytes).
+/// A stat mismatch on either field triggers a re-read.
+type VersionKey = (SystemTime, u64);
+
+struct CacheEntry {
+    key: VersionKey,
+    text: Arc<str>,
+}
+
+/// Session-scoped cache for imported Mangrove file texts.
+///
+/// Uses `std::fs::metadata` (a single stat) as the cache-hit check, falling
+/// back to `read_to_string` only when mtime or length has changed.  All IO
+/// errors are treated as cache-miss → return `None`; callers skip the file.
+///
+/// This type is intentionally NOT `Send`/`Sync` (it holds `RefCell`).
+/// That is correct for the single-threaded LSP event loop.
+pub struct ImportCache {
+    inner: RefCell<HashMap<PathBuf, CacheEntry>>,
+    reads: Cell<usize>,
+}
+
+impl ImportCache {
+    pub fn new() -> Self {
+        Self {
+            inner: RefCell::new(HashMap::new()),
+            reads: Cell::new(0),
+        }
+    }
+
+    /// Number of actual `read_to_string` calls (cache misses).
+    /// Used in tests to verify cache-hit behaviour.
+    pub fn reads(&self) -> usize {
+        self.reads.get()
+    }
+
+    /// Return the text of `path`, reading from disk only when the
+    /// mtime/len key has changed (or the path is not yet cached).
+    ///
+    /// Returns `None` on any IO error; never panics, never fetches.
+    pub fn read(&self, path: &Path) -> Option<Arc<str>> {
+        // Stat first (cheap; avoids opening the file on cache hits).
+        let meta = std::fs::metadata(path).ok()?;
+        let key: VersionKey = (meta.modified().ok()?, meta.len());
+
+        // Fast path: key matches → return cached text.
+        if let Some(entry) = self.inner.borrow().get(path) {
+            if entry.key == key {
+                return Some(Arc::clone(&entry.text));
+            }
+        }
+
+        // Slow path: read from disk.
+        let text: Arc<str> = Arc::from(std::fs::read_to_string(path).ok()?.as_str());
+        self.reads.set(self.reads.get() + 1);
+        self.inner.borrow_mut().insert(
+            path.to_path_buf(),
+            CacheEntry {
+                key,
+                text: Arc::clone(&text),
+            },
+        );
+        Some(text)
+    }
+}
+
+impl Default for ImportCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// A completion item returned by the analysis layer.
 #[derive(Debug, Clone, PartialEq)]
@@ -617,8 +702,28 @@ fn find_param_entry(root: &SyntaxNode, name: &str) -> Option<(usize, usize)> {
 pub fn goto_definition_cross_file(
     src: &str,
     offset: usize,
-    doc_path: &std::path::Path,
-) -> Option<(std::path::PathBuf, (usize, usize), String)> {
+    doc_path: &Path,
+) -> Option<(PathBuf, (usize, usize), String)> {
+    goto_definition_cross_file_impl(src, offset, doc_path, None)
+}
+
+/// Internal implementation; `cache` is `None` in pure unit tests (preserves
+/// existing test behaviour) and `Some(&state.import_cache)` in the live server.
+pub(crate) fn goto_definition_cross_file_cached(
+    src: &str,
+    offset: usize,
+    doc_path: &Path,
+    cache: &ImportCache,
+) -> Option<(PathBuf, (usize, usize), String)> {
+    goto_definition_cross_file_impl(src, offset, doc_path, Some(cache))
+}
+
+fn goto_definition_cross_file_impl(
+    src: &str,
+    offset: usize,
+    doc_path: &Path,
+    cache: Option<&ImportCache>,
+) -> Option<(PathBuf, (usize, usize), String)> {
     let root = parse_cst(src).syntax();
     let off: rowan::TextSize = (offset as u32).into();
 
@@ -657,13 +762,18 @@ pub fn goto_definition_cross_file(
     let resolvers = mangrove_resolve::Resolvers::find_and_load(doc_dir).ok()?;
     let pkg_path = resolvers.resolve_local_path(&reference).ok()?;
 
-    // Only proceed if the file exists locally.
-    if !pkg_path.exists() {
-        return None;
-    }
-
-    // Read the file (read-only).
-    let pkg_text = std::fs::read_to_string(&pkg_path).ok()?;
+    // Read the file via cache (or directly when no cache is available).
+    // The cache internally checks existence via metadata(); a missing file → None.
+    let pkg_text: String = if let Some(c) = cache {
+        c.read(&pkg_path)?.to_string()
+    } else {
+        // Fallback: check existence then read directly (preserves behaviour
+        // for unit tests that don't supply a cache).
+        if !pkg_path.exists() {
+            return None;
+        }
+        std::fs::read_to_string(&pkg_path).ok()?
+    };
 
     // Parse and find the type/unit declaration.
     let pkg_root = parse_cst(&pkg_text).syntax();
@@ -1296,10 +1406,26 @@ fn cursor_context(root: &SyntaxNode, offset: usize) -> CursorContext {
 /// the function also offers imported types from `use` declarations by resolving
 /// them exactly like `goto_definition_cross_file` (local-only, no-fetch).
 /// When `None` (untitled buffer), imported-type completion is skipped.
-pub fn completions(
+pub fn completions(src: &str, offset: usize, doc_path: Option<&Path>) -> Vec<CompletionItem> {
+    completions_impl(src, offset, doc_path, None)
+}
+
+/// Cached variant used by the live server — passes the session cache so
+/// imported-file reads are served from memory on subsequent requests.
+pub(crate) fn completions_cached(
     src: &str,
     offset: usize,
-    doc_path: Option<&std::path::Path>,
+    doc_path: Option<&Path>,
+    cache: &ImportCache,
+) -> Vec<CompletionItem> {
+    completions_impl(src, offset, doc_path, Some(cache))
+}
+
+fn completions_impl(
+    src: &str,
+    offset: usize,
+    doc_path: Option<&Path>,
+    cache: Option<&ImportCache>,
 ) -> Vec<CompletionItem> {
     let root = parse_cst(src).syntax();
     let mut items: Vec<CompletionItem> = Vec::new();
@@ -1327,7 +1453,8 @@ pub fn completions(
                 // Alias-prefix present: offer only types from that alias's package,
                 // using bare TypeName labels (not alias.TypeName, since the user
                 // already typed alias.).
-                for imported in imported_type_completions_for_alias(&root, doc_path, &alias) {
+                for imported in imported_type_completions_for_alias(&root, doc_path, &alias, cache)
+                {
                     push(imported);
                 }
             } else {
@@ -1363,7 +1490,7 @@ pub fn completions(
 
         CursorContext::SchemaValuePosition => {
             // Field names from the bound schema (if any).
-            if let Some(fields) = schema_record_fields(src, doc_path) {
+            if let Some(fields) = schema_record_fields(src, doc_path, cache) {
                 for field in fields {
                     push(CompletionItem {
                         label: field,
@@ -1413,7 +1540,7 @@ pub fn completions(
                     kind: CompletionKind::Keyword,
                 });
             }
-            if let Some(fields) = schema_record_fields(src, doc_path) {
+            if let Some(fields) = schema_record_fields(src, doc_path, cache) {
                 for field in fields {
                     push(CompletionItem {
                         label: field,
@@ -1489,8 +1616,9 @@ fn detect_alias_prefix(root: &SyntaxNode, offset: usize) -> Option<String> {
 /// No-fetch, local-only: same resolution chain as `imported_type_completions`.
 fn imported_type_completions_for_alias(
     root: &SyntaxNode,
-    doc_path: Option<&std::path::Path>,
+    doc_path: Option<&Path>,
     alias: &str,
+    cache: Option<&ImportCache>,
 ) -> Vec<CompletionItem> {
     let Some(doc_path) = doc_path else {
         return vec![];
@@ -1507,11 +1635,19 @@ fn imported_type_completions_for_alias(
     let Ok(pkg_path) = resolvers.resolve_local_path(&reference) else {
         return vec![];
     };
-    if !pkg_path.exists() {
-        return vec![];
-    }
-    let Ok(pkg_text) = std::fs::read_to_string(&pkg_path) else {
-        return vec![];
+    let pkg_text: String = if let Some(c) = cache {
+        let Some(t) = c.read(&pkg_path) else {
+            return vec![];
+        };
+        t.to_string()
+    } else {
+        if !pkg_path.exists() {
+            return vec![];
+        }
+        let Ok(t) = std::fs::read_to_string(&pkg_path) else {
+            return vec![];
+        };
+        t
     };
     let pkg_root = parse_cst(&pkg_text).syntax();
 
@@ -1545,7 +1681,11 @@ fn imported_type_completions_for_alias(
 ///
 /// Returns `None` when the schema is absent, unresolvable, or not a record type.
 /// Never panics, never fetches.
-fn schema_record_fields(src: &str, doc_path: Option<&std::path::Path>) -> Option<Vec<String>> {
+fn schema_record_fields(
+    src: &str,
+    doc_path: Option<&Path>,
+    cache: Option<&ImportCache>,
+) -> Option<Vec<String>> {
     let root = parse_cst(src).syntax();
 
     // Determine the schema name: prefer lower() but fall back to CST scan when
@@ -1560,7 +1700,7 @@ fn schema_record_fields(src: &str, doc_path: Option<&std::path::Path>) -> Option
 
     if schema_name.contains('.') {
         // Imported schema: `alias.TypeName`
-        schema_record_fields_imported(&root, &schema_name, doc_path)
+        schema_record_fields_imported(&root, &schema_name, doc_path, cache)
     } else {
         // Local schema: resolve through the document's own typedefs.
         // Re-lower to get typedefs (or retry after the branch above).
@@ -1605,7 +1745,8 @@ fn schema_name_from_cst(root: &SyntaxNode) -> Option<String> {
 fn schema_record_fields_imported(
     root: &SyntaxNode,
     schema_name: &str,
-    doc_path: Option<&std::path::Path>,
+    doc_path: Option<&Path>,
+    cache: Option<&ImportCache>,
 ) -> Option<Vec<String>> {
     let doc_path = doc_path?;
     let doc_dir = doc_path.parent()?;
@@ -1619,11 +1760,13 @@ fn schema_record_fields_imported(
     let Ok(pkg_path) = resolvers.resolve_local_path(&reference) else {
         return None;
     };
-    if !pkg_path.exists() {
-        return None;
-    }
-    let Ok(pkg_text) = std::fs::read_to_string(&pkg_path) else {
-        return None;
+    let pkg_text: String = if let Some(c) = cache {
+        c.read(&pkg_path)?.to_string()
+    } else {
+        if !pkg_path.exists() {
+            return None;
+        }
+        std::fs::read_to_string(&pkg_path).ok()?
     };
     let pkg_root = parse_cst(&pkg_text).syntax();
     // Lower the imported file — it's self-contained so lower() works.
@@ -2781,5 +2924,156 @@ mod tests {
             !labels.contains(&"k.SomeType"),
             "must not offer k.SomeType (double-alias), got {labels:?}"
         );
+    }
+
+    // ---- ImportCache unit tests ----
+
+    /// Test 1: cache hit avoids re-read.
+    /// Two calls to `cache.read(path)` for the same unchanged file must result
+    /// in exactly one disk read (`reads() == 1`) and identical returned text.
+    #[test]
+    fn import_cache_hit_avoids_re_read() {
+        let dir = scratch_dir();
+        let path = dir.join("cached.mang");
+        std::fs::write(&path, "type T = int\n").unwrap();
+
+        let cache = ImportCache::new();
+        let text1 = cache.read(&path).expect("first read should succeed");
+        let text2 = cache.read(&path).expect("second read should hit cache");
+
+        assert_eq!(
+            cache.reads(),
+            1,
+            "expected exactly 1 disk read; got {}",
+            cache.reads()
+        );
+        assert_eq!(
+            text1.as_ref(),
+            text2.as_ref(),
+            "both calls should return identical text"
+        );
+        assert_eq!(text1.as_ref(), "type T = int\n");
+    }
+
+    /// Test 2: mtime/len invalidation forces a re-read with fresh content.
+    /// After a cache hit, we write new content (different length → len key changes),
+    /// then call read() again. The read counter must increment and new content returned.
+    #[test]
+    fn import_cache_invalidated_on_len_change() {
+        let dir = scratch_dir();
+        let path = dir.join("invalidated.mang");
+        std::fs::write(&path, "type A = int\n").unwrap();
+
+        let cache = ImportCache::new();
+        let text1 = cache.read(&path).expect("first read");
+        assert_eq!(cache.reads(), 1);
+        assert_eq!(text1.as_ref(), "type A = int\n");
+
+        // Write new content with a different byte length so the len key changes.
+        // (Even on same-second filesystems, len != len triggers a miss.)
+        std::fs::write(&path, "type A = str\ntype B = int\n").unwrap();
+
+        let text2 = cache.read(&path).expect("re-read after invalidation");
+        assert_eq!(
+            cache.reads(),
+            2,
+            "expected a second disk read after content change"
+        );
+        assert_eq!(text2.as_ref(), "type A = str\ntype B = int\n");
+        assert_ne!(
+            text1.as_ref(),
+            text2.as_ref(),
+            "stale text must not be returned after invalidation"
+        );
+    }
+
+    /// Test 3: missing file returns None, no panic.
+    #[test]
+    fn import_cache_missing_file_returns_none() {
+        let dir = scratch_dir();
+        let path = dir.join("does_not_exist.mang");
+
+        let cache = ImportCache::new();
+        let result = cache.read(&path);
+        assert!(
+            result.is_none(),
+            "expected None for missing file, got {result:?}"
+        );
+        assert_eq!(
+            cache.reads(),
+            0,
+            "no disk read should be attempted for missing file"
+        );
+    }
+
+    /// Test 4: two successive completions_cached calls return the same results
+    /// and the second call does not perform any additional disk reads.
+    #[test]
+    fn completions_cached_reduces_reads_on_second_call() {
+        let dir = scratch_dir();
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_completion_fixture(
+            &dir,
+            "vendor/pkg.mang",
+            "type SomeType = int\nunit OtherUnit : int\n",
+        );
+        let main_src = "use \"ns/pkg@v1\" as k\ntype Local = k.SomeType\n";
+        let main_path = dir.join("main.mang");
+        let off = main_src.rfind("SomeType").unwrap();
+
+        let cache = ImportCache::new();
+
+        // First call — populates cache.
+        let items1 = completions_cached(main_src, off, Some(&main_path), &cache);
+        let reads_after_first = cache.reads();
+        assert!(reads_after_first > 0, "first call must read from disk");
+
+        // Second call — should be served entirely from cache.
+        let items2 = completions_cached(main_src, off, Some(&main_path), &cache);
+        let reads_after_second = cache.reads();
+        assert_eq!(
+            reads_after_first, reads_after_second,
+            "second call must not trigger any additional disk reads"
+        );
+
+        // Results must be identical.
+        let labels1: Vec<&str> = items1.iter().map(|i| i.label.as_str()).collect();
+        let labels2: Vec<&str> = items2.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels1, labels2,
+            "both calls must return identical completions"
+        );
+        assert!(
+            labels1.contains(&"SomeType"),
+            "SomeType must be in completions"
+        );
+    }
+
+    /// Test 5: goto_definition_cross_file with a missing file returns None, no panic.
+    /// (Exercises the no-fetch / missing-file guard through the cached path.)
+    #[test]
+    fn import_cache_goto_missing_file_returns_none() {
+        let dir = scratch_dir();
+        write_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        // vendor/pkg.mang intentionally NOT created
+        let main_src = "use \"ns/pkg@v1\" as k\ntype Local = k.SomeType\n";
+        let main_path = dir.join("main.mang");
+        let off = main_src.rfind("SomeType").unwrap();
+
+        let cache = ImportCache::new();
+        let result = goto_definition_cross_file_cached(main_src, off, &main_path, &cache);
+        assert!(
+            result.is_none(),
+            "expected None for missing package (cached path), got {result:?}"
+        );
+        assert_eq!(cache.reads(), 0, "no disk read for a missing file");
     }
 }
