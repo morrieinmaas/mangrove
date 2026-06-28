@@ -569,6 +569,65 @@ fn tree_has_expected_kinds_at_paths() {
     assert_eq!(first_node(&r2, UNSET).kind(), UNSET);
 }
 
+// ---- Depth limit: no stack overflow on deeply nested input ----
+
+/// D1: parse_cst on a deeply-nested value MUST return (not abort) AND be lossless
+/// AND record at least one error. Before the fix this ABORTS via SIGABRT (stack
+/// overflow — uncatchable by catch_unwind). To confirm RED: build the binary and
+/// run `timeout 15 <bin> fmt <file>`; exit 134 = SIGABRT.
+#[test]
+fn deeply_nested_value_does_not_overflow() {
+    // 100_000 open brackets (far beyond the 128-deep cap)
+    let src_list = format!("x: {}", "[".repeat(100_000));
+    let parse_list = super::parse::parse_cst(&src_list);
+    assert_eq!(
+        parse_list.syntax().text().to_string(),
+        src_list,
+        "lossless on deep list nesting"
+    );
+    assert!(
+        !parse_list.errors.is_empty(),
+        "should record a depth error for deeply nested list"
+    );
+
+    // 100_000 open records (each `{a: ` — depth exceeds cap)
+    let src_rec = "a: ".to_string() + &"{a: ".repeat(100_000);
+    let parse_rec = super::parse::parse_cst(&src_rec);
+    assert_eq!(
+        parse_rec.syntax().text().to_string(),
+        src_rec,
+        "lossless on deep record nesting"
+    );
+    assert!(
+        !parse_rec.errors.is_empty(),
+        "should record a depth error for deeply nested record"
+    );
+}
+
+/// D2: a reasonably nested valid input (10-deep) still parses correctly and
+/// round-trips through lower with NO errors — the depth cap does not affect
+/// real-world inputs.
+#[test]
+fn moderately_nested_input_parses_normally() {
+    // 10-deep list: well below MAX_DEPTH
+    let depth = 10usize;
+    let src = format!("x: {}{}", "[".repeat(depth), "]".repeat(depth));
+    let parse = super::parse::parse_cst(&src);
+    assert_eq!(
+        parse.syntax().text().to_string(),
+        src,
+        "lossless on 10-deep list"
+    );
+    assert!(
+        parse.errors.is_empty(),
+        "no errors on a valid 10-deep list: {:?}",
+        parse.errors
+    );
+
+    // Also verify round-trip via oracle
+    assert_hash_equivalent(&src);
+}
+
 fn relex_roundtrips(src: &str) {
     let toks = super::lex::lex_lossless(src);
     let joined: String = toks.iter().map(|t| &src[t.start..t.end]).collect();

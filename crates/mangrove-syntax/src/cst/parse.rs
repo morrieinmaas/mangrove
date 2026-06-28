@@ -8,6 +8,10 @@ use super::kind::{MangroveLang, SyntaxKind, SyntaxNode};
 use super::lex::{LosslessTok, lex_lossless};
 use rowan::GreenNodeBuilder;
 
+/// Maximum value-container nesting depth. Matches the legacy parser's `MAX_DEPTH`
+/// (parser.rs:55) so both parsers agree on the depth limit for deep inputs.
+const CST_MAX_DEPTH: usize = 128;
+
 pub struct Parse {
     pub green: rowan::GreenNode,
     pub errors: Vec<ParseError>,
@@ -337,7 +341,7 @@ fn parse_binding(p: &mut Parser) {
     if p.current() == SyntaxKind::COLON {
         p.bump();
     }
-    parse_atom(p, false);
+    parse_atom(p, false, 0);
     p.finish();
 }
 
@@ -346,10 +350,12 @@ fn parse_binding(p: &mut Parser) {
 /// `stop_at_closer`: when `true` (inside a record or list), the error-recovery
 /// sync boundary also includes `R_BRACE` and `R_BRACKET` — the container's
 /// closer must NOT be consumed by recovery.
-fn parse_atom(p: &mut Parser, stop_at_closer: bool) {
+/// `depth`: current container nesting level; incremented on each descent into a
+/// record or list.
+fn parse_atom(p: &mut Parser, stop_at_closer: bool, depth: usize) {
     match p.current() {
-        SyntaxKind::L_BRACE => parse_record(p),
-        SyntaxKind::L_BRACKET => parse_list(p),
+        SyntaxKind::L_BRACE => parse_record(p, depth + 1),
+        SyntaxKind::L_BRACKET => parse_list(p, depth + 1),
         SyntaxKind::INT
         | SyntaxKind::STR
         | SyntaxKind::BOOL
@@ -389,7 +395,14 @@ fn parse_atom(p: &mut Parser, stop_at_closer: bool) {
     }
 }
 
-fn parse_record(p: &mut Parser) {
+fn parse_record(p: &mut Parser, depth: usize) {
+    if depth >= CST_MAX_DEPTH {
+        p.push_error("nesting too deep");
+        p.start(SyntaxKind::ERROR);
+        consume_nested_remainder(p);
+        p.finish();
+        return;
+    }
     p.start(SyntaxKind::RECORD);
     p.bump(); // L_BRACE
     loop {
@@ -404,7 +417,7 @@ fn parse_record(p: &mut Parser) {
                 if p.current() == SyntaxKind::COLON {
                     p.bump(); // COLON
                 }
-                parse_atom(p, true); // value — stop_at_closer=true: don't eat }
+                parse_atom(p, true, depth); // value — stop_at_closer=true: don't eat }
                 p.finish(); // FIELD
             }
             // Foreign closers (R_BRACKET, R_PAREN) inside a record: error_and_recover
@@ -426,7 +439,14 @@ fn parse_record(p: &mut Parser) {
     p.finish(); // RECORD
 }
 
-fn parse_list(p: &mut Parser) {
+fn parse_list(p: &mut Parser, depth: usize) {
+    if depth >= CST_MAX_DEPTH {
+        p.push_error("nesting too deep");
+        p.start(SyntaxKind::ERROR);
+        consume_nested_remainder(p);
+        p.finish();
+        return;
+    }
     p.start(SyntaxKind::LIST);
     p.bump(); // L_BRACKET
     loop {
@@ -446,12 +466,46 @@ fn parse_list(p: &mut Parser) {
                 p.finish();
             }
             _ => {
-                parse_atom(p, true); // element value — stop_at_closer=true: don't eat ]
+                parse_atom(p, true, depth); // element value — stop_at_closer=true: don't eat ]
             }
         }
     }
     p.bump(); // R_BRACKET (or no-op at EOF)
     p.finish(); // LIST
+}
+
+/// Consume all remaining tokens of the current deeply-nested construct as raw
+/// tokens without calling parse_atom/parse_record/parse_list. Tracks
+/// brace/bracket/paren depth so the balanced remainder is consumed up to the
+/// matching closers or EOF. Every token is bumped into the tree, preserving
+/// losslessness.
+fn consume_nested_remainder(p: &mut Parser) {
+    let mut depth = 0usize;
+    loop {
+        match p.current() {
+            SyntaxKind::EOF => break,
+            SyntaxKind::L_BRACE | SyntaxKind::L_BRACKET | SyntaxKind::L_PAREN => {
+                depth += 1;
+                p.bump();
+            }
+            SyntaxKind::R_BRACE | SyntaxKind::R_BRACKET | SyntaxKind::R_PAREN => {
+                if depth == 0 {
+                    // Don't consume the closer that belongs to the parent container.
+                    break;
+                }
+                depth -= 1;
+                p.bump();
+            }
+            SyntaxKind::NEWLINE if depth == 0 => {
+                // At top-level (outside any opener we ate), stop before the newline
+                // so the enclosing binding loop can use it as a separator.
+                break;
+            }
+            _ => {
+                p.bump();
+            }
+        }
+    }
 }
 
 fn parse_spread(p: &mut Parser) {
@@ -469,7 +523,7 @@ fn parse_list_op_item(p: &mut Parser) {
     match p.current() {
         SyntaxKind::PLUS_EQ => {
             p.bump(); // +=
-            parse_atom(p, false); // value (typically a list)
+            parse_atom(p, false, 0); // value (typically a list)
         }
         SyntaxKind::L_BRACE => {
             // key { patch/append/remove ops } — consume the whole brace block + newline
