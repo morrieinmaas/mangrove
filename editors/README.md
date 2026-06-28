@@ -72,7 +72,7 @@ If the language server fails to start, check that `mangrove` is on `$PATH`:
 
 ```sh
 which mangrove
-mangrove lsp --version   # should print something and exit cleanly
+mangrove --version   # prints the version (note: `mangrove lsp` runs the server on stdio and waits for a client)
 ```
 
 Zed's log panel (`View > Toggle Log`) shows LSP stderr output.
