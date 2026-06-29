@@ -229,6 +229,14 @@ fn check(
         }
 
         Type::Union(variants) => {
+            // Attempt discriminated-union dispatch first (purely additive — does not
+            // change the accept/reject set for non-DU shapes). If detection fails at
+            // any step, fall through to the existing try-each-variant loop below.
+            if let Some(result) = try_du_dispatch(value, variants, ty, path, env, depth) {
+                return result;
+            }
+
+            // Fallback: try each variant in order, return empty on first match.
             // If an arm hits the depth guard, surface that real cause rather than
             // the generic "no matching variant" (which would otherwise mask it).
             let mut too_deep = None;
@@ -276,6 +284,152 @@ fn check(
         // §4.6: a brand validates exactly as its structural `inner` — a bare
         // literal into a brand-typed slot is auto-constructed (no ceremony).
         Type::Brand { inner, .. } => check(value, inner, path, env, depth + 1),
+    }
+}
+
+/// Try discriminated-union dispatch. Returns `Some(errors)` when DU detection
+/// succeeds and we've dispatched to a single variant (errors may be empty on
+/// success). Returns `None` to signal the caller to fall back to try-each.
+///
+/// Detection rules (all must hold or we return None):
+///   1. Every variant resolves through `Named`/`Brand` to a plain `Record`.
+///   2. There exists a field name that is: present in every resolved record,
+///      non-optional, has a literal type (`LitStr`/`LitInt`/`LitBool`), AND
+///      the literal values are pairwise distinct.
+///   3. The value is a `Value::Map` that contains the discriminant field.
+///   4. The field's value matches exactly one variant's literal.
+fn try_du_dispatch(
+    value: &Value,
+    variants: &[Type],
+    union_ty: &Type,
+    path: &str,
+    env: &TypeEnv,
+    depth: usize,
+) -> Option<Vec<ValidationError>> {
+    use mangrove_syntax::FieldDef;
+
+    // Step 1: resolve each variant to a Record, keeping the original type node.
+    let resolved: Vec<(&Type, &[FieldDef])> = variants
+        .iter()
+        .map(|orig| resolve_to_record(orig, env).map(|fields| (orig, fields)))
+        .collect::<Option<Vec<_>>>()?;
+
+    // Step 2: find a qualifying discriminant field.
+    // Iterate candidate names in the order of the first variant's fields.
+    let disc_name: &str = resolved[0]
+        .1
+        .iter()
+        .find(|f| is_discriminant(f, &resolved))?
+        .name
+        .as_str();
+
+    // Step 3: value must be a map containing the discriminant field.
+    let Value::Map(map) = value else {
+        return None;
+    };
+    let disc_val = map.get(disc_name)?;
+
+    // Step 4: find the single matching variant.
+    let matched = resolved.iter().find(|(_, fields)| {
+        fields
+            .iter()
+            .find(|f| f.name == disc_name)
+            .is_some_and(|f| lit_matches(&f.ty, disc_val))
+    });
+
+    Some(match matched {
+        Some((orig_ty, _)) => check(value, orig_ty, path, env, depth + 1),
+        None => {
+            // Discriminant present but value doesn't match any variant.
+            let candidates: Vec<String> = resolved
+                .iter()
+                .filter_map(|(_, fields)| {
+                    fields
+                        .iter()
+                        .find(|f| f.name == disc_name)
+                        .map(|f| render_type(&f.ty))
+                })
+                .collect();
+            let failed = format!(
+                "unknown {disc_name} {}: expected one of {}",
+                render(disc_val),
+                candidates.join(" | ")
+            );
+            vec![mismatch(path, value, union_ty).with_failed(failed)]
+        }
+    })
+}
+
+/// Resolve a type through `Named` (one level of env lookup) and `Brand` wrappers
+/// until we reach a `Record`. Returns `None` if the chain doesn't end at a Record.
+fn resolve_to_record<'a>(
+    ty: &'a Type,
+    env: &'a TypeEnv,
+) -> Option<&'a [mangrove_syntax::FieldDef]> {
+    match ty {
+        Type::Record { fields, .. } => Some(fields),
+        Type::Brand { inner, .. } => resolve_to_record(inner, env),
+        Type::Named(n) => resolve_to_record(env.resolve(n)?, env),
+        _ => None,
+    }
+}
+
+/// Returns `true` if `field` qualifies as a discriminant field given all resolved
+/// variant records. A qualifying field must, in every variant, be: present,
+/// non-optional, have a literal type, and the literal values must be pairwise distinct.
+fn is_discriminant(
+    candidate: &mangrove_syntax::FieldDef,
+    resolved: &[(&Type, &[mangrove_syntax::FieldDef])],
+) -> bool {
+    if candidate.optional {
+        return false;
+    }
+    if !matches!(
+        candidate.ty,
+        Type::LitStr(_) | Type::LitInt(_) | Type::LitBool(_)
+    ) {
+        return false;
+    }
+
+    // Every variant must have this field as a non-optional literal, and all
+    // literals must be pairwise distinct.
+    let mut seen_lits: Vec<&Type> = Vec::new();
+    for (_, fields) in resolved {
+        let Some(f) = fields.iter().find(|f| f.name == candidate.name) else {
+            return false;
+        };
+        if f.optional {
+            return false;
+        }
+        if !matches!(f.ty, Type::LitStr(_) | Type::LitInt(_) | Type::LitBool(_)) {
+            return false;
+        }
+        // Check distinctness against previously seen literals.
+        if seen_lits.iter().any(|prev| lit_eq(prev, &f.ty)) {
+            return false;
+        }
+        seen_lits.push(&f.ty);
+    }
+    true
+}
+
+/// Returns `true` when `value` equals the literal encoded in `lit_ty`.
+fn lit_matches(lit_ty: &Type, value: &Value) -> bool {
+    match (lit_ty, value) {
+        (Type::LitStr(s), Value::Str(v)) => s == v,
+        (Type::LitInt(n), Value::Int(v)) => n == v,
+        (Type::LitBool(b), Value::Bool(v)) => b == v,
+        _ => false,
+    }
+}
+
+/// Returns `true` when two literal types encode the same value.
+fn lit_eq(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::LitStr(x), Type::LitStr(y)) => x == y,
+        (Type::LitInt(x), Type::LitInt(y)) => x == y,
+        (Type::LitBool(x), Type::LitBool(y)) => x == y,
+        _ => false,
     }
 }
 
@@ -732,5 +886,173 @@ mod tests {
         let e = errs(Value::Str("x".into()), "str & =~ \"[\"");
         assert_eq!(e.len(), 1);
         assert!(e[0].failed.as_deref().unwrap().contains("valid regex"));
+    }
+
+    // --- discriminated-union tests ---
+
+    fn du_env() -> TypeEnv {
+        // Resource = { kind: "PVC",     spec: { storage: str } }
+        //           | { kind: "CronJob", schedule: str }
+        use mangrove_syntax::{TypeDef, parse_type};
+        TypeEnv::build(
+            &[TypeDef {
+                name: "Resource".into(),
+                ty: parse_type(
+                    "{ kind: \"PVC\", spec: { storage: str } } | { kind: \"CronJob\", schedule: str }",
+                )
+                .unwrap(),
+                annotations: vec![],
+            }],
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn du_precise_nested_error() {
+        // PVC with wrong storage type — error must be at spec.storage, not "no matching variant"
+        let env = du_env();
+        let v = map(&[
+            ("kind", Value::Str("PVC".into())),
+            ("spec", map(&[("storage", Value::Int(123.into()))])),
+        ]);
+        let e = validate(&v, &Type::Named("Resource".into()), &env);
+        assert_eq!(e.len(), 1, "expected exactly one error, got: {e:?}");
+        assert_eq!(
+            e[0].path, "spec.storage",
+            "error must point at spec.storage"
+        );
+        // must be a type mismatch, not "no matching variant"
+        assert_ne!(
+            e[0].failed.as_deref(),
+            Some("no matching variant"),
+            "must be a precise error, not generic union failure"
+        );
+    }
+
+    #[test]
+    fn du_unknown_discriminant_value() {
+        // kind: "Service" — no variant matches; expect single error listing valid values
+        let env = du_env();
+        let v = map(&[
+            ("kind", Value::Str("Service".into())),
+            ("spec", map(&[("storage", Value::Str("1Ti".into()))])),
+        ]);
+        let e = validate(&v, &Type::Named("Resource".into()), &env);
+        assert_eq!(e.len(), 1, "expected exactly one error, got: {e:?}");
+        let failed = e[0].failed.as_deref().unwrap_or("");
+        assert!(
+            failed.contains("unknown kind"),
+            "failed should say 'unknown kind', got: {failed:?}"
+        );
+        assert!(
+            failed.contains("\"PVC\"") && failed.contains("\"CronJob\""),
+            "failed should list valid discriminant values, got: {failed:?}"
+        );
+    }
+
+    #[test]
+    fn du_list_of_resources() {
+        // [ PVC-ok, CronJob-bad ] — exactly one error at [1].schedule
+        let env = du_env();
+        let pvc = map(&[
+            ("kind", Value::Str("PVC".into())),
+            ("spec", map(&[("storage", Value::Str("12Ti".into()))])),
+        ]);
+        let cronjob_bad = map(&[
+            ("kind", Value::Str("CronJob".into())),
+            ("schedule", Value::Int(5.into())), // wrong type
+        ]);
+        let list = Value::List(vec![pvc, cronjob_bad]);
+        let list_ty = Type::List(Box::new(Type::Named("Resource".into())));
+        let e = validate(&list, &list_ty, &env);
+        assert_eq!(e.len(), 1, "expected exactly one error, got: {e:?}");
+        assert_eq!(e[0].path, "[1].schedule");
+    }
+
+    #[test]
+    fn du_happy_path() {
+        // Both well-formed variants should validate with zero errors
+        let env = du_env();
+        let pvc = map(&[
+            ("kind", Value::Str("PVC".into())),
+            ("spec", map(&[("storage", Value::Str("10Gi".into()))])),
+        ]);
+        let cronjob = map(&[
+            ("kind", Value::Str("CronJob".into())),
+            ("schedule", Value::Str("0 * * * *".into())),
+        ]);
+        assert!(
+            validate(&pvc, &Type::Named("Resource".into()), &env).is_empty(),
+            "PVC should be valid"
+        );
+        assert!(
+            validate(&cronjob, &Type::Named("Resource".into()), &env).is_empty(),
+            "CronJob should be valid"
+        );
+    }
+
+    #[test]
+    fn du_regression_non_record_union_falls_back() {
+        // int | str: not a DU; value `true` should still give "no matching variant"
+        let e = errs(Value::Bool(true), "int | str");
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].failed.as_deref(), Some("no matching variant"));
+    }
+
+    #[test]
+    fn du_regression_no_common_discriminant_falls_back() {
+        // Two records with no common required literal field — must fall back to try-each.
+        // A value matching the first variant should be accepted (zero errors).
+        let v = map(&[("x", Value::Int(1.into()))]);
+        // { x: int } | { y: str } — no common literal discriminant
+        assert!(errs(v, "{ x: int } | { y: str }").is_empty());
+    }
+
+    #[test]
+    fn du_named_variant_message_propagates() {
+        // When a named type has @message, that message should still appear on mismatch
+        // after DU dispatches to the named variant.
+        use mangrove_syntax::{Annotation, TypeDef, parse_type};
+        let env = TypeEnv::build(
+            &[
+                TypeDef {
+                    name: "PVC".into(),
+                    ty: parse_type("{ kind: \"PVC\", storage: str }").unwrap(),
+                    annotations: vec![Annotation {
+                        name: "message".into(),
+                        arg: Some("invalid PVC".into()),
+                    }],
+                },
+                TypeDef {
+                    name: "CronJob".into(),
+                    ty: parse_type("{ kind: \"CronJob\", schedule: str }").unwrap(),
+                    annotations: vec![],
+                },
+                TypeDef {
+                    name: "Resource".into(),
+                    ty: Type::Union(vec![
+                        Type::Named("PVC".into()),
+                        Type::Named("CronJob".into()),
+                    ]),
+                    annotations: vec![],
+                },
+            ],
+            &[],
+        )
+        .unwrap();
+        // kind: "PVC" but storage is int — DU should dispatch to PVC, Named wraps it,
+        // @message "invalid PVC" should appear on the error.
+        let v = map(&[
+            ("kind", Value::Str("PVC".into())),
+            ("storage", Value::Int(99.into())),
+        ]);
+        let e = validate(&v, &Type::Named("Resource".into()), &env);
+        assert_eq!(e.len(), 1, "expected one error, got: {e:?}");
+        assert_eq!(
+            e[0].message.as_deref(),
+            Some("invalid PVC"),
+            "@message from named variant should propagate"
+        );
     }
 }
