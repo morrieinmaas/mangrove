@@ -180,30 +180,39 @@ fn compose_rec(
     }
     visiting.pop();
 
-    // Fold the body statements left-to-right.
-    let mut acc = Value::Map(BTreeMap::new());
-    for stmt in &doc.stmts {
-        match stmt {
-            Stmt::Spread(alias) => {
-                let base = modules
-                    .get(alias)
-                    .ok_or_else(|| format!("unknown spread alias `{alias}`"))?;
-                acc = merge(acc, base.body.clone());
-            }
-            Stmt::Bind(k, v) => {
-                let mut one = BTreeMap::new();
-                one.insert(k.clone(), v.clone());
-                acc = merge(acc, Value::Map(one));
-            }
-            Stmt::Append(k, v) => {
-                acc = apply_append(acc, k, v.clone())?;
-            }
-            Stmt::ListOp(k, items) => {
-                let keyfield = key_field(&doc, k)?;
-                acc = apply_list_ops(acc, k, items, &keyfield)?;
+    // For bare-value documents (stmts is empty, body holds the value directly)
+    // return doc.body as-is. This also handles empty documents (stmts empty,
+    // body is an empty map), which is also correct. Folding stmts in either case
+    // would discard the body and return an empty map — the bug being fixed here.
+    let body = if doc.stmts.is_empty() {
+        doc.body.clone()
+    } else {
+        // Fold the body statements left-to-right (normal binding documents).
+        let mut acc = Value::Map(BTreeMap::new());
+        for stmt in &doc.stmts {
+            match stmt {
+                Stmt::Spread(alias) => {
+                    let base = modules
+                        .get(alias)
+                        .ok_or_else(|| format!("unknown spread alias `{alias}`"))?;
+                    acc = merge(acc, base.body.clone());
+                }
+                Stmt::Bind(k, v) => {
+                    let mut one = BTreeMap::new();
+                    one.insert(k.clone(), v.clone());
+                    acc = merge(acc, Value::Map(one));
+                }
+                Stmt::Append(k, v) => {
+                    acc = apply_append(acc, k, v.clone())?;
+                }
+                Stmt::ListOp(k, items) => {
+                    let keyfield = key_field(&doc, k)?;
+                    acc = apply_list_ops(acc, k, items, &keyfield)?;
+                }
             }
         }
-    }
+        acc
+    };
 
     Ok(Composed {
         typedefs: doc.typedefs,
@@ -214,7 +223,7 @@ fn compose_rec(
         fns: doc.fns,
         modules,
         pinned,
-        body: acc,
+        body,
     })
 }
 
@@ -666,6 +675,46 @@ mod tests {
         let dir = scratch(&refs);
         let e = compose(&dir.join("f0.mang")).unwrap_err();
         assert!(e.contains("too deep"), "{e}");
+    }
+
+    // --- bare-value document tests (fix for compose discarding doc.body) ---
+
+    #[test]
+    fn bare_list_composes_to_list_not_empty_map() {
+        let dir = scratch(&[("doc.mang", "[ 1, 2, 3 ]\n")]);
+        let c = compose(&dir.join("doc.mang")).unwrap();
+        assert_eq!(
+            c.body,
+            Value::List(vec![
+                Value::Int(1.into()),
+                Value::Int(2.into()),
+                Value::Int(3.into()),
+            ]),
+            "bare list must compose to Value::List, not empty map"
+        );
+    }
+
+    #[test]
+    fn bare_scalar_composes_to_int() {
+        let dir = scratch(&[("doc.mang", "42\n")]);
+        let c = compose(&dir.join("doc.mang")).unwrap();
+        assert_eq!(
+            c.body,
+            Value::Int(42.into()),
+            "bare integer must compose to Value::Int, not empty map"
+        );
+    }
+
+    #[test]
+    fn binding_document_still_folds_stmts() {
+        // Regression: the stmts.is_empty() branch must not disturb the fold path.
+        let dir = scratch(&[("doc.mang", "a: 1\n")]);
+        let c = compose(&dir.join("doc.mang")).unwrap();
+        assert_eq!(
+            get(&c.body, "a"),
+            Some(&Value::Int(1.into())),
+            "single-binding document must still fold stmts correctly"
+        );
     }
 
     #[test]
