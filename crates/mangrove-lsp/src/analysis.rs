@@ -1276,8 +1276,9 @@ fn find_binding_key_range(root: &SyntaxNode, name: &str) -> Option<(usize, usize
 
 // ---- rename ----
 
-/// Validate that `new_name` is a legal Mangrove identifier (a non-empty bareword
-/// that matches `[a-zA-Z_][a-zA-Z0-9_]*`).
+/// Validate that `new_name` is a legal Mangrove identifier.  Matches the
+/// lexer rules exactly: start position requires `[a-zA-Z_]`; continue
+/// position allows `[a-zA-Z0-9_-]` (hyphen is valid after the first char).
 fn is_valid_identifier(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -1287,7 +1288,7 @@ fn is_valid_identifier(s: &str) -> bool {
     if !first.is_ascii_alphabetic() && first != '_' {
         return false;
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Return the byte ranges to replace for a rename of the symbol under `offset`
@@ -1342,11 +1343,16 @@ fn walk_mang_files_inner(dir: &Path, out: &mut Vec<PathBuf>) {
         if name.starts_with('.') || name == "target" {
             continue;
         }
-        if path.is_dir() {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if ft.is_dir() {
             walk_mang_files_inner(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("mang") {
+        } else if ft.is_file() && path.extension().and_then(|e| e.to_str()) == Some("mang") {
             out.push(path);
         }
+        // ft.is_symlink() → skip (no recursion; avoids ancestor-dir cycles)
     }
 }
 
@@ -3035,6 +3041,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rename_to_hyphenated_name_succeeds() {
+        // `my-field` is a valid Mangrove bareword (lexer allows `-` in continue position).
+        let src = "type my-field = int\n";
+        // cursor on `my-field` in the type declaration
+        let off = src.find("my-field").unwrap();
+        let result = rename(src, off, "your-field");
+        assert!(
+            result.is_some(),
+            "rename to 'your-field' must succeed (hyphen is valid in continue position), got None"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_leading_hyphen() {
+        // Leading `-` is not allowed per is_ident_start.
+        let src = "type Foo = int\n";
+        let off = src.find("Foo").unwrap();
+        let result = rename(src, off, "-bad");
+        assert!(
+            result.is_none(),
+            "rename to '-bad' (leading hyphen) must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_leading_digit() {
+        let src = "type Foo = int\n";
+        let off = src.find("Foo").unwrap();
+        let result = rename(src, off, "1bad");
+        assert!(
+            result.is_none(),
+            "rename to '1bad' (leading digit) must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_name_with_space() {
+        let src = "type Foo = int\n";
+        let off = src.find("Foo").unwrap();
+        let result = rename(src, off, "bad name");
+        assert!(
+            result.is_none(),
+            "rename to 'bad name' (space) must be rejected, got {result:?}"
+        );
+    }
+
     // ---- cross-file go-to-definition tests ----
 
     fn write_fixture(dir: &std::path::Path, rel: &str, contents: &str) {
@@ -3943,6 +3996,53 @@ mod tests {
         assert!(
             !paths.iter().any(|p| p.ends_with("b.mang")),
             "b.mang must not appear when workspace_root is None, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn rename_in_workspace_declines_on_imported_ref() {
+        let dir = make_workspace();
+        // b.mang: `use "local/a@v1" as x\ntype T = x.S\n`
+        // Cursor on `S` inside `x.S` — this is a FOREIGN (imported) symbol,
+        // not locally defined in b.mang.
+        let b_path = dir.join("b.mang");
+        let b_src = std::fs::read_to_string(&b_path).unwrap();
+        let cache = ImportCache::new();
+        // Find the `S` offset inside `x.S` (the type-ref, not a local decl).
+        let off = b_src.rfind('S').unwrap(); // only one S in b.mang — it's `x.S`
+
+        // rename must decline (return None) — cannot rename a foreign symbol
+        let result = rename_in_workspace(&b_src, off, "NewName", &b_path, Some(&dir), &cache);
+        assert!(
+            result.is_none(),
+            "rename_in_workspace must return None when cursor is on imported ref (x.S), got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_mang_files_skips_symlinked_dirs() {
+        let dir = scratch_dir();
+        // Write a real .mang file.
+        std::fs::write(dir.join("a.mang"), "type A = int\n").unwrap();
+        // Create a subdirectory with a symlink pointing back to the workspace root,
+        // which would cause infinite recursion if followed.
+        let subdir = dir.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::os::unix::fs::symlink(&dir, subdir.join("cycle")).unwrap();
+
+        let results = walk_mang_files(&dir);
+
+        // a.mang must appear exactly once.
+        assert!(
+            results.iter().any(|p| p.ends_with("a.mang")),
+            "a.mang must appear in walk results, got {results:?}"
+        );
+        // Must not have hit the 500-file cap (symlink cycle not followed).
+        assert!(
+            results.len() < 500,
+            "walk hit 500-file cap — symlink cycle was followed, got {} files",
+            results.len()
         );
     }
 }
