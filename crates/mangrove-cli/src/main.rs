@@ -157,6 +157,15 @@ fn evaluate(path: &str) -> Result<mangrove_core::Value, String> {
     let modules = build_modules(&doc.modules).map_err(|e| format!("{path}: {e}"))?;
     let body = mangrove_typed::eval(&doc.body, &doc.params, &doc.fns, &env, &modules)
         .map_err(|e| format!("{path}: {e}"))?;
+    // Reject a surviving `Value::Unset` before it reaches the CBOR encoder's
+    // panic guard. `unset` only removes a binding during composition — it is
+    // never a final value, whether at the document root, in a list element, or
+    // nested inside a map.  This runs for both schema and no-schema paths.
+    if contains_unset(&body) {
+        return Err(format!(
+            "{path}: `unset` is not a value (it only removes a binding during composition)"
+        ));
+    }
     match &doc.schema {
         Some(name) => {
             let ty = effective_schema(name, &doc.schema_narrow, &env)
@@ -353,6 +362,20 @@ fn contains_unit(v: &mangrove_core::Value) -> bool {
     }
 }
 
+/// Whether a value tree contains a surviving `Value::Unset`. `unset` is only
+/// ever meaningful as a binding-time directive that removes a key during
+/// composition; it must never appear in a final evaluated body. This guard
+/// covers the root, list elements, and nested map values.
+fn contains_unset(v: &mangrove_core::Value) -> bool {
+    use mangrove_core::Value;
+    match v {
+        Value::Unset => true,
+        Value::List(xs) => xs.iter().any(contains_unset),
+        Value::Map(m) => m.values().any(contains_unset),
+        _ => false,
+    }
+}
+
 fn cmd_check(path: &str) -> ExitCode {
     let doc = match mangrove_compose::compose(std::path::Path::new(path)) {
         Ok(c) => c,
@@ -484,5 +507,43 @@ fn print_error(e: &ValidationError) {
     }
     if let Some(m) = &e.message {
         println!("  message:  {m}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains_unset;
+    use mangrove_core::Value;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn contains_unset_direct() {
+        assert!(contains_unset(&Value::Unset));
+    }
+
+    #[test]
+    fn contains_unset_in_list() {
+        let list = Value::List(vec![
+            Value::Int(1.into()),
+            Value::Unset,
+            Value::Int(3.into()),
+        ]);
+        assert!(contains_unset(&list));
+    }
+
+    #[test]
+    fn contains_unset_in_map_value() {
+        let mut m = BTreeMap::new();
+        m.insert("a".to_string(), Value::Unset);
+        assert!(contains_unset(&Value::Map(m)));
+    }
+
+    #[test]
+    fn contains_unset_false_for_plain_values() {
+        assert!(!contains_unset(&Value::Int(42.into())));
+        assert!(!contains_unset(&Value::Bool(true)));
+        assert!(!contains_unset(&Value::Str("hello".into())));
+        let list = Value::List(vec![Value::Int(1.into()), Value::Int(2.into())]);
+        assert!(!contains_unset(&list));
     }
 }

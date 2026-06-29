@@ -717,6 +717,25 @@ fn oracle_bare_value_hash() {
     assert_hash_equivalent("\"hello\"\n");
 }
 
+/// M4: bare `unset` and `match` as document bodies — the oracle must agree
+/// (both produce Value::Unset / Value::Match respectively) without panicking.
+/// These are `assert_value_equivalent` rather than `assert_hash_equivalent`
+/// because CBOR panics on Unset/Match by design; we only need both parsers to
+/// agree on the *value* they produce.
+#[test]
+fn oracle_bare_unset_document() {
+    // Both parsers must agree that a bare `unset` document produces Value::Unset.
+    assert_value_equivalent("unset\n");
+}
+
+#[test]
+fn oracle_bare_match_document() {
+    // Both parsers must agree on a bare `match` expression document.
+    assert_value_equivalent(
+        "params {\n  env: \"dev\" | \"prod\" = \"dev\"\n}\nmatch env { dev: 1, prod: 2 }\n",
+    );
+}
+
 #[test]
 fn bare_value_cst_node_kind() {
     // The CST must emit a BARE_VALUE node as a direct child of DOCUMENT

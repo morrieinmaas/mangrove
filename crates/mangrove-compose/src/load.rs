@@ -195,6 +195,15 @@ fn compose_rec(
                     let base = modules
                         .get(alias)
                         .ok_or_else(|| format!("unknown spread alias `{alias}`"))?;
+                    // Spreading is record-merge semantics: the source must be a
+                    // map (record). A bare-list or scalar module body cannot be
+                    // spread — doing so would silently discard the list (merge's
+                    // `(_, over)` arm overwrites it with whatever follows).
+                    if !matches!(base.body, Value::Map(_)) {
+                        return Err(format!(
+                            "cannot spread `...{alias}`: a spread source must be a record, but its body is not"
+                        ));
+                    }
                     acc = merge(acc, base.body.clone());
                 }
                 Stmt::Bind(k, v) => {
@@ -714,6 +723,34 @@ mod tests {
             get(&c.body, "a"),
             Some(&Value::Int(1.into())),
             "single-binding document must still fold stmts correctly"
+        );
+    }
+
+    #[test]
+    fn spread_of_bare_list_module_errors_cleanly() {
+        // I1: spreading a module whose body is a bare list must error, not silently
+        // discard the list. Before the fix: `x: 1` is the only output (list dropped).
+        let dir = scratch(&[
+            ("list.mang", "[ 1, 2, 3 ]\n"),
+            ("root.mang", "use \"./list.mang\" as L\n...L\nx: 1\n"),
+        ]);
+        let e = compose(&dir.join("root.mang")).unwrap_err();
+        assert!(
+            e.contains("cannot spread") && e.contains("L"),
+            "expected spread-of-non-record error, got: {e}"
+        );
+    }
+
+    #[test]
+    fn spread_of_bare_scalar_module_errors_cleanly() {
+        let dir = scratch(&[
+            ("num.mang", "42\n"),
+            ("root.mang", "use \"./num.mang\" as N\n...N\nx: 1\n"),
+        ]);
+        let e = compose(&dir.join("root.mang")).unwrap_err();
+        assert!(
+            e.contains("cannot spread") && e.contains("N"),
+            "expected spread-of-non-record error, got: {e}"
         );
     }
 

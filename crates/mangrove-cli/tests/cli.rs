@@ -517,6 +517,60 @@ fn required_param_without_value_fails_check() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("v"));
 }
 
+// ── C1: bare `unset` and unset-in-list must be clean errors, not panics ──────
+
+#[test]
+fn bare_unset_document_hash_exits_1_with_clean_message() {
+    // C1: `unset\n` as the entire document must produce exit 1 with a helpful
+    // error message — NOT a panic/SIGABRT (exit 101) from the CBOR encoder.
+    let p = std::env::temp_dir().join(format!("c1_bare_unset_{}.mang", std::process::id()));
+    std::fs::write(&p, "unset\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+        .arg("hash")
+        .arg(&p)
+        .output()
+        .unwrap();
+    // Must exit 1 (clean error), not 101 (panic) or any signal.
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "bare `unset` must exit 1, got {:?}; stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unset"),
+        "error message must mention `unset`, got: {stderr}"
+    );
+}
+
+#[test]
+fn list_with_unset_element_hash_exits_1_with_clean_message() {
+    // C1: `[ 1, unset, 3 ]` must produce exit 1 — not panic. The `unset` in a
+    // list element is never stripped by merge (merge only strips map values), so
+    // without the guard it reaches the CBOR encoder and aborts.
+    let p = std::env::temp_dir().join(format!("c1_list_unset_{}.mang", std::process::id()));
+    std::fs::write(&p, "[ 1, unset, 3 ]\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+        .arg("hash")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "list with unset element must exit 1, got {:?}; stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unset"),
+        "error message must mention `unset`, got: {stderr}"
+    );
+}
+
 #[test]
 fn schemaless_unit_literal_errors() {
     let p = std::env::temp_dir().join("m2b_bare.mang");

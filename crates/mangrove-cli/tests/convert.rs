@@ -177,37 +177,63 @@ fn import_multidoc_yaml_succeeds_and_prints_list() {
 
 #[test]
 fn export_yaml_stream_list_produces_multidoc_output() {
-    // A .mang whose body is a list → `--to yaml-stream` emits a multi-doc stream.
+    // A bare-list .mang (now supported as a bare-value document) exported with
+    // `--to yaml-stream` must emit one YAML document per element separated by
+    // `---`, not a single flat document.
     let pid = std::process::id();
-    let f = std::env::temp_dir().join(format!("m5_stream_{pid}.mang"));
-    // A schemaless list of two maps.
+
+    // Two-element bare list: each element is a map.
+    let f2 = std::env::temp_dir().join(format!("m5_stream2_{pid}.mang"));
     std::fs::write(
-        &f,
-        "items: [ { kind: \"PVC\", name: \"pvc\" }, { kind: \"CronJob\", name: \"cron\" } ]\n",
+        &f2,
+        "[ { kind: \"PVC\", name: \"pvc\" }, { kind: \"CronJob\", name: \"cron\" } ]\n",
     )
     .unwrap();
-    // First export --to yaml (list → single-doc sequence), then re-import, then
-    // export --to yaml-stream. This tests the stream flag end-to-end.
-    let exported_yaml = stdout(&mangrove(&["export", f.to_str().unwrap(), "--to", "yaml"]));
-    let y = std::env::temp_dir().join(format!("m5_stream_{pid}.yaml"));
-    std::fs::write(&y, &exported_yaml).unwrap();
-    // Re-import the YAML (single-doc) → mangrove doc
-    let mang2 = stdout(&mangrove(&["import", y.to_str().unwrap()]));
-    let f2 = std::env::temp_dir().join(format!("m5_stream_{pid}_2.mang"));
-    std::fs::write(&f2, mang2).unwrap();
-    // Export that doc as yaml-stream: the `items` field is a list, but the doc
-    // root is a map (items key), so yaml-stream falls back to a single doc.
-    // To test a true list-root stream, build a list-body .mang:
-    // (Note: Mangrove documents must have a map root, so we test yaml-stream
-    //  indirectly via the convert layer's unit tests. The CLI test verifies that
-    //  `--to yaml-stream` is accepted without error and --to unknown fails.)
-    let out_stream = mangrove(&["export", f.to_str().unwrap(), "--to", "yaml-stream"]);
+    let out2 = mangrove(&["export", f2.to_str().unwrap(), "--to", "yaml-stream"]);
     assert!(
-        out_stream.status.success(),
-        "--to yaml-stream failed: {}",
-        String::from_utf8_lossy(&out_stream.stderr)
+        out2.status.success(),
+        "--to yaml-stream failed on bare list: {}",
+        String::from_utf8_lossy(&out2.stderr)
     );
+    let text2 = String::from_utf8(out2.stdout).unwrap();
+    // Must contain a `---` separator between the two documents.
+    assert!(
+        text2.contains("---"),
+        "expected `---` separator in yaml-stream output, got: {text2}"
+    );
+    // Must contain both element values.
+    assert!(text2.contains("PVC"), "missing PVC in stream: {text2}");
+    assert!(
+        text2.contains("CronJob"),
+        "missing CronJob in stream: {text2}"
+    );
+    // Must end with a newline (well-formed text file).
+    assert!(
+        text2.ends_with('\n'),
+        "yaml-stream output must end with a newline"
+    );
+
+    // Three-element bare list: verify exactly 2 separators (n-1 for n=3 docs).
+    let f3 = std::env::temp_dir().join(format!("m5_stream3_{pid}.mang"));
+    std::fs::write(
+        &f3,
+        "[ { kind: \"A\" }, { kind: \"B\" }, { kind: \"C\" } ]\n",
+    )
+    .unwrap();
+    let out3 = mangrove(&["export", f3.to_str().unwrap(), "--to", "yaml-stream"]);
+    assert!(
+        out3.status.success(),
+        "--to yaml-stream failed on 3-element list: {}",
+        String::from_utf8_lossy(&out3.stderr)
+    );
+    let text3 = String::from_utf8(out3.stdout).unwrap();
+    let sep_count = text3.matches("---").count();
+    assert_eq!(
+        sep_count, 2,
+        "expected 2 `---` separators for 3-element list, got {sep_count} in: {text3}"
+    );
+
     // Unknown format must error.
-    let out_bad = mangrove(&["export", f.to_str().unwrap(), "--to", "json"]);
+    let out_bad = mangrove(&["export", f2.to_str().unwrap(), "--to", "json"]);
     assert_eq!(out_bad.status.code(), Some(1));
 }

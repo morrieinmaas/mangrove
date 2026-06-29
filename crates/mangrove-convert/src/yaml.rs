@@ -77,7 +77,11 @@ pub fn export_stream(v: &Value) -> Result<String, String> {
         let body = raw.strip_prefix("---\n").unwrap_or(&raw).to_string();
         docs.push(body);
     }
-    Ok(docs.join("\n---\n"))
+    let mut out = docs.join("\n---\n");
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 /// Serialize a `Value` (post-eval, no markers) as YAML.
