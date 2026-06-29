@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.8.0
+
+Editor/tooling round: a Tree-sitter grammar, smarter completion, and
+workspace-wide navigation. The LSP stays read-only and network-free — all
+cross-file/workspace work reads local files (resolved via the committed
+lockfile) and returns a `WorkspaceEdit` for the client to apply; nothing is
+fetched or written.
+
+### Editors
+- **Tree-sitter grammar** (`tree-sitter-mangrove/`) covering the full surface
+  syntax, with highlight queries. Gives `.mang` files immediate syntax
+  highlighting (in Neovim/Zed/Helix/…) before the LSP attaches, independent of
+  the server's semantic tokens.
+
+### Tooling — `mangrove lsp`
+- **Enum-value completion.** In a field's value position, completion offers the
+  field type's literal-union values (e.g. a `gen-openapi` enum), resolving the
+  type locally, through a named alias, or from an imported package.
+- **Workspace-wide find-references and rename.** Both now span every `.mang`
+  file under the workspace root: a file is matched only when its `use` alias
+  resolves (by canonical path) to the symbol's defining file, so unrelated
+  same-named symbols are never touched. Rename produces a multi-file
+  `WorkspaceEdit`; renaming symbols inside external/imported packages is declined.
+
+### Fixed / internal
+- Skip symlinked directories in the workspace walk (no cycles); allow `-` in
+  rename target identifiers (matching the lexer); documented duplicate-`use`-alias
+  rejection and the import-cache invalidation contract.
+
 ## v0.7.1
 
 Robustness fix from a whole-arc adversarial review.

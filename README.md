@@ -7,7 +7,7 @@ and **templating** (L3), on top of a supply-chain layer for verified imports. Ev
 reduces to a single canonical value with a stable BLAKE3 content hash, so two documents that
 *mean* the same thing hash the same.
 
-> **Status:** v0.7.0 — an experimental, solo, spec-complete implementation with a
+> **Status:** v0.8.0 — an experimental, solo, spec-complete implementation with a
 > formatter and a language server. Not used in production yet. The ideas (below) are
 > the point; a hosted docs site and broad editor packaging are still to come.
 
@@ -78,10 +78,12 @@ mangrove lsp                           # run the language server over stdio (for
 `mangrove lsp` is a read-only, network-free [language server](editors/README.md):
 diagnostics (parse + schema errors), hover, document symbols, semantic-token
 highlighting, formatting, context-aware completion (including imported/`gen-openapi`
-types), go-to-definition (local and cross-file into imported types), find-references,
-and rename. Neovim ([`editors/nvim/`](editors/nvim/)) and Zed ([`editors/zed/`](editors/zed/)) setups are provided;
-any LSP client can launch `mangrove lsp`. (No tree-sitter grammar — highlighting
-comes from the server's semantic tokens.)
+types and literal-union/enum values), go-to-definition (local and cross-file into
+imported types), and workspace-wide find-references and rename. Neovim
+([`editors/nvim/`](editors/nvim/)) and Zed ([`editors/zed/`](editors/zed/)) setups are provided;
+any LSP client can launch `mangrove lsp`. A [Tree-sitter grammar](tree-sitter-mangrove/)
+gives immediate syntax highlighting on open (before the LSP attaches); the LSP's
+semantic tokens add type/reference-aware highlighting once it connects.
 
 ## Kubernetes
 
