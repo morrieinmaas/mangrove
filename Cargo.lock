@@ -305,6 +305,7 @@ name = "mangrove-convert"
 version = "0.8.0"
 dependencies = [
  "bigdecimal",
+ "mangrove-canonical",
  "mangrove-core",
  "num-bigint",
  "num-traits",

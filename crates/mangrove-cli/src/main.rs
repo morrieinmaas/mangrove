@@ -1,13 +1,16 @@
 //! The `mangrove` command-line tool.
-//!   `mangrove --version`            — print the version
-//!   `mangrove hash <file>`          — print the BLAKE3 content address of an L0 document
-//!   `mangrove check <file>`         — validate a document against its bound schema
-//!   `mangrove update <file>`        — resolve + pin namespaced imports into mangrove.lock
-//!   `mangrove import <file>`        — convert a YAML/TOML file to a Mangrove document
-//!   `mangrove export <file> --to`   — evaluate a document and emit YAML/TOML
-//!   `mangrove gen-openapi <spec>`   — generate Mangrove types from an OpenAPI spec
-//!   `mangrove fmt <file>…`          — format documents (--check to gate; - for stdin)
-//!   `mangrove lsp`                  — run the language server over stdio (editors)
+//!   `mangrove --version`                        — print the version
+//!   `mangrove hash <file>`                      — print the BLAKE3 content address of an L0 document
+//!   `mangrove check <file>`                     — validate a document against its bound schema
+//!   `mangrove update <file>`                    — resolve + pin namespaced imports into mangrove.lock
+//!   `mangrove import <file>`                    — convert a YAML/TOML file to a Mangrove document
+//!                                                 (multi-doc YAML streams import as a Mangrove list)
+//!   `mangrove export <file> --to yaml`          — evaluate a document and emit YAML (default)
+//!   `mangrove export <file> --to yaml-stream`   — emit a Value::List as a YAML multi-doc stream
+//!   `mangrove export <file> --to toml`          — evaluate a document and emit TOML
+//!   `mangrove gen-openapi <spec>`               — generate Mangrove types from an OpenAPI spec
+//!   `mangrove fmt <file>…`                      — format documents (--check to gate; - for stdin)
+//!   `mangrove lsp`                              — run the language server over stdio (editors)
 
 use mangrove_core::error::ValidationError;
 use std::process::ExitCode;
@@ -82,7 +85,7 @@ fn cmd_lsp() -> ExitCode {
 fn usage() -> ExitCode {
     eprintln!(
         "usage: mangrove [--version | hash <file> | check <file> | update <file> \
-         | import <file.yaml|.toml> | export <file.mang> [--to yaml|toml] \
+         | import <file.yaml|.toml> | export <file.mang> [--to yaml|yaml-stream|toml] \
          | gen-openapi <spec.json> [--root <Definition>] \
          | fmt <file…> | fmt --check <file…> | fmt - | lsp]"
     );
@@ -221,8 +224,12 @@ fn cmd_import(path: &str) -> ExitCode {
     }
 }
 
-/// `mangrove export <file.mang> --to yaml|toml` — evaluate a document and print its
-/// canonical value in the target format (D46). Defaults to YAML.
+/// `mangrove export <file.mang> --to yaml|yaml-stream|toml` — evaluate a document
+/// and print its canonical value in the target format (D46). Defaults to YAML.
+///
+/// `--to yaml-stream`: if the document body is a `Value::List`, each element is
+/// emitted as a separate YAML document separated by `---` (a multi-doc stream).
+/// Non-list values are emitted as a single-document stream, identical to `--to yaml`.
 fn cmd_export(path: &str, to: Option<&str>) -> ExitCode {
     let value = match evaluate(path) {
         Ok(v) => v,
@@ -233,9 +240,10 @@ fn cmd_export(path: &str, to: Option<&str>) -> ExitCode {
     };
     let out = match to {
         None | Some("yaml") => mangrove_convert::yaml::export(&value),
+        Some("yaml-stream") => mangrove_convert::yaml::export_stream(&value),
         Some("toml") => mangrove_convert::toml::export(&value),
         Some(other) => Err(format!(
-            "unknown target format `{other}` (expected yaml or toml)"
+            "unknown target format `{other}` (expected yaml, yaml-stream, or toml)"
         )),
     };
     match out {

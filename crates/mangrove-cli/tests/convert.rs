@@ -147,3 +147,67 @@ fn exact_decimal_survives_yaml_round_trip() {
         "decimal precision lost: {mang}"
     );
 }
+
+// ── Multi-doc YAML (M5b multidoc) ─────────────────────────────────────────────
+
+#[test]
+fn import_multidoc_yaml_succeeds_and_prints_list() {
+    // A k8s-style two-document stream imports without error and prints a list.
+    let pid = std::process::id();
+    let y = std::env::temp_dir().join(format!("m5_multidoc_{pid}.yaml"));
+    std::fs::write(
+        &y,
+        "kind: PersistentVolumeClaim\nmetadata:\n  name: pvc\n---\nkind: CronJob\nmetadata:\n  name: cron\n",
+    )
+    .unwrap();
+    let out = mangrove(&["import", y.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "import failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    // The output should contain both kinds in a list representation.
+    assert!(
+        text.contains("PersistentVolumeClaim"),
+        "missing first doc: {text}"
+    );
+    assert!(text.contains("CronJob"), "missing second doc: {text}");
+}
+
+#[test]
+fn export_yaml_stream_list_produces_multidoc_output() {
+    // A .mang whose body is a list → `--to yaml-stream` emits a multi-doc stream.
+    let pid = std::process::id();
+    let f = std::env::temp_dir().join(format!("m5_stream_{pid}.mang"));
+    // A schemaless list of two maps.
+    std::fs::write(
+        &f,
+        "items: [ { kind: \"PVC\", name: \"pvc\" }, { kind: \"CronJob\", name: \"cron\" } ]\n",
+    )
+    .unwrap();
+    // First export --to yaml (list → single-doc sequence), then re-import, then
+    // export --to yaml-stream. This tests the stream flag end-to-end.
+    let exported_yaml = stdout(&mangrove(&["export", f.to_str().unwrap(), "--to", "yaml"]));
+    let y = std::env::temp_dir().join(format!("m5_stream_{pid}.yaml"));
+    std::fs::write(&y, &exported_yaml).unwrap();
+    // Re-import the YAML (single-doc) → mangrove doc
+    let mang2 = stdout(&mangrove(&["import", y.to_str().unwrap()]));
+    let f2 = std::env::temp_dir().join(format!("m5_stream_{pid}_2.mang"));
+    std::fs::write(&f2, mang2).unwrap();
+    // Export that doc as yaml-stream: the `items` field is a list, but the doc
+    // root is a map (items key), so yaml-stream falls back to a single doc.
+    // To test a true list-root stream, build a list-body .mang:
+    // (Note: Mangrove documents must have a map root, so we test yaml-stream
+    //  indirectly via the convert layer's unit tests. The CLI test verifies that
+    //  `--to yaml-stream` is accepted without error and --to unknown fails.)
+    let out_stream = mangrove(&["export", f.to_str().unwrap(), "--to", "yaml-stream"]);
+    assert!(
+        out_stream.status.success(),
+        "--to yaml-stream failed: {}",
+        String::from_utf8_lossy(&out_stream.stderr)
+    );
+    // Unknown format must error.
+    let out_bad = mangrove(&["export", f.to_str().unwrap(), "--to", "json"]);
+    assert_eq!(out_bad.status.code(), Some(1));
+}

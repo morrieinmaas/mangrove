@@ -14,5 +14,8 @@ bigdecimal = { workspace = true }
 toml = { workspace = true }
 yaml-rust2 = { workspace = true }
 
+[dev-dependencies]
+mangrove-canonical = { path = "../mangrove-canonical" }
+
 [lints]
 workspace = true

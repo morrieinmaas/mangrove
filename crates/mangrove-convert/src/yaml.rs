@@ -14,24 +14,70 @@ use yaml_rust2::{YamlEmitter, YamlLoader};
 /// stack overflow on adversarial input, rather than relying on the YAML library's.
 const MAX_DEPTH: usize = 128;
 
-/// Parse a single YAML document into a `Value` (schemaless L0 data, D42).
+/// Parse a YAML document or multi-document stream into a `Value` (schemaless L0 data, D42).
+///
+/// - A single-document stream returns the document's value directly.
+/// - A multi-document stream (documents separated by `---`) returns a
+///   `Value::List` where each element is the value of one document.
+/// - An empty stream and `null` within any document are still rejected.
 ///
 /// ```
 /// let v = mangrove_convert::yaml::import("name: api\nport: 8443\n").unwrap();
 /// assert!(matches!(v, mangrove_core::Value::Map(_)));
 /// // YAML null is rejected — Mangrove has no null (§2.4).
 /// assert!(mangrove_convert::yaml::import("x: null\n").is_err());
+/// // Multi-doc stream → Value::List.
+/// let multi = mangrove_convert::yaml::import("a: 1\n---\nb: 2\n").unwrap();
+/// assert!(matches!(multi, mangrove_core::Value::List(_)));
 /// ```
 pub fn import(s: &str) -> Result<Value, String> {
     let docs = YamlLoader::load_from_str(s).map_err(|e| format!("YAML parse error: {e}"))?;
     match docs.as_slice() {
         [] => Err("empty YAML document".into()),
         [one] => yaml_to_value(one, "", 0),
-        _ => Err(format!(
-            "expected a single YAML document, found {}",
-            docs.len()
-        )),
+        many => {
+            let mut out = Vec::with_capacity(many.len());
+            for (i, doc) in many.iter().enumerate() {
+                out.push(yaml_to_value(doc, &format!("[doc {i}]"), 0)?);
+            }
+            Ok(Value::List(out))
+        }
     }
+}
+
+/// Serialize a `Value::List` as a YAML multi-document stream, with each list
+/// element emitted as a separate YAML document separated by `\n---\n`.
+///
+/// If `v` is not a `Value::List`, it is emitted as a single document (identical
+/// to [`export`]). The existing [`export`] function is unchanged: a list value
+/// still serializes as a single-document YAML sequence by default.
+///
+/// ```
+/// use mangrove_core::Value;
+/// use std::collections::BTreeMap;
+///
+/// let mut m1 = BTreeMap::new();
+/// m1.insert("kind".to_string(), Value::Str("PVC".into()));
+/// let mut m2 = BTreeMap::new();
+/// m2.insert("kind".to_string(), Value::Str("CronJob".into()));
+/// let list = Value::List(vec![Value::Map(m1), Value::Map(m2)]);
+/// let stream = mangrove_convert::yaml::export_stream(&list).unwrap();
+/// assert!(stream.contains("---"));
+/// ```
+pub fn export_stream(v: &Value) -> Result<String, String> {
+    let Value::List(elems) = v else {
+        return export(v);
+    };
+    // YamlEmitter prefixes every document with `---\n` (a document-start marker).
+    // Strip that prefix from each piece so that joining with `\n---\n` produces
+    // a valid, standard multi-doc stream without doubled markers.
+    let mut docs = Vec::with_capacity(elems.len());
+    for elem in elems {
+        let raw = export(elem)?;
+        let body = raw.strip_prefix("---\n").unwrap_or(&raw).to_string();
+        docs.push(body);
+    }
+    Ok(docs.join("\n---\n"))
 }
 
 /// Serialize a `Value` (post-eval, no markers) as YAML.
@@ -196,5 +242,134 @@ mod tests {
         let src = format!("a: {deep}\n");
         // Either the YAML lib or our depth guard rejects it — never a SIGABRT.
         assert!(import(&src).is_err());
+    }
+
+    // ── Multi-document import ──────────────────────────────────────────────────
+
+    #[test]
+    fn import_multidoc_two_maps_yields_list() {
+        // A k8s-style stream: PVC doc then CronJob doc → Value::List of length 2.
+        let yaml = "\
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc
+---
+kind: CronJob
+metadata:
+  name: cron
+";
+        let v = import(yaml).unwrap();
+        let Value::List(elems) = v else {
+            panic!("expected List, got {v:?}")
+        };
+        assert_eq!(elems.len(), 2);
+        let Value::Map(ref first) = elems[0] else {
+            panic!("first elem not Map")
+        };
+        assert_eq!(
+            first.get("kind"),
+            Some(&Value::Str("PersistentVolumeClaim".into()))
+        );
+        let Value::Map(ref second) = elems[1] else {
+            panic!("second elem not Map")
+        };
+        assert_eq!(second.get("kind"), Some(&Value::Str("CronJob".into())));
+    }
+
+    #[test]
+    fn import_single_doc_not_wrapped_in_list() {
+        // Single doc must remain a Map, NOT wrapped in a List.
+        let v = import("name: api\nport: 8443\n").unwrap();
+        assert!(matches!(v, Value::Map(_)), "expected Map, got {v:?}");
+    }
+
+    #[test]
+    fn import_empty_still_errors() {
+        assert!(import("").is_err());
+    }
+
+    #[test]
+    fn import_multidoc_with_null_doc_errors() {
+        // Null within any document in the stream is still rejected.
+        let yaml = "kind: PVC\n---\nx: null\n";
+        assert!(import(yaml).is_err());
+    }
+
+    // ── export_stream ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn export_stream_list_produces_separator() {
+        use std::collections::BTreeMap;
+        let mut m1 = BTreeMap::new();
+        m1.insert("kind".to_string(), Value::Str("PVC".into()));
+        let mut m2 = BTreeMap::new();
+        m2.insert("kind".to_string(), Value::Str("CronJob".into()));
+        let list = Value::List(vec![Value::Map(m1), Value::Map(m2)]);
+        let out = export_stream(&list).unwrap();
+        // Must contain exactly one `---` separator between the two docs.
+        assert!(out.contains("---"), "no separator in: {out}");
+        let sep_count = out.matches("---").count();
+        assert_eq!(
+            sep_count, 1,
+            "expected exactly 1 `---`, got {sep_count} in: {out}"
+        );
+        assert!(out.contains("PVC"));
+        assert!(out.contains("CronJob"));
+    }
+
+    #[test]
+    fn export_stream_non_list_is_single_doc_no_separator() {
+        use std::collections::BTreeMap;
+        let mut m = BTreeMap::new();
+        m.insert("kind".to_string(), Value::Str("PVC".into()));
+        let v = Value::Map(m.clone());
+        let out = export_stream(&v).unwrap();
+        // For a non-list, export_stream behaves like export (single doc).
+        // YamlEmitter always adds a leading `---` document-start marker; that is
+        // fine — what we're checking is that there's no *separator* `---` (i.e.
+        // the output equals what plain export produces, not a multi-doc stream).
+        assert_eq!(
+            out,
+            export(&Value::Map(m)).unwrap(),
+            "non-list stream differs from export"
+        );
+        assert!(out.contains("PVC"));
+    }
+
+    #[test]
+    fn export_stream_list_round_trips() {
+        // import(export_stream(list)) == list, and canonical hash is stable.
+        use std::collections::BTreeMap;
+        let mut m1 = BTreeMap::new();
+        m1.insert("kind".to_string(), Value::Str("PVC".into()));
+        m1.insert("name".to_string(), Value::Str("my-pvc".into()));
+        let mut m2 = BTreeMap::new();
+        m2.insert("kind".to_string(), Value::Str("CronJob".into()));
+        m2.insert("replicas".to_string(), Value::Int(3.into()));
+        let list = Value::List(vec![Value::Map(m1), Value::Map(m2)]);
+        let yaml_stream = export_stream(&list).unwrap();
+        let roundtripped = import(&yaml_stream).unwrap();
+        assert_eq!(list, roundtripped);
+        // Canonical hash must be stable.
+        assert_eq!(
+            mangrove_canonical::hash(&list),
+            mangrove_canonical::hash(&roundtripped)
+        );
+    }
+
+    #[test]
+    fn export_unchanged_for_list_produces_single_doc_sequence() {
+        // Regression: export (non-stream) of a list still gives a single-doc YAML
+        // sequence (unchanged behaviour — multi-doc is opt-in via export_stream).
+        let list = Value::List(vec![Value::Int(1.into()), Value::Int(2.into())]);
+        let out = export(&list).unwrap();
+        // A YAML sequence is rendered as `- 1\n- 2\n`. YamlEmitter prefixes with
+        // `---\n` (document-start), but there must be no mid-stream `---` separator.
+        // We verify single-doc by ensuring YamlLoader sees exactly one document.
+        let docs = YamlLoader::load_from_str(&out).unwrap();
+        assert_eq!(docs.len(), 1, "export of a list must be a single YAML doc");
+        // Round-trips back to the same List (single-doc sequence → Value::List).
+        let back = import(&out).unwrap();
+        assert_eq!(list, back);
     }
 }

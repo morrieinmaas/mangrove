@@ -16,9 +16,10 @@ use mangrove_core::Value;
 /// this errors instead of overflowing the stack on an adversarial value.
 const MAX_DEPTH: usize = 128;
 
-/// Render a (schemaless) `Value` as Mangrove document text. The root must be a map
-/// (D2). Strings are escaped so a literal `$` cannot become interpolation on
-/// re-parse, and keys that are not simple identifiers are quoted.
+/// Render a (schemaless) `Value` as Mangrove document text. The root must be a
+/// map (D2) or a list (produced by a multi-document YAML import, D42). Strings
+/// are escaped so a literal `$` cannot become interpolation on re-parse, and
+/// keys that are not simple identifiers are quoted.
 ///
 /// ```
 /// use mangrove_convert::to_mangrove;
@@ -30,17 +31,24 @@ const MAX_DEPTH: usize = 128;
 /// assert_eq!(to_mangrove(&Value::Map(m)).unwrap(), "port: 8443\n");
 /// ```
 pub fn to_mangrove(v: &Value) -> Result<String, String> {
-    let Value::Map(m) = v else {
-        return Err("a Mangrove document root must be a map".into());
-    };
-    let mut out = String::new();
-    for (k, val) in m {
-        out.push_str(&render_key(k));
-        out.push_str(": ");
-        out.push_str(&render_val(val, 1)?);
-        out.push('\n');
+    match v {
+        Value::Map(m) => {
+            let mut out = String::new();
+            for (k, val) in m {
+                out.push_str(&render_key(k));
+                out.push_str(": ");
+                out.push_str(&render_val(val, 1)?);
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        Value::List(_) => {
+            // Multi-doc YAML import: render the list as an inline Mangrove value.
+            let rendered = render_val(v, 0)?;
+            Ok(format!("{rendered}\n"))
+        }
+        _ => Err("a Mangrove document root must be a map or list".into()),
     }
-    Ok(out)
 }
 
 fn render_key(k: &str) -> String {
