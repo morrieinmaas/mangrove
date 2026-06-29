@@ -1308,6 +1308,241 @@ pub fn rename(src: &str, offset: usize, new_name: &str) -> Option<Vec<(usize, us
     Some(occs)
 }
 
+// ---- workspace-wide references and rename ----
+
+/// Recursively collect all `.mang` files under `root`, skipping hidden dirs,
+/// `target/` dirs, and capping at 500 entries.
+fn walk_mang_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_mang_files_inner(root, &mut out);
+    out
+}
+
+fn walk_mang_files_inner(dir: &Path, out: &mut Vec<PathBuf>) {
+    if out.len() >= 500 {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if out.len() >= 500 {
+            eprintln!(
+                "mangrove-lsp: workspace walk capped at 500 files; some files may be skipped"
+            );
+            return;
+        }
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        // Skip hidden entries and the target directory.
+        if name.starts_with('.') || name == "target" {
+            continue;
+        }
+        if path.is_dir() {
+            walk_mang_files_inner(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("mang") {
+            out.push(path);
+        }
+    }
+}
+
+/// Collect all byte ranges where `type_name` appears as the TypeName part of
+/// `alias.TypeName` in the given CST root.  Only the type-name token range
+/// (not the alias or dot) is returned.
+fn qualified_type_occurrences(
+    root: &SyntaxNode,
+    alias: &str,
+    type_name: &str,
+) -> Vec<(usize, usize)> {
+    let all_toks: Vec<_> = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+        .collect();
+
+    let mut out = Vec::new();
+    for (pos, tok) in all_toks.iter().enumerate() {
+        if tok.kind() != SyntaxKind::BAREWORD || tok.text() != type_name {
+            continue;
+        }
+        // Must be preceded by DOT then the alias BAREWORD.
+        if pos < 2 {
+            continue;
+        }
+        let prev = &all_toks[pos - 1];
+        let before = &all_toks[pos - 2];
+        if prev.kind() == SyntaxKind::DOT
+            && before.kind() == SyntaxKind::BAREWORD
+            && before.text() == alias
+        {
+            let r = tok.text_range();
+            out.push((r.start().into(), r.end().into()));
+        }
+    }
+    out
+}
+
+/// Cross-workspace references for a type symbol defined in `doc_path`.
+///
+/// Returns a list of `(file_path, occurrences)` pairs — always includes the
+/// source file itself first.
+///
+/// When `workspace_root` is `None`, falls back to same-file references only.
+/// Only works for `TypeName` symbols; `ValueName` symbols are file-local and
+/// return same-file results only.
+/// If the cursor is on a qualified (imported) reference (`alias.X`), returns
+/// empty — renaming foreign symbols is out of scope.
+pub fn references_in_workspace(
+    src: &str,
+    offset: usize,
+    doc_path: &Path,
+    workspace_root: Option<&Path>,
+    cache: &ImportCache,
+) -> Vec<(PathBuf, Vec<(usize, usize)>)> {
+    let root = parse_cst(src).syntax();
+
+    // If the cursor is on a qualified ref (alias.X), decline — that is an
+    // imported symbol; we cannot rename the foreign declaration.
+    let off: rowan::TextSize = (offset as u32).into();
+    let covering: Vec<_> = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.text_range().contains_inclusive(off))
+        .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+        .collect();
+    if let Some(tok) = covering.first() {
+        if tok.kind() == SyntaxKind::BAREWORD && detect_qualified_ref(&root, tok).is_some() {
+            return vec![];
+        }
+    }
+
+    let symbol = match resolve_symbol(&root, src, offset) {
+        Some(s) => s,
+        None => return vec![],
+    };
+
+    // Same-file occurrences (always include decl for workspace use).
+    let same_file_refs = references(src, offset, true);
+
+    // Non-TypeName symbols are always file-local.
+    let name = match symbol {
+        ResolvedSymbol::TypeName(n) => n,
+        ResolvedSymbol::ValueName(_) => {
+            if same_file_refs.is_empty() {
+                return vec![];
+            }
+            return vec![(doc_path.to_path_buf(), same_file_refs)];
+        }
+    };
+
+    // No workspace root → same-file only.
+    let workspace_root = match workspace_root {
+        Some(r) => r,
+        None => {
+            if same_file_refs.is_empty() {
+                return vec![];
+            }
+            return vec![(doc_path.to_path_buf(), same_file_refs)];
+        }
+    };
+
+    let mut result: Vec<(PathBuf, Vec<(usize, usize)>)> = Vec::new();
+    if !same_file_refs.is_empty() {
+        result.push((doc_path.to_path_buf(), same_file_refs));
+    }
+
+    // Canonical path of the source file for comparison.
+    let doc_canonical = std::fs::canonicalize(doc_path).unwrap_or_else(|_| doc_path.to_path_buf());
+
+    // Walk all other .mang files in the workspace.
+    let mang_files = walk_mang_files(workspace_root);
+    for other_path in mang_files {
+        let other_canonical =
+            std::fs::canonicalize(&other_path).unwrap_or_else(|_| other_path.clone());
+        if other_canonical == doc_canonical {
+            continue;
+        }
+
+        // Read via cache.
+        let other_text = match cache.read(&other_path) {
+            Some(t) => t,
+            None => continue,
+        };
+
+        // Parse and find all aliases whose use-reference resolves to doc_path.
+        let other_root = parse_cst(other_text.as_ref()).syntax();
+        let doc_dir_b = match other_path.parent() {
+            Some(d) => d,
+            None => continue,
+        };
+        let resolvers = match mangrove_resolve::Resolvers::find_and_load(doc_dir_b) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let mut file_ranges: Vec<(usize, usize)> = Vec::new();
+
+        // Walk USE_DECL nodes to find aliases that resolve to our doc.
+        for child in other_root.children() {
+            if child.kind() != SyntaxKind::USE_DECL {
+                continue;
+            }
+            let text = child.text().to_string();
+            let u = match mangrove_syntax::parse_use_str(text.trim()) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let pkg_path = match resolvers.resolve_local_path(&u.path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let pkg_canonical =
+                std::fs::canonicalize(&pkg_path).unwrap_or_else(|_| pkg_path.clone());
+            if pkg_canonical != doc_canonical {
+                continue;
+            }
+            // This alias maps to our file — collect qualified occurrences.
+            let ranges = qualified_type_occurrences(&other_root, &u.alias, &name);
+            file_ranges.extend(ranges);
+        }
+
+        if !file_ranges.is_empty() {
+            file_ranges.sort_by_key(|r| r.0);
+            result.push((other_path, file_ranges));
+        }
+    }
+
+    result
+}
+
+/// Cross-workspace rename: returns a map of file → byte ranges to replace with
+/// `new_name`, or `None` if the cursor is not on a renameable symbol or
+/// `new_name` is invalid.
+///
+/// Callers replace each returned range with `new_name` to produce renamed
+/// source across all files.
+pub fn rename_in_workspace(
+    src: &str,
+    offset: usize,
+    new_name: &str,
+    doc_path: &Path,
+    workspace_root: Option<&Path>,
+    cache: &ImportCache,
+) -> Option<HashMap<PathBuf, Vec<(usize, usize)>>> {
+    if !is_valid_identifier(new_name) {
+        return None;
+    }
+    let per_file = references_in_workspace(src, offset, doc_path, workspace_root, cache);
+    if per_file.is_empty() {
+        return None;
+    }
+    Some(per_file.into_iter().collect())
+}
+
 // ---- completions ----
 
 /// Top-level declaration keywords (valid at the start of a new statement).
@@ -3544,5 +3779,170 @@ mod tests {
             "expected None for missing package (cached path), got {result:?}"
         );
         assert_eq!(cache.reads(), 0, "no disk read for a missing file");
+    }
+
+    // ---- workspace-wide references and rename tests ----
+
+    /// Helper: write a fixture file in a workspace directory.
+    fn write_ws_fixture(dir: &std::path::Path, rel: &str, contents: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+    }
+
+    /// Build a standard three-file workspace:
+    ///   workspace/
+    ///     .mangrove/resolvers.toml  — `[local] path = "."`
+    ///     a.mang                   — `type S = int`
+    ///     b.mang                   — imports a.mang as x, uses `x.S`
+    ///     c.mang                   — has its own `type S = str` (unrelated)
+    fn make_workspace() -> std::path::PathBuf {
+        let dir = scratch_dir();
+        // resolvers.toml: local namespace points at the workspace root itself.
+        write_ws_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.local]\nremote = \".\"\n",
+        );
+        // a.mang — defines type S
+        write_ws_fixture(&dir, "a.mang", "type S = int\n");
+        // b.mang — imports a.mang via "local/a@v1" and uses x.S
+        write_ws_fixture(&dir, "b.mang", "use \"local/a@v1\" as x\ntype T = x.S\n");
+        // c.mang — unrelated type S
+        write_ws_fixture(&dir, "c.mang", "type S = str\n");
+        dir
+    }
+
+    #[test]
+    fn workspace_references_finds_type_in_importer() {
+        let dir = make_workspace();
+        let a_path = dir.join("a.mang");
+        let a_src = std::fs::read_to_string(&a_path).unwrap();
+        let off = a_src.find('S').unwrap(); // cursor on `S` in `type S = int`
+
+        let cache = ImportCache::new();
+        let results = references_in_workspace(&a_src, off, &a_path, Some(&dir), &cache);
+
+        // Must include a.mang (the decl) and b.mang (x.S reference).
+        let paths: Vec<_> = results.iter().map(|(p, _)| p.clone()).collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("a.mang")),
+            "expected a.mang in workspace refs, got {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.ends_with("b.mang")),
+            "expected b.mang in workspace refs, got {paths:?}"
+        );
+
+        // b.mang ranges must point at the `S` token only (not `x` or dot).
+        if let Some((_, b_ranges)) = results.iter().find(|(p, _)| p.ends_with("b.mang")) {
+            let b_src = std::fs::read_to_string(dir.join("b.mang")).unwrap();
+            for &(s, e) in b_ranges {
+                assert_eq!(
+                    &b_src[s..e],
+                    "S",
+                    "b.mang range ({s},{e}) should span only 'S'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_references_false_positive_guard() {
+        let dir = make_workspace();
+        let a_path = dir.join("a.mang");
+        let a_src = std::fs::read_to_string(&a_path).unwrap();
+        let off = a_src.find('S').unwrap();
+
+        let cache = ImportCache::new();
+        let results = references_in_workspace(&a_src, off, &a_path, Some(&dir), &cache);
+
+        // c.mang defines its own `type S = str` but does NOT import a.mang.
+        // It must NOT appear in the results.
+        let paths: Vec<_> = results.iter().map(|(p, _)| p.clone()).collect();
+        assert!(
+            !paths.iter().any(|p| p.ends_with("c.mang")),
+            "c.mang (unrelated S) must not appear in workspace refs, got {paths:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_rename_produces_multi_file_workspace_edit() {
+        let dir = make_workspace();
+        let a_path = dir.join("a.mang");
+        let a_src = std::fs::read_to_string(&a_path).unwrap();
+        let off = a_src.find('S').unwrap();
+
+        let cache = ImportCache::new();
+        let per_file = rename_in_workspace(&a_src, off, "NewName", &a_path, Some(&dir), &cache);
+        assert!(per_file.is_some(), "rename_in_workspace should return Some");
+        let per_file = per_file.unwrap();
+
+        // Must have entries for a.mang and b.mang.
+        let keys: Vec<_> = per_file.keys().collect();
+        assert!(
+            keys.iter().any(|p| p.ends_with("a.mang")),
+            "expected a.mang in rename output, got {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|p| p.ends_with("b.mang")),
+            "expected b.mang in rename output, got {keys:?}"
+        );
+
+        // c.mang must NOT be touched.
+        assert!(
+            !keys.iter().any(|p| p.ends_with("c.mang")),
+            "c.mang must not be touched by rename, got {keys:?}"
+        );
+
+        // Apply the b.mang edits and verify only `S` was renamed.
+        let b_path = dir.join("b.mang");
+        let b_src = std::fs::read_to_string(&b_path).unwrap();
+        if let Some(b_ranges) = per_file.get(&b_path) {
+            let mut result = b_src.clone();
+            let mut sorted = b_ranges.clone();
+            sorted.sort_by_key(|r| std::cmp::Reverse(r.0));
+            for (s, e) in sorted {
+                result.replace_range(s..e, "NewName");
+            }
+            assert!(
+                result.contains("x.NewName"),
+                "b.mang after rename should contain 'x.NewName', got: {result:?}"
+            );
+            assert!(
+                !result.contains("x.S"),
+                "b.mang after rename must not contain 'x.S', got: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_references_no_root_falls_back_to_same_file() {
+        let dir = make_workspace();
+        let a_path = dir.join("a.mang");
+        let a_src = std::fs::read_to_string(&a_path).unwrap();
+        let off = a_src.find('S').unwrap();
+
+        let cache = ImportCache::new();
+        // workspace_root = None → same-file only
+        let results = references_in_workspace(&a_src, off, &a_path, None, &cache);
+
+        // Only a.mang should be in the results.
+        assert_eq!(
+            results.len(),
+            1,
+            "expected exactly 1 file (a.mang) with no workspace root, got {results:?}"
+        );
+        assert!(
+            results[0].0.ends_with("a.mang"),
+            "expected a.mang, got {:?}",
+            results[0].0
+        );
+        // b.mang must not appear.
+        let paths: Vec<_> = results.iter().map(|(p, _)| p.clone()).collect();
+        assert!(
+            !paths.iter().any(|p| p.ends_with("b.mang")),
+            "b.mang must not appear when workspace_root is None, got {paths:?}"
+        );
     }
 }

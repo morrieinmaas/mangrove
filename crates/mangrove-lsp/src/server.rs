@@ -64,9 +64,34 @@ pub fn run() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
 pub fn run_on(connection: &Connection) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let capabilities = server_capabilities();
     let init_value = serde_json::to_value(&capabilities)?;
-    let _params = connection.initialize(init_value)?;
-    main_loop(connection)?;
+    let init_params_raw = connection.initialize(init_value)?;
+    let workspace_root = extract_workspace_root(&init_params_raw);
+    main_loop(connection, workspace_root)?;
     Ok(())
+}
+
+/// Extract the workspace root from the LSP InitializeParams JSON value.
+/// Tries `rootUri` first, then the first entry of `workspaceFolders`.
+fn extract_workspace_root(params: &serde_json::Value) -> Option<std::path::PathBuf> {
+    // rootUri may be a string or JSON null.
+    if let Some(uri_val) = params.get("rootUri") {
+        if let Some(uri) = uri_val.as_str() {
+            if let Some(p) = uri_to_path(uri) {
+                return Some(p);
+            }
+        }
+    }
+    // workspaceFolders array.
+    if let Some(folders) = params.get("workspaceFolders").and_then(|v| v.as_array()) {
+        if let Some(first) = folders.first() {
+            if let Some(uri) = first.get("uri").and_then(|v| v.as_str()) {
+                if let Some(p) = uri_to_path(uri) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn server_capabilities() -> ServerCapabilities {
@@ -101,17 +126,26 @@ fn server_capabilities() -> ServerCapabilities {
 }
 
 /// In-memory document store. URI → current full text.
-#[derive(Default)]
 struct State {
     docs: HashMap<String, String>,
     /// Session-scoped cache for imported-file reads (mtime/len-keyed).
     /// Lives for the lifetime of the server; avoids re-reading unchanged files
     /// on every completion/goto request.
     import_cache: analysis::ImportCache,
+    /// Workspace root captured during LSP initialization (rootUri /
+    /// workspaceFolders). Used for workspace-wide find-references and rename.
+    workspace_root: Option<std::path::PathBuf>,
 }
 
-fn main_loop(connection: &Connection) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
-    let mut state = State::default();
+fn main_loop(
+    connection: &Connection,
+    workspace_root: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
+    let mut state = State {
+        docs: HashMap::new(),
+        import_cache: analysis::ImportCache::new(),
+        workspace_root,
+    };
     for msg in &connection.receiver {
         match msg {
             Message::Request(req) => {
@@ -506,17 +540,76 @@ fn on_references(state: &State, req: Request) -> Response {
     };
     let offset = offset_of(text, params.text_document_position.position);
     let include_decl = params.context.include_declaration;
-    let locs: Vec<Location> = analysis::references(text, offset, include_decl)
-        .into_iter()
-        .filter_map(|(start, end)| {
-            let idx = LineIndex::new(text);
-            let parsed: Uri = uri.parse().ok()?;
-            Some(Location {
-                uri: parsed,
-                range: to_range(&idx, (start, end)),
+
+    let locs: Vec<Location> = if let Some(doc_path) = uri_to_path(&uri) {
+        // Workspace-wide references. The workspace function always returns all
+        // occurrences including the declaration; filter source-file results for
+        // include_decl=false.
+        let per_file = analysis::references_in_workspace(
+            text,
+            offset,
+            &doc_path,
+            state.workspace_root.as_deref(),
+            &state.import_cache,
+        );
+        per_file
+            .into_iter()
+            .flat_map(|(file_path, ranges)| {
+                let is_source = file_path == doc_path;
+                let file_text_owned;
+                let file_text: &str = if is_source {
+                    text
+                } else {
+                    file_text_owned = state
+                        .import_cache
+                        .read(&file_path)
+                        .map(|t| t.to_string())
+                        .unwrap_or_default();
+                    &file_text_owned
+                };
+                let file_uri = path_to_uri(&file_path);
+                let idx = LineIndex::new(file_text);
+                // For the source file, honour include_decl; cross-file hits are
+                // always references (never declarations in foreign files).
+                let source_decl_range = if is_source && !include_decl {
+                    // Determine the decl range to exclude by re-running references
+                    // with include_decl=true vs false.
+                    let with = analysis::references(file_text, offset, true);
+                    let without = analysis::references(file_text, offset, false);
+                    // The decl range is any range in `with` but not `without`.
+                    with.into_iter()
+                        .filter(|r| !without.contains(r))
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+                ranges.into_iter().filter_map(move |(start, end)| {
+                    if is_source && !include_decl && source_decl_range.contains(&(start, end)) {
+                        return None;
+                    }
+                    let uri = file_uri.clone()?;
+                    Some(Location {
+                        uri,
+                        range: to_range(&idx, (start, end)),
+                    })
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        // Fallback: same-file only (no doc_path available).
+        analysis::references(text, offset, include_decl)
+            .into_iter()
+            .filter_map(|(start, end)| {
+                let idx = LineIndex::new(text);
+                let parsed: Uri = uri.parse().ok()?;
+                Some(Location {
+                    uri: parsed,
+                    range: to_range(&idx, (start, end)),
+                })
+            })
+            .collect()
+    };
+
     if locs.is_empty() {
         return Response::new_ok(id, serde_json::Value::Null);
     }
@@ -537,27 +630,75 @@ fn on_rename(state: &State, req: Request) -> Response {
         return Response::new_ok(id, serde_json::Value::Null);
     };
     let offset = offset_of(text, params.text_document_position.position);
-    let Some(ranges) = analysis::rename(text, offset, &params.new_name) else {
-        return Response::new_ok(id, serde_json::Value::Null);
+
+    let workspace_edit = if let Some(doc_path) = uri_to_path(&uri) {
+        // Workspace-wide rename.
+        let Some(per_file) = analysis::rename_in_workspace(
+            text,
+            offset,
+            &params.new_name,
+            &doc_path,
+            state.workspace_root.as_deref(),
+            &state.import_cache,
+        ) else {
+            return Response::new_ok(id, serde_json::Value::Null);
+        };
+        let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+        for (file_path, ranges) in per_file {
+            let file_text_owned;
+            let file_text: &str = if file_path == doc_path {
+                text
+            } else {
+                file_text_owned = state
+                    .import_cache
+                    .read(&file_path)
+                    .map(|t| t.to_string())
+                    .unwrap_or_default();
+                &file_text_owned
+            };
+            let idx = LineIndex::new(file_text);
+            let file_uri = match path_to_uri(&file_path) {
+                Some(u) => u,
+                None => continue,
+            };
+            let edits: Vec<TextEdit> = ranges
+                .into_iter()
+                .map(|(start, end)| TextEdit {
+                    range: to_range(&idx, (start, end)),
+                    new_text: params.new_name.clone(),
+                })
+                .collect();
+            changes.insert(file_uri, edits);
+        }
+        WorkspaceEdit {
+            changes: Some(changes),
+            ..WorkspaceEdit::default()
+        }
+    } else {
+        // Fallback: same-file rename (no doc_path available).
+        let Some(ranges) = analysis::rename(text, offset, &params.new_name) else {
+            return Response::new_ok(id, serde_json::Value::Null);
+        };
+        let idx = LineIndex::new(text);
+        let edits: Vec<TextEdit> = ranges
+            .into_iter()
+            .map(|(start, end)| TextEdit {
+                range: to_range(&idx, (start, end)),
+                new_text: params.new_name.clone(),
+            })
+            .collect();
+        let parsed: Uri = match uri.parse() {
+            Ok(u) => u,
+            Err(_) => return Response::new_ok(id, serde_json::Value::Null),
+        };
+        let mut changes = HashMap::new();
+        changes.insert(parsed, edits);
+        WorkspaceEdit {
+            changes: Some(changes),
+            ..WorkspaceEdit::default()
+        }
     };
-    let idx = LineIndex::new(text);
-    let edits: Vec<TextEdit> = ranges
-        .into_iter()
-        .map(|(start, end)| TextEdit {
-            range: to_range(&idx, (start, end)),
-            new_text: params.new_name.clone(),
-        })
-        .collect();
-    let parsed: Uri = match uri.parse() {
-        Ok(u) => u,
-        Err(_) => return Response::new_ok(id, serde_json::Value::Null),
-    };
-    let mut changes = std::collections::HashMap::new();
-    changes.insert(parsed, edits);
-    let workspace_edit = WorkspaceEdit {
-        changes: Some(changes),
-        ..WorkspaceEdit::default()
-    };
+
     Response::new_ok(
         id,
         serde_json::to_value(workspace_edit).unwrap_or(serde_json::Value::Null),
