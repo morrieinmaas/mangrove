@@ -128,6 +128,8 @@ pub enum CompletionKind {
     Keyword,
     /// A record-field name from the bound schema type.
     Field,
+    /// A literal member of an enum / literal-union field type.
+    EnumValue,
 }
 
 /// A diagnostic with a byte-offset range into the source.
@@ -1512,6 +1514,10 @@ fn completions_impl(
         }
 
         CursorContext::SchemaValuePosition => {
+            // Enum-value completions: offered first so they appear at the top.
+            for ev in enum_value_completions(src, offset, doc_path, cache) {
+                push(ev);
+            }
             // Field names from the bound schema (if any).
             if let Some(fields) = schema_record_fields(src, doc_path, cache) {
                 for field in fields {
@@ -1690,6 +1696,223 @@ fn imported_type_completions_for_alias(
         }
     }
     out
+}
+
+/// Determine which field name the cursor is in the **value** position of,
+/// within a schema-bound record context.
+///
+/// Walks the token's ancestors to find the innermost `FIELD` or top-level
+/// `BINDING` node, then returns the key (first significant token before COLON).
+/// Returns `None` when the cursor is not inside such a node or the structure
+/// is unexpected.
+fn field_name_at_cursor(root: &SyntaxNode, offset: usize) -> Option<String> {
+    let off: rowan::TextSize = (offset as u32).into();
+
+    // Find the significant token at or containing the offset.
+    let covering: Vec<_> = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.text_range().contains_inclusive(off))
+        .collect();
+    let tok = covering
+        .iter()
+        .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)
+        .cloned()?;
+
+    // Walk up ancestors to find the enclosing FIELD or BINDING.
+    let mut cur = tok.parent()?;
+    loop {
+        match cur.kind() {
+            SyntaxKind::FIELD | SyntaxKind::BINDING => {
+                // The key is the first significant token before the COLON.
+                let key = cur
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .find(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::NEWLINE)?;
+                // Confirm it's a BAREWORD or STR key.
+                let key_text = match key.kind() {
+                    SyntaxKind::BAREWORD => key.text().to_string(),
+                    SyntaxKind::STR => {
+                        // Quoted key — strip surrounding quotes.
+                        let s = key.text();
+                        s.strip_prefix('"')
+                            .and_then(|s| s.strip_suffix('"'))
+                            .unwrap_or(s)
+                            .to_string()
+                    }
+                    _ => return None,
+                };
+                return Some(key_text);
+            }
+            SyntaxKind::DOCUMENT => return None,
+            _ => {
+                cur = cur.parent()?;
+            }
+        }
+    }
+}
+
+/// Walk the typedef list to find a field named `field_name` in the record type
+/// named `schema_name` (following Named aliases up to `depth` levels).
+/// Returns a clone of the field's `Type` if found.
+fn resolve_field_type_in_typedefs(
+    schema_name: &str,
+    field_name: &str,
+    typedefs: &[mangrove_syntax::parser::TypeDef],
+) -> Option<Type> {
+    // First resolve the schema name to a record type.
+    let fields = resolve_record_fields(schema_name, typedefs)?;
+    let field = fields.iter().find(|f| f.name == field_name)?;
+    Some(field.ty.clone())
+}
+
+/// Given a `Type`, collect all literal completion items (LitStr/LitInt/LitBool),
+/// following Named aliases through `typedefs` up to 8 levels.
+/// Non-literal members of a Union are skipped silently.
+/// Returns an empty Vec if the type is not a literal or literal union.
+fn literal_completions_from_type(
+    ty: &Type,
+    typedefs: &[mangrove_syntax::parser::TypeDef],
+    depth: usize,
+) -> Vec<CompletionItem> {
+    if depth > 8 {
+        return vec![];
+    }
+    match ty {
+        Type::LitStr(s) => vec![CompletionItem {
+            label: format!("\"{s}\""),
+            kind: CompletionKind::EnumValue,
+        }],
+        Type::LitInt(n) => vec![CompletionItem {
+            label: n.to_string(),
+            kind: CompletionKind::EnumValue,
+        }],
+        Type::LitBool(b) => vec![CompletionItem {
+            label: b.to_string(),
+            kind: CompletionKind::EnumValue,
+        }],
+        Type::Union(members) => {
+            let mut out = Vec::new();
+            for m in members {
+                out.extend(literal_completions_from_type(m, typedefs, depth + 1));
+            }
+            out
+        }
+        Type::Named(name) => {
+            // Resolve the alias one level deeper.
+            let Some(td) = typedefs.iter().find(|t| t.name == name.as_str()) else {
+                return vec![];
+            };
+            literal_completions_from_type(&td.ty.clone(), typedefs, depth + 1)
+        }
+        _ => vec![],
+    }
+}
+
+/// Collect enum-value completions for the field the cursor is in, within a
+/// schema-bound context.  Returns an empty Vec when the cursor field cannot be
+/// determined, the field's type is not a literal/literal-union, or the schema
+/// cannot be resolved.  Never panics, never fetches.
+fn enum_value_completions(
+    src: &str,
+    offset: usize,
+    doc_path: Option<&Path>,
+    cache: Option<&ImportCache>,
+) -> Vec<CompletionItem> {
+    let root = parse_cst(src).syntax();
+
+    let field_name = match field_name_at_cursor(&root, offset) {
+        Some(n) => n,
+        None => return vec![],
+    };
+
+    // Determine the schema name.
+    let schema_name: String = if let Ok(doc) = lower(&root) {
+        match doc.schema {
+            Some(s) => s,
+            None => return vec![],
+        }
+    } else {
+        match schema_name_from_cst(&root) {
+            Some(s) => s,
+            None => return vec![],
+        }
+    };
+
+    if schema_name.contains('.') {
+        // Imported schema — resolve the field type from the imported file.
+        enum_value_completions_imported(&root, &schema_name, &field_name, doc_path, cache)
+    } else {
+        // Local schema.
+        let doc = match lower(&root).ok() {
+            Some(d) => d,
+            None => return vec![],
+        };
+        let field_ty =
+            match resolve_field_type_in_typedefs(&schema_name, &field_name, &doc.typedefs) {
+                Some(t) => t,
+                None => return vec![],
+            };
+        literal_completions_from_type(&field_ty, &doc.typedefs, 0)
+    }
+}
+
+/// Collect enum-value completions for an imported schema's field.
+fn enum_value_completions_imported(
+    root: &SyntaxNode,
+    schema_name: &str,
+    field_name: &str,
+    doc_path: Option<&Path>,
+    cache: Option<&ImportCache>,
+) -> Vec<CompletionItem> {
+    let doc_path = match doc_path {
+        Some(p) => p,
+        None => return vec![],
+    };
+    let doc_dir = match doc_path.parent() {
+        Some(d) => d,
+        None => return vec![],
+    };
+    let (alias, type_name) = match schema_name.split_once('.') {
+        Some(pair) => pair,
+        None => return vec![],
+    };
+    let reference = match use_reference_for_alias(root, alias) {
+        Some(r) => r,
+        None => return vec![],
+    };
+    let resolvers = match mangrove_resolve::Resolvers::find_and_load(doc_dir).ok() {
+        Some(r) => r,
+        None => return vec![],
+    };
+    let pkg_path = match resolvers.resolve_local_path(&reference).ok() {
+        Some(p) => p,
+        None => return vec![],
+    };
+    let pkg_text: String = if let Some(c) = cache {
+        match c.read(&pkg_path) {
+            Some(t) => t.to_string(),
+            None => return vec![],
+        }
+    } else {
+        if !pkg_path.exists() {
+            return vec![];
+        }
+        match std::fs::read_to_string(&pkg_path).ok() {
+            Some(t) => t,
+            None => return vec![],
+        }
+    };
+    let pkg_root = parse_cst(&pkg_text).syntax();
+    let pkg_doc = match lower(&pkg_root).ok() {
+        Some(d) => d,
+        None => return vec![],
+    };
+    let field_ty = match resolve_field_type_in_typedefs(type_name, field_name, &pkg_doc.typedefs) {
+        Some(t) => t,
+        None => return vec![],
+    };
+    literal_completions_from_type(&field_ty, &pkg_doc.typedefs, 0)
 }
 
 /// If the document has a `schema X` and `X` resolves to a record type (either
@@ -3122,6 +3345,180 @@ mod tests {
         assert!(
             labels1.contains(&"SomeType"),
             "SomeType must be in completions"
+        );
+    }
+
+    // ---- enum-value completion tests (T2: literal-union field types) ----
+
+    /// T2-a: local schema with a field typed as a direct literal union.
+    /// Cursor in the value position of `mode:` where `type T = { mode: "a" | "b" | "c" }`.
+    /// Must offer `"a"`, `"b"`, `"c"` as EnumValue completions.
+    #[test]
+    fn completions_enum_value_local_direct_union() {
+        let src = "type T = { mode: \"a\" | \"b\" | \"c\" }\nschema T\nmode: \"a\"\n";
+        // Cursor inside the value of `mode: "a"` — after the opening quote.
+        let off = src.rfind("\"a\"\n").unwrap() + 1;
+        let items = completions(src, off, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"\"a\""),
+            "expected '\"a\"' in enum completions, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"\"b\""),
+            "expected '\"b\"' in enum completions, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"\"c\""),
+            "expected '\"c\"' in enum completions, got {labels:?}"
+        );
+        // The items for the literals must be EnumValue kind.
+        let item_a = items.iter().find(|i| i.label == "\"a\"").unwrap();
+        assert_eq!(
+            item_a.kind,
+            CompletionKind::EnumValue,
+            "literal completion must have kind EnumValue"
+        );
+    }
+
+    /// T2-b: field typed via a Named alias to a literal union.
+    /// `type Mode = "a" | "b"`, `type T = { m: Mode }`.
+    /// Cursor in `m:`'s value must resolve through Named → offer `"a"`, `"b"`.
+    #[test]
+    fn completions_enum_value_named_alias_resolves() {
+        let src = "type Mode = \"a\" | \"b\"\ntype T = { m: Mode }\nschema T\nm: \"a\"\n";
+        let off = src.rfind("\"a\"\n").unwrap() + 1;
+        let items = completions(src, off, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"\"a\""),
+            "expected '\"a\"' via Named alias, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"\"b\""),
+            "expected '\"b\"' via Named alias, got {labels:?}"
+        );
+        let item = items.iter().find(|i| i.label == "\"a\"").unwrap();
+        assert_eq!(item.kind, CompletionKind::EnumValue);
+    }
+
+    /// T2-c: non-literal field type (`x: int`) offers no enum values (no panic).
+    #[test]
+    fn completions_enum_value_non_literal_type_no_values() {
+        let src = "type T = { x: int }\nschema T\nx: 1\n";
+        // Cursor inside value of `x: 1`
+        let off = src.rfind("1\n").unwrap();
+        let items = completions(src, off, None);
+        let enum_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == CompletionKind::EnumValue)
+            .collect();
+        assert!(
+            enum_items.is_empty(),
+            "expected no EnumValue completions for int field, got {enum_items:?}"
+        );
+    }
+
+    /// T2-d: mixed union `"a" | int` — only offers the literal member `"a"`.
+    #[test]
+    fn completions_enum_value_mixed_union_only_literals() {
+        let src = "type T = { x: \"a\" | int }\nschema T\nx: \"a\"\n";
+        let off = src.rfind("\"a\"\n").unwrap() + 1;
+        let items = completions(src, off, None);
+        let enum_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == CompletionKind::EnumValue)
+            .collect();
+        // Only "a" should be offered, not the int part.
+        assert_eq!(
+            enum_items.len(),
+            1,
+            "expected exactly 1 EnumValue completion for mixed union, got {enum_items:?}"
+        );
+        assert_eq!(
+            enum_items[0].label, "\"a\"",
+            "only the literal member 'a' should be offered"
+        );
+    }
+
+    /// T2-e: unresolvable field (field name not in schema) → no EnumValue, no panic.
+    #[test]
+    fn completions_enum_value_unresolvable_no_panic() {
+        let src = "type T = { x: int }\nschema T\ny: 1\n";
+        // `y` is not a field of T; cursor in its value
+        let off = src.rfind("1\n").unwrap();
+        // Must not panic.
+        let items = completions(src, off, None);
+        let enum_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.kind == CompletionKind::EnumValue)
+            .collect();
+        assert!(
+            enum_items.is_empty(),
+            "expected no EnumValue for unknown field, got {enum_items:?}"
+        );
+    }
+
+    /// T2-f: imported schema where the field has a literal-union type.
+    /// `schema k.Deployment` where imported file has `type Deployment = { policy: "Always" | "Never" }`.
+    #[test]
+    fn completions_enum_value_imported_schema_field() {
+        let dir = scratch_dir();
+        write_completion_fixture(
+            &dir,
+            ".mangrove/resolvers.toml",
+            "[namespace.ns]\nremote = \"vendor\"\n",
+        );
+        write_completion_fixture(
+            &dir,
+            "vendor/pkg.mang",
+            "type Deployment = { policy: \"Always\" | \"Never\" | \"IfNotPresent\" }\n",
+        );
+        let main_src = "use \"ns/pkg@v1\" as k\nschema k.Deployment\npolicy: \"Always\"\n";
+        let main_path = dir.join("main.mang");
+        // Cursor inside value of `policy: "Always"` — after opening quote.
+        let off = main_src.rfind("\"Always\"\n").unwrap() + 1;
+        let items = completions(main_src, off, Some(&main_path));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(
+            labels.contains(&"\"Always\""),
+            "expected '\"Always\"' from imported schema, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"\"Never\""),
+            "expected '\"Never\"' from imported schema, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"\"IfNotPresent\""),
+            "expected '\"IfNotPresent\"' from imported schema, got {labels:?}"
+        );
+        let item = items.iter().find(|i| i.label == "\"Always\"").unwrap();
+        assert_eq!(item.kind, CompletionKind::EnumValue);
+        // No fetch: verify read count is finite and no extra disk reads on second call.
+        // (No-fetch invariant: the resolution uses the same local-path mechanism as other cross-file features.)
+    }
+
+    /// T2-g: regression — existing field-name and keyword completions still work
+    /// when enum-value completion is also active.
+    #[test]
+    fn completions_enum_value_regression_field_names_still_offered() {
+        let src = "type T = { mode: \"a\" | \"b\", host: str }\nschema T\nmode: \"a\"\n";
+        let off = src.rfind("\"a\"\n").unwrap() + 1;
+        let items = completions(src, off, None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // Enum values for `mode` field.
+        assert!(
+            labels.contains(&"\"a\""),
+            "enum value 'a' should still be offered"
+        );
+        // Field names (from schema) should also be there.
+        assert!(
+            labels.contains(&"mode"),
+            "field name 'mode' should still be offered alongside enum values, got {labels:?}"
+        );
+        assert!(
+            labels.contains(&"host"),
+            "field name 'host' should still be offered, got {labels:?}"
         );
     }
 

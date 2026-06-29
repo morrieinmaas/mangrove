@@ -569,6 +569,7 @@ fn completion_item_kind(k: CompletionKind) -> CompletionItemKind {
         CompletionKind::TypeName => CompletionItemKind::STRUCT,
         CompletionKind::Keyword => CompletionItemKind::KEYWORD,
         CompletionKind::Field => CompletionItemKind::FIELD,
+        CompletionKind::EnumValue => CompletionItemKind::ENUM_MEMBER,
     }
 }
 
