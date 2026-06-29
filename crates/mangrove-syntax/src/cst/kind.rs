@@ -78,6 +78,7 @@ pub enum SyntaxKind {
     ANNOTATION,
     DEFAULT,
     BINDING,
+    BARE_VALUE, // a document whose body is a single bare value
     // types
     // RESERVED — not currently emitted by the lexer/parser. Type and match
     // interiors are flat token runs under TYPE_DEF / MATCH_EXPR in v0.3.0;
@@ -173,6 +174,7 @@ impl SyntaxKind {
         SyntaxKind::ANNOTATION,
         SyntaxKind::DEFAULT,
         SyntaxKind::BINDING,
+        SyntaxKind::BARE_VALUE,
         SyntaxKind::TYPE_PRIMITIVE,
         SyntaxKind::TYPE_RANGE,
         SyntaxKind::TYPE_REGEX,

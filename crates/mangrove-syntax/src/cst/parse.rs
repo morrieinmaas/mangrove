@@ -174,6 +174,12 @@ fn parse_document(p: &mut Parser) {
             parse_schema_decl(p);
         } else if p.current() == SyntaxKind::DOT_DOT_DOT {
             parse_spread(p);
+        } else if is_bare_value_start_cst(p) {
+            parse_bare_value_body(p);
+            // After the bare-value body the document is fully consumed — any
+            // remaining tokens are errors. Continue the loop so they are
+            // captured into the tree (preserving losslessness) via the normal
+            // binding error-recovery path. The loop exits naturally at EOF.
         } else {
             let second = nth_sig(p, 1);
             if (p.current() == SyntaxKind::BAREWORD || p.current() == SyntaxKind::STR)
@@ -216,6 +222,63 @@ fn lookahead_is_str(p: &Parser) -> bool {
 /// Returns true if the first significant token after the current one is L_BRACE.
 fn lookahead_is_lbrace(p: &Parser) -> bool {
     nth_sig(p, 1) == SyntaxKind::L_BRACE
+}
+
+/// Returns the kind of the Nth significant token, skipping trivia AND ERROR tokens.
+/// Used for disambiguation where malformed input may insert ERROR tokens between
+/// a key and its colon (e.g. `café: 1` → BAREWORD("caf") + ERROR("é") + COLON).
+fn nth_sig_skip_errors(p: &Parser, n: usize) -> SyntaxKind {
+    let mut count = 0;
+    let mut i = p.pos;
+    while i < p.toks.len() {
+        let kind = p.toks[i].kind;
+        if !kind.is_trivia() && kind != SyntaxKind::ERROR {
+            if count == n {
+                return kind;
+            }
+            count += 1;
+        }
+        i += 1;
+    }
+    SyntaxKind::EOF
+}
+
+/// True if the current significant token starts a bare-value body.
+///
+/// Mirrors `Parser::is_bare_value_start` in parser.rs — same rule applied to
+/// `SyntaxKind` instead of `Tok`. `{`-leading bodies are NOT bare-value.
+fn is_bare_value_start_cst(p: &Parser) -> bool {
+    match p.current() {
+        // List literal — unambiguously a bare value
+        SyntaxKind::L_BRACKET => true,
+        // All scalar tokens — never a key
+        SyntaxKind::INT
+        | SyntaxKind::DECIMAL
+        | SyntaxKind::UNIT_LIT
+        | SyntaxKind::BOOL
+        | SyntaxKind::BYTES
+        | SyntaxKind::INTERP_STR => true,
+        // String: bare value only if NOT followed by COLON (skip errors too)
+        SyntaxKind::STR => nth_sig_skip_errors(p, 1) != SyntaxKind::COLON,
+        // Bareword: check the text for `unset`/`match`, or check that the next
+        // non-error significant token is not `:` / `+=` / `{`.
+        // Skip ERROR tokens in the lookahead so that inputs like `café: 1`
+        // (BAREWORD + ERROR + COLON) are still treated as bindings, not bare values.
+        SyntaxKind::BAREWORD => {
+            let text = current_bareword_text(p);
+            match text.as_deref() {
+                Some("unset") | Some("match") => true,
+                _ => {
+                    let next = nth_sig_skip_errors(p, 1);
+                    next != SyntaxKind::COLON
+                        && next != SyntaxKind::PLUS_EQ
+                        && next != SyntaxKind::L_BRACE
+                }
+            }
+        }
+        // Everything else (including L_BRACE) — not a bare-value start
+        _ => false,
+    }
 }
 
 /// Returns the kind of the Nth significant token (0 = current, 1 = next, ...).
@@ -513,6 +576,18 @@ fn parse_spread(p: &mut Parser) {
     p.bump(); // DOT_DOT_DOT
     if p.current() == SyntaxKind::BAREWORD {
         p.bump(); // alias
+    }
+    p.finish();
+}
+
+/// A bare-value document body: a single value expression at the top level.
+/// Wraps the value in a BARE_VALUE node so `lower.rs` can identify it.
+fn parse_bare_value_body(p: &mut Parser) {
+    p.start(SyntaxKind::BARE_VALUE);
+    parse_atom(p, false, 0);
+    // Consume trailing newline if present (keeps the tree lossless)
+    if p.current() == SyntaxKind::NEWLINE {
+        p.bump();
     }
     p.finish();
 }

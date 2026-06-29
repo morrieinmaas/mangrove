@@ -651,3 +651,86 @@ fn lexer_is_lossless_on_examples() {
         relex_roundtrips(src);
     }
 }
+
+// ---- bare-value top-level documents ----
+
+#[test]
+fn oracle_bare_list_document() {
+    assert_document_equivalent("[ 1, 2, 3 ]\n");
+}
+
+#[test]
+fn oracle_bare_int_document() {
+    assert_document_equivalent("42\n");
+}
+
+#[test]
+fn oracle_bare_string_document() {
+    assert_document_equivalent("\"hello\"\n");
+}
+
+#[test]
+fn oracle_bare_bool_document() {
+    assert_document_equivalent("true\n");
+}
+
+#[test]
+fn oracle_bare_ref_document() {
+    assert_document_equivalent("myref\n");
+}
+
+#[test]
+fn oracle_bare_empty_list() {
+    assert_document_equivalent("[]\n");
+}
+
+#[test]
+fn oracle_bare_value_with_declarations() {
+    assert_document_equivalent("type Port = int & >= 1 & <= 65535\nschema Port\n[ 8443, 9090 ]\n");
+}
+
+#[test]
+fn bare_value_cst_losslessness() {
+    for src in [
+        "[ 1, 2, 3 ]\n",
+        "42\n",
+        "\"hello\"\n",
+        "true\n",
+        "[]\n",
+        "type Port = int & >= 1 & <= 65535\nschema Port\n[ 8443, 9090 ]\n",
+    ] {
+        let node = super::parse::parse_cst(src).syntax();
+        assert_eq!(
+            node.text().to_string(),
+            src,
+            "bare-value document must round-trip losslessly: {src:?}"
+        );
+    }
+}
+
+#[test]
+fn oracle_bare_value_hash() {
+    // The hash of a bare-list document matches the hash of Value::List directly
+    assert_hash_equivalent("[ 1, 2, 3 ]\n");
+    assert_hash_equivalent("[]\n");
+    assert_hash_equivalent("42\n");
+    assert_hash_equivalent("\"hello\"\n");
+}
+
+#[test]
+fn bare_value_cst_node_kind() {
+    // The CST must emit a BARE_VALUE node as a direct child of DOCUMENT
+    let p = super::parse::parse_cst("[ 1, 2, 3 ]\n");
+    let root = p.syntax();
+    let bare_val = root.children().find(|n| n.kind() == SyntaxKind::BARE_VALUE);
+    assert!(
+        bare_val.is_some(),
+        "expected a BARE_VALUE child of DOCUMENT for a bare list"
+    );
+    // No BINDING children — this is a bare doc, not a binding doc
+    let bindings = root
+        .children()
+        .filter(|n| n.kind() == SyntaxKind::BINDING)
+        .count();
+    assert_eq!(bindings, 0);
+}

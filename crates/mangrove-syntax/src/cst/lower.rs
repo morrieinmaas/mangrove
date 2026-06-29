@@ -70,6 +70,21 @@ pub fn lower(node: &SyntaxNode) -> Result<Document, ParseError> {
                 schema = Some(name);
                 schema_narrow = narrow;
             }
+            SyntaxKind::BARE_VALUE => {
+                // Bare-value document: lower the single child value.
+                let body_value = lower_bare_value_node(&child)?;
+                return Ok(Document {
+                    uses,
+                    typedefs,
+                    unitdefs,
+                    schema,
+                    schema_narrow,
+                    params,
+                    fns,
+                    stmts: vec![],
+                    body: body_value,
+                });
+            }
             _ => {}
         }
     }
@@ -324,4 +339,30 @@ fn decode_str_tok(t: &SyntaxToken) -> Result<String, ParseError> {
             col: 0,
         }),
     }
+}
+
+/// Lower the value inside a BARE_VALUE node.
+///
+/// A BARE_VALUE node wraps a single value expression at the document level.
+/// Its children are: optional leading trivia, the value (a node like LIST/RECORD/REF/UNSET/
+/// MATCH_EXPR/CALL, or a scalar token), optional trailing NEWLINE.
+fn lower_bare_value_node(node: &SyntaxNode) -> Result<Value, ParseError> {
+    for elem in node.children_with_tokens() {
+        match elem {
+            NodeOrToken::Token(t) if t.kind().is_trivia() => continue,
+            // Skip the structural NEWLINE at the end of the bare-value node
+            NodeOrToken::Token(t) if t.kind() == SyntaxKind::NEWLINE => continue,
+            NodeOrToken::Token(t) => {
+                return decode_scalar(&t);
+            }
+            NodeOrToken::Node(n) => {
+                return lower_composite(&n);
+            }
+        }
+    }
+    Err(ParseError {
+        message: "BARE_VALUE node has no value content".into(),
+        line: 0,
+        col: 0,
+    })
 }

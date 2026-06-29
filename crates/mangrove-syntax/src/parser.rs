@@ -427,6 +427,27 @@ impl Parser {
                     }
                 };
                 stmts.push(Stmt::Spread(alias));
+            } else if self.is_bare_value_start() {
+                // Bare-value body: the document is a single value, not a record of bindings.
+                let value = self.parse_value(0)?;
+                // Consume the trailing newline/sep so the loop terminates cleanly.
+                self.skip_seps();
+                if !self.at_eof() {
+                    return Err(
+                        self.error("unexpected token after bare-value document body".into())
+                    );
+                }
+                return Ok(Document {
+                    uses,
+                    typedefs,
+                    unitdefs,
+                    schema,
+                    schema_narrow,
+                    params,
+                    fns,
+                    stmts: vec![],
+                    body: value,
+                });
             } else {
                 // A keyed body statement: `k: v`, `k += [..]`, or `k { ops }`.
                 let key = match self.peek().tok.clone() {
@@ -689,6 +710,39 @@ impl Parser {
             }
         }
         Ok(items)
+    }
+
+    /// True if the current token starts a bare-value body (not a keyed binding or spread).
+    /// Requires that `skip_seps` has already been called so we're at the first body token.
+    ///
+    /// Bare-value: `[`, scalars (int/dec/bool/bytes/unit/interp/str), `unset`, `match`,
+    /// or a bareword NOT followed by `:` / `+=` / `{`.
+    ///
+    /// `{`-leading bodies are NOT bare-value — they fall through to existing binding logic.
+    fn is_bare_value_start(&self) -> bool {
+        match &self.peek().tok {
+            // List literal — unambiguously a bare value
+            Tok::LBracket => true,
+            // All scalar tokens — never a key on their own
+            Tok::Int(_)
+            | Tok::Decimal(_)
+            | Tok::UnitLit(_, _)
+            | Tok::Bool(_)
+            | Tok::Bytes(_)
+            | Tok::InterpStr(_) => true,
+            // String literal: bare value ONLY if NOT followed by `:`
+            Tok::Str(_) => !self.next_is(&Tok::Colon),
+            // `unset` or `match` barewords are values, not keys
+            Tok::Bareword(b) if b == "unset" || b == "match" => true,
+            // Other barewords: bare value only if next token is NOT `:`, `+=`, or `{`
+            Tok::Bareword(_) => {
+                !self.next_is(&Tok::Colon)
+                    && !self.next_is(&Tok::PlusEq)
+                    && !self.next_is(&Tok::LBrace)
+            }
+            // Everything else (including `{`) — not a bare-value start
+            _ => false,
+        }
     }
 
     /// True if the current statement is the keyword `kw` followed by a bareword
@@ -1800,5 +1854,89 @@ mod tests {
         // A reasonable nesting depth still parses fine.
         let ok = format!("a: {}{}", "[".repeat(50), "]".repeat(50));
         assert!(parse(&ok).is_ok());
+    }
+
+    // ---- bare-value top-level documents ----
+
+    #[test]
+    fn bare_list_document() {
+        let d = parse_document("[ 1, 2, 3 ]\n").unwrap();
+        assert!(d.stmts.is_empty(), "bare-value doc has no stmts");
+        assert_eq!(
+            d.body,
+            Value::List(vec![
+                Value::Int(1.into()),
+                Value::Int(2.into()),
+                Value::Int(3.into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn bare_int_document() {
+        let d = parse_document("42\n").unwrap();
+        assert!(d.stmts.is_empty());
+        assert_eq!(d.body, Value::Int(42.into()));
+    }
+
+    #[test]
+    fn bare_string_document() {
+        let d = parse_document("\"hello\"\n").unwrap();
+        assert!(d.stmts.is_empty());
+        assert_eq!(d.body, Value::Str("hello".into()));
+    }
+
+    #[test]
+    fn bare_bool_document() {
+        let d = parse_document("true\n").unwrap();
+        assert!(d.stmts.is_empty());
+        assert_eq!(d.body, Value::Bool(true));
+    }
+
+    #[test]
+    fn bare_value_parse_helper() {
+        // `parse` (the hash entrypoint) must also work
+        let v = parse("[ 10, 20 ]\n").unwrap();
+        assert_eq!(
+            v,
+            Value::List(vec![Value::Int(10.into()), Value::Int(20.into())])
+        );
+    }
+
+    #[test]
+    fn bare_ref_document() {
+        // a bareword not followed by : is a reference
+        let d = parse_document("myref\n").unwrap();
+        assert!(d.stmts.is_empty());
+        assert_eq!(d.body, Value::Ref("myref".into()));
+    }
+
+    #[test]
+    fn bare_value_with_declarations() {
+        // type defs + schema + bare list body
+        let src = "type Port = int & >= 1 & <= 65535\nschema Port\n[ 8443, 9090 ]\n";
+        let d = parse_document(src).unwrap();
+        assert_eq!(d.typedefs.len(), 1);
+        assert_eq!(d.schema.as_deref(), Some("Port"));
+        assert_eq!(
+            d.body,
+            Value::List(vec![Value::Int(8443.into()), Value::Int(9090.into())])
+        );
+    }
+
+    #[test]
+    fn quoted_key_is_still_a_binding_not_bare_value() {
+        // A string followed by `:` must remain a binding, not a bare value.
+        let d = parse_document("\"my-key\": 42\n").unwrap();
+        let Value::Map(m) = &d.body else {
+            panic!("expected map")
+        };
+        assert_eq!(m.get("my-key"), Some(&Value::Int(42.into())));
+    }
+
+    #[test]
+    fn bare_value_empty_list() {
+        let d = parse_document("[]\n").unwrap();
+        assert_eq!(d.body, Value::List(vec![]));
     }
 }
