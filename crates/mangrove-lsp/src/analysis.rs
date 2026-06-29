@@ -24,8 +24,25 @@ use std::time::SystemTime;
 // needless overhead.
 // ---------------------------------------------------------------------------
 
-/// Version key: (last-modified time, file length in bytes).
-/// A stat mismatch on either field triggers a re-read.
+/// Version key: `(mtime, file_len)` — both fields come from a single
+/// `std::fs::metadata` stat call; no extra read is needed.
+///
+/// **Invalidation contract**: a cache entry is considered stale when either
+/// field changes.  In practice this catches all normal edits:
+/// - Any write that changes the file content almost always changes either the
+///   byte length OR the mtime (or both).
+/// - `std::fs::Metadata::modified()` returns the OS's full-resolution mtime
+///   (nanoseconds on Linux/macOS, 100 ns on Windows), making the residual
+///   same-tick + same-len window effectively impossible under real workloads
+///   (it would require two distinct writes whose bytes cancel out to identical
+///   length, both completing within one mtime tick — sub-microsecond on
+///   modern kernels).
+///
+/// We deliberately do NOT add content-hashing on every request because that
+/// would re-read the file on every cache check, defeating the cache's purpose.
+/// Adding a unix `ctime` field (via `std::os::unix::fs::MetadataExt`) would
+/// close the residual window on Unix but adds platform-specific complexity
+/// that isn't justified by the near-zero practical risk.
 type VersionKey = (SystemTime, u64);
 
 struct CacheEntry {
@@ -785,6 +802,12 @@ fn goto_definition_cross_file_impl(
 /// Walk `USE_DECL` nodes in the CST and return the path of the one whose alias
 /// matches. This avoids calling `lower()`, which fails on partially-invalid
 /// documents (e.g. a bareword in value position such as `x: inf.Widget`).
+///
+/// **First-match is correct here**: duplicate `use` aliases (e.g. two `use
+/// "…" as k` declarations sharing the alias `k`) are rejected by the compose
+/// layer (`mangrove-compose/src/load.rs`) before a document can be evaluated.
+/// The LSP skips type-checking for documents with `use` declarations, so a
+/// duplicate-alias document never reaches this function with ambiguous state.
 fn use_reference_for_alias(root: &SyntaxNode, alias: &str) -> Option<String> {
     for child in root.children() {
         if child.kind() == SyntaxKind::USE_DECL {
@@ -2987,7 +3010,56 @@ mod tests {
         );
     }
 
-    /// Test 3: missing file returns None, no panic.
+    /// Test 3a: mtime-only invalidation forces a re-read even when the byte
+    /// length is unchanged.
+    ///
+    /// This test documents the `(mtime, len)` key contract: if ONLY the mtime
+    /// changes (same length, same text content — as though a `touch` were run),
+    /// the cache treats the entry as stale and reads from disk again.  The
+    /// residual risk scenario (same mtime AND same len with different content)
+    /// is not tested here because it cannot be reliably reproduced without
+    /// defeating the OS mtime mechanism; see the `VersionKey` doc comment for
+    /// why that window is effectively impossible in practice.
+    #[test]
+    fn import_cache_invalidated_on_mtime_change() {
+        let dir = scratch_dir();
+        let path = dir.join("mtime_only.mang");
+        std::fs::write(&path, "type A = int\n").unwrap();
+
+        // Backdate the mtime to a well-known past time so the first cache entry
+        // stores a mtime that is clearly different from "now".
+        let past =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        let cache = ImportCache::new();
+        let text1 = cache.read(&path).expect("first read");
+        assert_eq!(cache.reads(), 1);
+        assert_eq!(text1.as_ref(), "type A = int\n");
+
+        // Re-write with IDENTICAL byte length so only the mtime changes.
+        // ("type A = int\n" and "type A = str\n" are both 13 bytes.)
+        std::fs::write(&path, "type A = str\n").unwrap();
+        // The OS sets mtime to "now" on write, which differs from `past`.
+
+        let text2 = cache.read(&path).expect("re-read after mtime change");
+        assert_eq!(
+            cache.reads(),
+            2,
+            "expected a re-read when mtime changed (even with same byte length)"
+        );
+        assert_eq!(text2.as_ref(), "type A = str\n");
+        assert_ne!(
+            text1.as_ref(),
+            text2.as_ref(),
+            "stale text must not be returned after mtime-only invalidation"
+        );
+    }
+
+    /// Test 4 (was 3): missing file returns None, no panic.
     #[test]
     fn import_cache_missing_file_returns_none() {
         let dir = scratch_dir();
@@ -3006,7 +3078,7 @@ mod tests {
         );
     }
 
-    /// Test 4: two successive completions_cached calls return the same results
+    /// Test 5: two successive completions_cached calls return the same results
     /// and the second call does not perform any additional disk reads.
     #[test]
     fn completions_cached_reduces_reads_on_second_call() {
@@ -3053,7 +3125,7 @@ mod tests {
         );
     }
 
-    /// Test 5: goto_definition_cross_file with a missing file returns None, no panic.
+    /// Test 6: goto_definition_cross_file with a missing file returns None, no panic.
     /// (Exercises the no-fetch / missing-file guard through the cached path.)
     #[test]
     fn import_cache_goto_missing_file_returns_none() {

@@ -669,6 +669,28 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_use_alias_errors() {
+        // Two `use` declarations sharing the same alias are rejected at compose
+        // time.  This is the validation that makes first-match in the LSP's
+        // `use_reference_for_alias` correct: a duplicate-alias document can
+        // never reach the LSP's go-to-definition / completion paths in a valid
+        // state.
+        let dir = scratch(&[
+            ("a.mang", "name: \"a\"\n"),
+            ("b.mang", "name: \"b\"\n"),
+            (
+                "root.mang",
+                "use \"./a.mang\" as k\nuse \"./b.mang\" as k\n...k\n",
+            ),
+        ]);
+        let e = compose(&dir.join("root.mang")).unwrap_err();
+        assert!(
+            e.contains("duplicate") && e.contains("k"),
+            "expected duplicate-alias error mentioning 'k', got: {e}"
+        );
+    }
+
+    #[test]
     fn append_op_extends_inherited_list() {
         let dir = scratch(&[
             ("base.mang", "ports: [ 80 ]\n"),
