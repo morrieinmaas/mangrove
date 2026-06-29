@@ -1,0 +1,407 @@
+==================
+Comment
+==================
+
+# this is a comment
+## this is a doc comment
+#! this is a directive
+
+---
+
+(source_file
+  (comment)
+  (doc_comment)
+  (directive))
+
+==================
+Integer binding
+==================
+
+count: 42
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (integer)))
+
+==================
+Decimal binding
+==================
+
+ratio: 3.14
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (decimal)))
+
+==================
+Unit literal binding
+==================
+
+mem: 512Mi
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (unit_literal)))
+
+==================
+String binding
+==================
+
+name: "hello"
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (string)))
+
+==================
+String with interpolation
+==================
+
+image: "registry/api:${version}"
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (string)))
+
+==================
+Raw string binding
+==================
+
+pattern: r"^[0-9]+$"
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (raw_string)))
+
+==================
+Boolean bindings
+==================
+
+enabled: true
+disabled: false
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (bool))
+  (binding
+    key: (identifier)
+    value: (bool)))
+
+==================
+Unset binding
+==================
+
+removed: unset
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (unset)))
+
+==================
+Record value
+==================
+
+meta: { name: "foo", version: 1 }
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (record
+      (binding key: (identifier) value: (string))
+      (binding key: (identifier) value: (integer)))))
+
+==================
+List value
+==================
+
+tags: [ "a", "b", "c" ]
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (list
+      (string)
+      (string)
+      (string))))
+
+==================
+Spread
+==================
+
+...base
+
+---
+
+(source_file
+  (spread
+    name: (identifier)))
+
+==================
+List append
+==================
+
+deps += [ "httpx" ]
+
+---
+
+(source_file
+  (list_op
+    key: (identifier)
+    (string)))
+
+==================
+Use declaration
+==================
+
+use "types/base" as base
+
+---
+
+(source_file
+  (use_decl
+    path: (string)
+    alias: (identifier)))
+
+==================
+Type definition - named type field
+==================
+
+type Container = { image: str }
+
+---
+
+(source_file
+  (type_def
+    name: (identifier)
+    type: (record_type
+      (field_type
+        name: (identifier)))))
+
+==================
+Type definition - with refinements
+==================
+
+type Port = int & >= 1 & <= 65535
+
+---
+
+(source_file
+  (type_def
+    name: (identifier)
+    type: (refined_type
+      (comparison_refinement
+        value: (integer))
+      (comparison_refinement
+        value: (integer)))))
+
+==================
+Type definition - union of strings
+==================
+
+type Env = "dev" | "staging" | "prod"
+
+---
+
+(source_file
+  (type_def
+    name: (identifier)
+    type: (union_type
+      (literal_type (string))
+      (literal_type (string))
+      (literal_type (string)))))
+
+==================
+Type definition - list type
+==================
+
+type Tags = [ str ]
+
+---
+
+(source_file
+  (type_def
+    name: (identifier)
+    type: (list_type)))
+
+==================
+Type definition - named list type
+==================
+
+type Ports = [ Port ]
+
+---
+
+(source_file
+  (type_def
+    name: (identifier)
+    type: (list_type
+      element: (named_type (identifier)))))
+
+==================
+Type definition - regex refinement
+==================
+
+type Version = str & =~ r"^[0-9]+\.[0-9]+$"
+
+---
+
+(source_file
+  (type_def
+    name: (identifier)
+    type: (refined_type
+      (regex_refinement
+        pattern: (raw_string)))))
+
+==================
+Unit type definition
+==================
+
+unit Mem: int { B = 1, Ki = 1024B, Mi = 1024Ki }
+
+---
+
+(source_file
+  (unit_def
+    name: (identifier)
+    members: (unit_member
+      name: (identifier)
+      value: (integer))
+    members: (unit_member
+      name: (identifier)
+      value: (unit_literal))
+    members: (unit_member
+      name: (identifier)
+      value: (unit_literal))))
+
+==================
+Schema declaration
+==================
+
+schema Deployment
+
+---
+
+(source_file
+  (schema_decl
+    name: (identifier)))
+
+==================
+Params block
+==================
+
+params {
+  env: "dev" | "staging" | "prod" = "prod"
+}
+
+---
+
+(source_file
+  (params_block
+    (param_decl
+      name: (identifier)
+      type: (union_type
+        (literal_type (string))
+        (literal_type (string))
+        (literal_type (string)))
+      default: (string))))
+
+==================
+Match expression
+==================
+
+replicas: match env { dev: 1, staging: 2, prod: 6 }
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (match_expr
+      subject: (identifier)
+      (match_arm
+        pattern: (identifier)
+        value: (integer))
+      (match_arm
+        pattern: (identifier)
+        value: (integer))
+      (match_arm
+        pattern: (identifier)
+        value: (integer)))))
+
+==================
+Annotation bare
+==================
+
+type Foo = { x: str @deprecated }
+
+---
+
+(source_file
+  (type_def
+    name: (identifier)
+    type: (record_type
+      (field_type
+        name: (identifier)
+        annotations: (annotation
+          name: (identifier))))))
+
+==================
+Annotation with argument
+==================
+
+type Foo = { ports: [ Port ] @key(name) }
+
+---
+
+(source_file
+  (type_def
+    name: (identifier)
+    type: (record_type
+      (field_type
+        name: (identifier)
+        type: (list_type
+          element: (named_type (identifier)))
+        annotations: (annotation
+          name: (identifier)
+          (identifier))))))
+
+==================
+Hyphenated identifier as key
+==================
+
+build-backend: "hatchling.build"
+
+---
+
+(source_file
+  (binding
+    key: (identifier)
+    value: (string)))

@@ -5,9 +5,12 @@ over stdio. It provides diagnostics (parse + schema errors), hover, document
 symbols, semantic-token highlighting, context-aware completion, go-to-definition
 (local and cross-file into imported types), find-references, rename, and formatting (via `mangrove fmt`).
 
-> Highlighting note: Mangrove ships **no tree-sitter grammar** — syntax
-> highlighting comes from the LSP's semantic tokens. A `.mang` file has no
-> highlighting until the server attaches.
+> Highlighting note: Mangrove ships a **tree-sitter grammar** in
+> `tree-sitter-mangrove/` for editors that support Tree-sitter (Neovim,
+> Zed, Helix, etc.). The grammar provides immediate syntax highlighting
+> on file open, before the LSP attaches. For full semantic highlighting
+> (types, references, schema errors), the LSP semantic tokens take over
+> once the server connects.
 
 ## Neovim (0.10+)
 
@@ -60,9 +63,9 @@ Open any `.mang` file. You should see:
 - Diagnostics (red squiggles) for parse/schema errors.
 - Hover (`Cmd+K Cmd+I`) showing type information.
 - Completions as you type.
-- Semantic-token highlighting (Mangrove has no tree-sitter grammar; colour
-  comes from LSP semantic tokens only — the file will appear uncoloured until
-  the server attaches, which is expected).
+- Syntax highlighting via the Tree-sitter grammar in `tree-sitter-mangrove/`
+  (available immediately on open) plus semantic-token highlighting from
+  the LSP once it attaches.
 - Go-to-definition (`F12` / `Cmd+Click`) for local and imported symbols.
 - Document outline in the Outline panel.
 
