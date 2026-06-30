@@ -244,6 +244,10 @@ fn lower_composite(node: &SyntaxNode) -> Result<Value, ParseError> {
                         let inner = lower_list_spread(&n)?;
                         items.push(Value::ListSpread(Box::new(inner)));
                     }
+                    NodeOrToken::Node(n) if n.kind() == SyntaxKind::COND_ELEM => {
+                        let desugared = lower_cond_elem(&n)?;
+                        items.push(desugared);
+                    }
                     NodeOrToken::Node(n) => {
                         items.push(lower_composite(&n)?);
                     }
@@ -369,6 +373,43 @@ fn lower_bare_value_node(node: &SyntaxNode) -> Result<Value, ParseError> {
         line: 0,
         col: 0,
     })
+}
+
+/// Lower a COND_ELEM node `item if cond` to the desugared
+/// `Value::ListSpread(Value::Match { scrutinee: cond, arms: [(true, [item]), (false, [])] })`.
+fn lower_cond_elem(node: &SyntaxNode) -> Result<Value, ParseError> {
+    let mut values: Vec<Value> = Vec::new();
+    for elem in node.children_with_tokens() {
+        match elem {
+            NodeOrToken::Token(t) if t.kind().is_trivia() => continue,
+            // Skip the `if` bareword token (it's a structural marker in the node)
+            NodeOrToken::Token(t) if t.kind() == SyntaxKind::BAREWORD && t.text() == "if" => {
+                continue;
+            }
+            NodeOrToken::Token(t) => values.push(decode_scalar(&t)?),
+            NodeOrToken::Node(n) => values.push(lower_composite(&n)?),
+        }
+    }
+    if values.len() != 2 {
+        return Err(ParseError {
+            message: format!(
+                "COND_ELEM node must have exactly 2 values (item, cond), found {}",
+                values.len()
+            ),
+            line: 0,
+            col: 0,
+        });
+    }
+    let mut it = values.into_iter();
+    let item = it.next().unwrap();
+    let cond = it.next().unwrap();
+    Ok(Value::ListSpread(Box::new(Value::Match {
+        scrutinee: Box::new(cond),
+        arms: vec![
+            (Some(Value::Bool(true)), Value::List(vec![item])),
+            (Some(Value::Bool(false)), Value::List(vec![])),
+        ],
+    })))
 }
 
 /// Lower a LIST_SPREAD node to the inner Value.

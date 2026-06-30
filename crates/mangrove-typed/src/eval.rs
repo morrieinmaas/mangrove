@@ -898,4 +898,110 @@ mod tests {
         let err = eval(&v, &[], &[], &types(), &nomods()).unwrap_err();
         assert!(err.expected.contains("list"), "{err}");
     }
+
+    // ---- conditional list elements (`item if cond`) ----
+
+    fn cond_elem(item: Value, cond: Value) -> Value {
+        Value::ListSpread(Box::new(Value::Match {
+            scrutinee: Box::new(cond),
+            arms: vec![
+                (Some(Value::Bool(true)), Value::List(vec![item])),
+                (Some(Value::Bool(false)), Value::List(vec![])),
+            ],
+        }))
+    }
+
+    #[test]
+    fn cond_elem_true_includes() {
+        // [ "a", "b" if true ]  →  ["a","b"]
+        let params = vec![Param {
+            name: "on".into(),
+            ty: Type::Bool,
+            default: Some(Value::Bool(true)),
+        }];
+        let v = list(vec![
+            Value::Str("a".into()),
+            cond_elem(Value::Str("b".into()), Value::Ref("on".into())),
+        ]);
+        let out = eval(&v, &params, &[], &types(), &nomods()).unwrap();
+        assert_eq!(
+            out,
+            list(vec![Value::Str("a".into()), Value::Str("b".into())])
+        );
+    }
+
+    #[test]
+    fn cond_elem_false_omits() {
+        // [ "a", "b" if false ]  →  ["a"]
+        let params = vec![Param {
+            name: "on".into(),
+            ty: Type::Bool,
+            default: Some(Value::Bool(false)),
+        }];
+        let v = list(vec![
+            Value::Str("a".into()),
+            cond_elem(Value::Str("b".into()), Value::Ref("on".into())),
+        ]);
+        let out = eval(&v, &params, &[], &types(), &nomods()).unwrap();
+        assert_eq!(out, list(vec![Value::Str("a".into())]));
+    }
+
+    #[test]
+    fn cond_elem_non_bool_errors_cleanly() {
+        // [ "x" if 5 ]  →  clean error (non-exhaustive match or not-covered), NOT panic, NOT silent omit
+        let v = list(vec![cond_elem(Value::Str("x".into()), int(5))]);
+        let err = eval(&v, &[], &[], &types(), &nomods()).unwrap_err();
+        // Must be an error (not panic, not Ok), and must NOT be a "list" spread error.
+        // Any match/exhaustiveness error is acceptable.
+        assert!(
+            err.got.contains("match")
+                || err.expected.contains("exhaustive")
+                || err.expected.contains("match arm")
+                || err.expected.contains("a value covered"),
+            "expected match-related error, got: {err}"
+        );
+        // Must NOT be a silent omit (i.e. eval must fail, not return ["x"] or [])
+    }
+
+    #[test]
+    fn bool_match_no_wildcard_both_frontends_exhaustive() {
+        // `match b { true: 1, false: 2 }` (no `_`) should evaluate — already tested
+        // in bool_match_is_exhaustive_without_wildcard but add here as explicit regression.
+        let params = vec![Param {
+            name: "b".into(),
+            ty: Type::Bool,
+            default: Some(Value::Bool(false)),
+        }];
+        let mut m = BTreeMap::new();
+        m.insert(
+            "r".into(),
+            matchv(
+                "b",
+                vec![
+                    (Some(Value::Bool(true)), int(1)),
+                    (Some(Value::Bool(false)), int(2)),
+                ],
+            ),
+        );
+        let out = eval(&Value::Map(m), &params, &[], &types(), &nomods()).unwrap();
+        let Value::Map(o) = out else { panic!() };
+        assert_eq!(o.get("r"), Some(&int(2)));
+    }
+
+    #[test]
+    fn wildcard_match_still_works() {
+        // `match env { a:1, _:2 }` still works (regression)
+        let mut m = BTreeMap::new();
+        m.insert("env".into(), Value::Str("other".into()));
+        m.insert(
+            "r".into(),
+            matchv(
+                "env",
+                vec![(Some(Value::Str("a".into())), int(1)), (None, int(2))],
+            ),
+        );
+        let out = eval(&Value::Map(m), &[], &[], &types(), &nomods()).unwrap();
+        let Value::Map(o) = out else { panic!() };
+        assert_eq!(o.get("r"), Some(&int(2)));
+    }
 }

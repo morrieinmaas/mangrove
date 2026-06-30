@@ -98,6 +98,7 @@ pub enum SyntaxKind {
     REQUIRE,
     PRED,
     LIST_SPREAD,
+    COND_ELEM,
     __LAST,
 }
 
@@ -190,6 +191,7 @@ impl SyntaxKind {
         SyntaxKind::REQUIRE,
         SyntaxKind::PRED,
         SyntaxKind::LIST_SPREAD,
+        SyntaxKind::COND_ELEM,
     ];
 
     pub fn is_trivia(self) -> bool {

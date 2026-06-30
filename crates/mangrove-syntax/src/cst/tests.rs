@@ -797,3 +797,45 @@ fn bare_value_cst_node_kind() {
         .count();
     assert_eq!(bindings, 0);
 }
+
+// ---- conditional list elements (`item if cond`) ----
+
+#[test]
+fn oracle_cond_elem_both_frontends_agree() {
+    // Both parsers must produce the same Value (ListSpread(Match{...})) for `item if cond`.
+    // Uses assert_value_equivalent because ListSpread is a transient marker.
+    assert_value_equivalent("on: true\nout: [ \"a\", \"b\" if on ]\n");
+    assert_value_equivalent("on: false\nout: [ \"a\", \"b\" if on ]\n");
+    assert_value_equivalent("xs: [ 1, 2 if true, 3 ]\n");
+    assert_value_equivalent("xs: [ 1 if false ]\n");
+}
+
+#[test]
+fn cond_elem_cst_losslessness() {
+    for src in [
+        "out: [ \"a\", \"b\" if on ]\n",
+        "xs: [ 1, 2 if true, 3 ]\n",
+        "xs: [ x if flag ]\n",
+    ] {
+        let node = super::parse::parse_cst(src).syntax();
+        assert_eq!(
+            node.text().to_string(),
+            src,
+            "conditional element must round-trip losslessly: {src:?}"
+        );
+    }
+}
+
+#[test]
+fn cond_elem_cst_node_kind() {
+    // The CST must emit a COND_ELEM node inside a LIST for `item if cond`
+    let p = super::parse::parse_cst("xs: [ 1, 2 if flag ]\n");
+    let root = p.syntax();
+    let cond_elem = root
+        .descendants()
+        .find(|n| n.kind() == super::kind::SyntaxKind::COND_ELEM);
+    assert!(
+        cond_elem.is_some(),
+        "expected a COND_ELEM child inside a LIST for `2 if flag`"
+    );
+}

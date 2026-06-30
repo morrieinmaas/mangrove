@@ -1167,7 +1167,22 @@ impl Parser {
                 let inner = self.parse_value(depth)?;
                 items.push(Value::ListSpread(Box::new(inner)));
             } else {
-                items.push(self.parse_value(depth)?);
+                let elem = self.parse_value(depth)?;
+                // `item if cond` — conditional element: desugar to
+                // `...match cond { true: [item], false: [] }`
+                if matches!(&self.peek().tok, Tok::Bareword(b) if b == "if") {
+                    self.advance(); // consume `if`
+                    let cond = self.parse_value(depth)?;
+                    items.push(Value::ListSpread(Box::new(Value::Match {
+                        scrutinee: Box::new(cond),
+                        arms: vec![
+                            (Some(Value::Bool(true)), Value::List(vec![elem])),
+                            (Some(Value::Bool(false)), Value::List(vec![])),
+                        ],
+                    })));
+                } else {
+                    items.push(elem);
+                }
             }
 
             let had_sep = self.at_sep();

@@ -535,7 +535,32 @@ fn parse_list(p: &mut Parser, depth: usize) {
                 p.finish(); // LIST_SPREAD
             }
             _ => {
-                parse_atom(p, true, depth); // element value — stop_at_closer=true: don't eat ]
+                // `item if cond` — conditional element. Only possible for single-token
+                // items (scalars/refs): peek if the 2nd significant token is bareword `if`.
+                let is_single_atom = matches!(
+                    p.current(),
+                    SyntaxKind::INT
+                        | SyntaxKind::STR
+                        | SyntaxKind::BOOL
+                        | SyntaxKind::DECIMAL
+                        | SyntaxKind::UNIT_LIT
+                        | SyntaxKind::INTERP_STR
+                        | SyntaxKind::BYTES
+                        | SyntaxKind::BAREWORD
+                );
+                let has_if_suffix = is_single_atom
+                    && nth_sig(p, 1) == SyntaxKind::BAREWORD
+                    && nth_bareword_text(p, 1).as_deref() == Some("if");
+
+                if has_if_suffix {
+                    p.start(SyntaxKind::COND_ELEM);
+                    parse_atom(p, true, depth); // the item
+                    p.bump(); // the `if` bareword
+                    parse_atom(p, true, depth); // the cond
+                    p.finish(); // COND_ELEM
+                } else {
+                    parse_atom(p, true, depth); // plain element — stop_at_closer=true: don't eat ]
+                }
             }
         }
     }
@@ -626,6 +651,26 @@ fn current_bareword_text(p: &Parser) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Get the text of the Nth significant BAREWORD token (0 = current), without consuming it.
+fn nth_bareword_text(p: &Parser, n: usize) -> Option<String> {
+    let mut count = 0;
+    let mut i = p.pos;
+    while i < p.toks.len() {
+        if !p.toks[i].kind.is_trivia() {
+            if count == n {
+                return if p.toks[i].kind == SyntaxKind::BAREWORD {
+                    Some(p.src[p.toks[i].start..p.toks[i].end].to_string())
+                } else {
+                    None
+                };
+            }
+            count += 1;
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Consume a parenthesized block `(...)`, already positioned at the opening `(`.
