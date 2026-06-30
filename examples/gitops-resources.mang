@@ -1,0 +1,74 @@
+# A GitOps resource list (v0.10.x/v0.11.0 conformance showcase).
+# Exercises together: discriminated-union validation over `kind`-tagged record
+# types (PVC | CronJob | Service), string-length refinement on `Name`,
+# a bare-value top-level list body (`[ ... ]`), conditional list elements
+# (`resource if params.flag`), and list spread (`...sharedServices`).
+# All params carry defaults, so the document evaluates and hashes standalone.
+
+# ── types ─────────────────────────────────────────────────────────────────────
+
+# k8s DNS-label constraint: 1..=63 code points.
+type Name = str & len >= 1 & len <= 63
+
+type PVC = {
+  kind: "PersistentVolumeClaim",
+  metadata: { name: Name },
+  spec: { storageClassName: str, storage: str },
+}
+
+type CronJob = {
+  kind: "CronJob",
+  metadata: { name: Name },
+  spec: { schedule: str, image: str },
+}
+
+type Service = {
+  kind: "Service",
+  metadata: { name: Name },
+  spec: { port: int & >= 1 & <= 65535 },
+}
+
+type Resource = PVC | CronJob | Service
+type Resources = [ Resource ]
+
+# ── schema + params ───────────────────────────────────────────────────────────
+
+schema Resources
+
+params {
+  # Enable the nightly-backup CronJob (default: on).
+  backups: bool = true
+  # Shared services spliced into every environment via list spread.
+  sharedServices: [ Service ] = [
+    {
+      kind: "Service"
+      metadata: { name: "metrics-svc" }
+      spec: { port: 9090 }
+    }
+  ]
+}
+
+# ── document body (bare-value list) ───────────────────────────────────────────
+
+[
+  # Storage claim for application data.
+  {
+    kind: "PersistentVolumeClaim"
+    metadata: { name: "data-pvc" }
+    spec: { storageClassName: "standard", storage: "10Gi" }
+  },
+  # Main API service.
+  {
+    kind: "Service"
+    metadata: { name: "api-svc" }
+    spec: { port: 8443 }
+  },
+  # Nightly backup job — included only when `backups` is true.
+  {
+    kind: "CronJob"
+    metadata: { name: "backup-job" }
+    spec: { schedule: "0 2 * * *", image: "registry.example.eu/backup:latest" }
+  } if backups,
+  # Shared cross-environment services (list spread).
+  ...sharedServices
+]

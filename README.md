@@ -105,7 +105,9 @@ port: 8443
 ```
 
 See [`examples/`](examples/) for a Kubernetes Deployment (with units, refinements, `@key` lists),
-a templated per-environment Deployment (`params` + `match` + interpolation), and a `pyproject`.
+a templated per-environment Deployment (`params` + `match` + interpolation), a `pyproject`, and a
+GitOps resource list (`gitops-resources.mang`) that exercises discriminated-union dispatch,
+string-length refinements, conditional list elements, and list spread together.
 
 ## Migrating an existing project
 
