@@ -294,8 +294,8 @@ fn check(
 /// Detection rules (all must hold or we return None):
 ///   1. Every variant resolves through `Named`/`Brand` to a plain `Record`.
 ///   2. There exists a field name that is: present in every resolved record,
-///      non-optional, has a literal type (`LitStr`/`LitInt`/`LitBool`), AND
-///      the literal values are pairwise distinct.
+///      has a literal type (`LitStr`/`LitInt`/`LitBool`), AND the literal
+///      values are pairwise distinct. The field may be optional.
 ///   3. The value is a `Value::Map` that contains the discriminant field.
 ///   4. The field's value matches exactly one variant's literal.
 fn try_du_dispatch(
@@ -376,14 +376,14 @@ fn resolve_to_record<'a>(
 
 /// Returns `true` if `field` qualifies as a discriminant field given all resolved
 /// variant records. A qualifying field must, in every variant, be: present,
-/// non-optional, have a literal type, and the literal values must be pairwise distinct.
+/// have a literal type (`LitStr`/`LitInt`/`LitBool`), and the literal values
+/// must be pairwise distinct. The field may be optional in any or all variants:
+/// when the value omits the discriminant, `try_du_dispatch` Step 3 returns
+/// `None` and the caller falls back to the try-each loop.
 fn is_discriminant(
     candidate: &mangrove_syntax::FieldDef,
     resolved: &[(&Type, &[mangrove_syntax::FieldDef])],
 ) -> bool {
-    if candidate.optional {
-        return false;
-    }
     if !matches!(
         candidate.ty,
         Type::LitStr(_) | Type::LitInt(_) | Type::LitBool(_)
@@ -391,16 +391,13 @@ fn is_discriminant(
         return false;
     }
 
-    // Every variant must have this field as a non-optional literal, and all
-    // literals must be pairwise distinct.
+    // Every variant must have this field as a literal, and all literals must
+    // be pairwise distinct.
     let mut seen_lits: Vec<&Type> = Vec::new();
     for (_, fields) in resolved {
         let Some(f) = fields.iter().find(|f| f.name == candidate.name) else {
             return false;
         };
-        if f.optional {
-            return false;
-        }
         if !matches!(f.ty, Type::LitStr(_) | Type::LitInt(_) | Type::LitBool(_)) {
             return false;
         }
@@ -1054,5 +1051,93 @@ mod tests {
             Some("invalid PVC"),
             "@message from named variant should propagate"
         );
+    }
+
+    // --- optional-discriminant DU tests ---
+
+    fn opt_du_env() -> TypeEnv {
+        // Same as du_env but discriminants are optional (k8s/gen-openapi shape).
+        use mangrove_syntax::{TypeDef, parse_type};
+        TypeEnv::build(
+            &[TypeDef {
+                name: "Resource".into(),
+                ty: parse_type(
+                    "{ kind?: \"PVC\", spec: { storage: str } } | { kind?: \"CronJob\", schedule: str }",
+                )
+                .unwrap(),
+                annotations: vec![],
+            }],
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn opt_du_has_disc_inner_field_wrong_precise_error() {
+        // Optional discriminant, value HAS it, inner field wrong → precise nested path.
+        let env = opt_du_env();
+        let v = map(&[
+            ("kind", Value::Str("PVC".into())),
+            ("spec", map(&[("storage", Value::Int(123.into()))])),
+        ]);
+        let e = validate(&v, &Type::Named("Resource".into()), &env);
+        assert_eq!(e.len(), 1, "expected exactly one error, got: {e:?}");
+        assert_eq!(
+            e[0].path, "spec.storage",
+            "error must point at spec.storage, not generic union failure"
+        );
+        assert_ne!(
+            e[0].failed.as_deref(),
+            Some("no matching variant"),
+            "must not be generic union failure"
+        );
+    }
+
+    #[test]
+    fn opt_du_has_disc_no_matching_variant_precise_error() {
+        // Optional discriminant, value HAS it but matches no variant → unknown … error.
+        let env = opt_du_env();
+        let v = map(&[
+            ("kind", Value::Str("Service".into())),
+            ("spec", map(&[("storage", Value::Str("1Ti".into()))])),
+        ]);
+        let e = validate(&v, &Type::Named("Resource".into()), &env);
+        assert_eq!(e.len(), 1, "expected exactly one error, got: {e:?}");
+        let failed = e[0].failed.as_deref().unwrap_or("");
+        assert!(
+            failed.contains("unknown kind"),
+            "failed should say 'unknown kind', got: {failed:?}"
+        );
+        assert!(
+            failed.contains("\"PVC\"") && failed.contains("\"CronJob\""),
+            "failed should list valid values, got: {failed:?}"
+        );
+    }
+
+    #[test]
+    fn opt_du_omits_disc_falls_back_to_try_each() {
+        // Optional discriminant, value OMITS it → fallback to try-each, valid value ok.
+        let env = opt_du_env();
+        // A value that matches PVC by structure (has spec.storage: str).
+        let v = map(&[("spec", map(&[("storage", Value::Str("10Gi".into()))]))]);
+        let e = validate(&v, &Type::Named("Resource".into()), &env);
+        assert!(
+            e.is_empty(),
+            "structurally-valid value without discriminant must pass, got: {e:?}"
+        );
+    }
+
+    #[test]
+    fn required_du_regression_still_dispatches() {
+        // REGRESSION: a required discriminant still dispatches precisely.
+        let env = du_env();
+        let v = map(&[
+            ("kind", Value::Str("PVC".into())),
+            ("spec", map(&[("storage", Value::Int(99.into()))])),
+        ]);
+        let e = validate(&v, &Type::Named("Resource".into()), &env);
+        assert_eq!(e.len(), 1, "expected one error, got: {e:?}");
+        assert_eq!(e[0].path, "spec.storage");
+        assert_ne!(e[0].failed.as_deref(), Some("no matching variant"));
     }
 }
