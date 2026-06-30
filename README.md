@@ -7,7 +7,7 @@ and **templating** (L3), on top of a supply-chain layer for verified imports. Ev
 reduces to a single canonical value with a stable BLAKE3 content hash, so two documents that
 *mean* the same thing hash the same.
 
-> **Status:** v0.8.0 — an experimental, solo, spec-complete implementation with a
+> **Status:** v0.9.0 — an experimental, solo, spec-complete implementation with a
 > formatter and a language server. Not used in production yet. The ideas (below) are
 > the point; a hosted docs site and broad editor packaging are still to come.
 
@@ -54,11 +54,11 @@ See the [language specification](mangrove-spec.md) and the [design RFC](mangrove
 | Layer | What it adds |
 |-------|--------------|
 | **L0 — Data** | maps, lists, strings (incl. text blocks & raw), ints, decimals, bools, bytes |
-| **L1 — Typed** | `type`/`schema`, refinements (`int & >= 1 & <= N`), unions, literals, units (`512Mi`), brands, `require`, annotations (`@key`, `@message`, `@deprecated`), defaults, **productive recursive types** (arbitrary-JSON / trees) |
+| **L1 — Typed** | `type`/`schema`, refinements (`int & >= 1 & <= N`), unions (incl. `kind`-discriminated, for precise per-variant errors), literals, units (`512Mi`), brands, `require`, annotations (`@key`, `@message`, `@deprecated`), defaults, **productive recursive types** (arbitrary-JSON / trees) |
 | **L2 — Composed** | `use` + spread (`...alias`), deep merge, `unset`, `@key` list-ops, subtype redefinition (`schema Base & {…}`) |
 | **L3 — Templated** | `params`, references, string interpolation (`${v}`), `match`, schema `fn` constructors, module calls (`emit: webapp(...)`) |
 | **Supply chain** | resolver split (identity/location/auth), local + git backends, `mangrove.lock` hash-verify, per-package anchoring, cross-file type imports, per-type version pins |
-| **Interop** | YAML/TOML ⇄ Mangrove converters (`import`/`export`); `gen-openapi` types from an OpenAPI/k8s API spec |
+| **Interop** | YAML/TOML ⇄ Mangrove converters (`import`/`export`), incl. multi-document YAML streams (`--to yaml-stream`); `gen-openapi` types from an OpenAPI/k8s API spec |
 
 ## CLI
 
@@ -68,7 +68,7 @@ mangrove check  <file.mang>            # validate against the bound schema
 mangrove fmt    <file.mang>            # format in place (--check for CI, - for stdin)
 mangrove update <file.mang>            # resolve + pin namespaced imports into mangrove.lock
 mangrove import <file.yaml|.toml>      # convert YAML/TOML to a schemaless Mangrove document
-mangrove export <file.mang> --to yaml  # evaluate and emit YAML/TOML
+mangrove export <file.mang> --to yaml  # evaluate and emit YAML/TOML (--to yaml-stream for a multi-doc list)
 mangrove gen-openapi <spec.json> --root <Def>   # OpenAPI (e.g. the k8s API) → Mangrove types
 mangrove lsp                           # run the language server over stdio (for editors)
 ```

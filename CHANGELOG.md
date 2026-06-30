@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.9.0
+
+Multi-document interop. A multi-document YAML stream (e.g. a Kubernetes
+manifest bundle) now imports to a single Mangrove document whose body is a
+list of resources, round-trips losslessly back to a `---`-separated stream,
+and validates per-resource with precise errors. This required two language
+additions, surfaced by migrating a real GitOps repo.
+
+### Language
+- **Bare-value top-level documents.** A document body may be a single value —
+  a list, scalar, string, `match`, or reference — not only `key: value`
+  bindings. `[ 1, 2, 3 ]` is now a complete document (it reduces to a list,
+  the same as any other value). Implemented in both the evaluation parser and
+  the lossless CST, kept in agreement by the existing parse-equivalence and
+  content-hash oracle. (`{`-led bodies remain bindings.)
+- **Discriminated-union validation.** When a union's variants are records
+  sharing a common, required, pairwise-distinct literal field (e.g. `kind`),
+  validation dispatches on that field to the matching variant and reports
+  precise per-field errors (`[2].spec.storage: got 12, expected str`) instead
+  of a generic "no matching variant". An unknown discriminant lists the valid
+  values. Unions without such a field fall back to the prior try-each-variant
+  behaviour; the accept/reject set is unchanged — only error precision improves.
+
+### Interop
+- **Multi-document YAML.** `mangrove import` turns a multi-doc YAML stream into
+  a `Value::List` (a single doc stays a scalar/map as before); `mangrove export
+  --to yaml-stream` emits a list body as `---`-separated YAML documents. The
+  round-trip is content-hash-stable.
+
+### Fixed
+- **Bare-value bodies no longer collapse to `{}`.** Composition rebuilt the body
+  by folding binding statements into an empty map and ignored a bare-value body,
+  so every bare-value document (and an empty file) evaluated to the same empty
+  map. Composition now uses the body directly when there are no statements.
+- **`unset` reaching a final value is a clean error, not a crash.** A bare
+  `unset` document, or an `unset` surviving inside a list (`[ 1, unset, 3 ]`),
+  previously aborted the process at the encoder. It is now rejected with a
+  message; `unset` remains valid only where it removes a binding during
+  composition.
+- **Spreading a non-record document is an error.** `...alias` where the spread
+  source's body is a list/scalar (now possible with bare-value bodies) is
+  rejected instead of silently discarding the data.
+
 ## v0.8.0
 
 Editor/tooling round: a Tree-sitter grammar, smarter completion, and
