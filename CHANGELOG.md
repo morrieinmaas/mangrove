@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.9.2
+
+`gen-openapi` upgrades that let a whole multi-resource Kubernetes repo be
+typed from one command. Verified end-to-end: every k8s/CRD manifest in a real
+GitOps repo validates against types generated in a single invocation. Additive
+— existing single-spec/single-root behaviour is byte-identical.
+
+### Interop — `gen-openapi`
+- **Combine multiple schemas/roots in one run.** `gen-openapi [--k8s] <spec>…
+  [--root <Def>]…` accepts several schema files (or several roots within one
+  envelope) and emits a single deduplicated type set with exactly one `Json`
+  free-form type. Previously each invocation re-emitted `type Json`, so
+  concatenating outputs for a multi-kind schema failed with
+  `duplicate type definition: Json`.
+- **`--k8s` injects the standard resource envelope.** Many CRD JSON schemas
+  describe only `spec`/`status`; the generated closed record then rejected a
+  real manifest's `apiVersion`/`kind`/`metadata` as unknown fields. With
+  `--k8s`, those three fields are injected into each root object type when
+  absent (`kind` as a literal of the `--root` name, so it also serves as a
+  discriminant) — never overwriting fields the schema already declares.
+
 ## v0.9.1
 
 Two additive refinements that make typing real Kubernetes manifests clean
