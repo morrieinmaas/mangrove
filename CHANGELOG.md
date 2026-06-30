@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.12.0
+
+### Interop
+- **`import --drop-null`.** A `null` *map value* in imported YAML is treated as
+  an absent key (the key is omitted) rather than rejected. This is the only
+  axiom-consistent reading — Mangrove expresses absence by a key not being
+  present, and an empty `annotations:` (which YAML parses as null) means "no
+  annotations". It unblocks snapshotting real-world Helm/k8s output (which is
+  full of implicit nulls) into a content-addressed value: e.g.
+  `helm template <chart> | mangrove import --drop-null --skip-empty` imports a
+  whole multi-hundred-resource render to one `b3:` hash, so an upstream chart
+  bump that changes the rendered output is detectable as a hash change.
+  Composes with `--skip-empty`; flags work before or after the path.
+
+  Scope: only a *null map value* becomes an absent key. A null *list element* or
+  a bare null scalar still errors (dropping a positional element would be lossy),
+  and default `import` (no flag) still rejects null — the no-null axiom is intact
+  for authored documents.
+
 ## v0.11.1
 
 ### Tests / examples
