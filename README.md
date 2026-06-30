@@ -7,7 +7,7 @@ and **templating** (L3), on top of a supply-chain layer for verified imports. Ev
 reduces to a single canonical value with a stable BLAKE3 content hash, so two documents that
 *mean* the same thing hash the same.
 
-> **Status:** v0.9.2 — an experimental, solo, spec-complete implementation with a
+> **Status:** v0.10.0 — an experimental, solo, spec-complete implementation with a
 > formatter and a language server. Not used in production yet. The ideas (below) are
 > the point; a hosted docs site and broad editor packaging are still to come.
 

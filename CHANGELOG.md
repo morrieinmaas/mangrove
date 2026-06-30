@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.10.0
+
+List composition and conditional resources — so a document that evaluates to a
+list of resources (e.g. a Kubernetes manifest set) can include items
+conditionally and splice in shared lists, without leaving the value model (no
+null, `unset` stays binding-level). Both new forms are first-class across the
+evaluation parser and the lossless CST, kept in agreement by the
+parse-equivalence + content-hash oracle.
+
+### Language
+- **List spread.** `[ 0, ...xs, 3 ]` splices the elements of a list-valued
+  expression into a list literal — the list analogue of map spread (`...alias`).
+  Resolved at evaluation, so `[ 0, ...[1, 2], 3 ]` is exactly `[ 0, 1, 2, 3 ]`
+  and hashes identically. Spreading a non-list is a clean error.
+- **Conditional list elements.** `[ namespace, alertSink if cfg.enabled ]`
+  includes an element when the condition is `true` and omits it when `false`.
+  Sugar for `...match cond { true: [item], false: [] }`; the item may be any
+  value (a whole resource record included). A non-bool condition is a clean
+  error, never a silent omission.
+- **`match` over `bool` is total without `_`.** A match whose arms cover both
+  `true` and `false` is now exhaustive for any scrutinee (previously a `_` arm
+  was required unless the scrutinee was a statically-bool-typed name). A
+  non-bool scrutinee still errors as uncovered.
+
+### Interop
+- **`import --skip-empty`.** Drops blank/`null` documents from a multi-document
+  YAML stream (e.g. `helm template` emits a blank document per disabled
+  resource) instead of rejecting the stream. The accepted flag works before or
+  after the path. This does not weaken the no-null axiom: an empty *document* in
+  a stream is "no document", not a null *value* — a null value inside a document
+  is still rejected.
+
 ## v0.9.2
 
 `gen-openapi` upgrades that let a whole multi-resource Kubernetes repo be
