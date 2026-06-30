@@ -14,7 +14,7 @@ pub enum Type {
     Bool,
     Bytes,
 
-    // refinements (§4.3) — interval bounds (inclusive) and regex
+    // refinements (§4.3) — interval bounds (inclusive), regex, and string-length
     IntRange {
         min: Option<BigInt>,
         max: Option<BigInt>,
@@ -23,7 +23,14 @@ pub enum Type {
         min: Option<BigDecimal>,
         max: Option<BigDecimal>,
     },
-    StrRegex(String),
+    /// String refinement: regex pattern and/or inclusive length bounds.
+    /// A bare `str` stays `Type::Str`; any `&`-refinement on a str produces/extends
+    /// a `StrRefine`. All three parts are optional and compose freely.
+    StrRefine {
+        regex: Option<String>,
+        min_len: Option<usize>,
+        max_len: Option<usize>,
+    },
 
     // literals (for unions / enums)
     LitStr(String),
@@ -168,7 +175,38 @@ mod tests {
 
     #[test]
     fn str_regex() {
-        assert_eq!(pt("str & =~ \"^a+$\""), Type::StrRegex("^a+$".into()));
+        assert_eq!(
+            pt("str & =~ \"^a+$\""),
+            Type::StrRefine {
+                regex: Some("^a+$".into()),
+                min_len: None,
+                max_len: None,
+            }
+        );
+    }
+
+    #[test]
+    fn str_len_only() {
+        assert_eq!(
+            pt("str & len >= 1 & len <= 5"),
+            Type::StrRefine {
+                regex: None,
+                min_len: Some(1),
+                max_len: Some(5),
+            }
+        );
+    }
+
+    #[test]
+    fn str_regex_and_len_composed() {
+        assert_eq!(
+            pt("str & =~ \"[a-z]+\" & len >= 1 & len <= 63"),
+            Type::StrRefine {
+                regex: Some("[a-z]+".into()),
+                min_len: Some(1),
+                max_len: Some(63),
+            }
+        );
     }
 
     #[test]

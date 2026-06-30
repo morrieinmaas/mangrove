@@ -1602,7 +1602,18 @@ impl Parser {
                     Tok::Str(re) => {
                         self.advance();
                         match ty {
-                            Type::Str => Ok(Type::StrRegex(re)),
+                            Type::Str => Ok(Type::StrRefine {
+                                regex: Some(re),
+                                min_len: None,
+                                max_len: None,
+                            }),
+                            Type::StrRefine {
+                                min_len, max_len, ..
+                            } => Ok(Type::StrRefine {
+                                regex: Some(re),
+                                min_len,
+                                max_len,
+                            }),
                             other => {
                                 Err(self.error(format!("=~ applies only to str, not {other:?}")))
                             }
@@ -1610,6 +1621,68 @@ impl Parser {
                     }
                     other => {
                         Err(self.error(format!("expected a string after =~, found {other:?}")))
+                    }
+                }
+            }
+            Tok::Bareword(ref kw) if kw == "len" => {
+                self.advance();
+                // `len` is a contextual keyword for string-length refinements.
+                // Syntax: `len >= N` or `len <= N` where N is a non-negative integer.
+                let op = match self.peek().tok.clone() {
+                    op @ (Tok::Ge | Tok::Le | Tok::Gt | Tok::Lt) => {
+                        self.advance();
+                        op
+                    }
+                    other => {
+                        return Err(
+                            self.error(format!("expected >= or <= after len, found {other:?}"))
+                        );
+                    }
+                };
+                if matches!(op, Tok::Gt | Tok::Lt) {
+                    return Err(
+                        self.error("strict < / > on len is unsupported; use >= / <=".into())
+                    );
+                }
+                let n = match self.peek().tok.clone() {
+                    Tok::Int(n) => {
+                        self.advance();
+                        n
+                    }
+                    other => {
+                        return Err(self.error(format!(
+                            "len bound must be a non-negative integer, found {other:?}"
+                        )));
+                    }
+                };
+                // Convert BigInt bound to usize.
+                let bound: usize = n
+                    .try_into()
+                    .map_err(|_| self.error("len bound must be a non-negative integer".into()))?;
+                match ty {
+                    Type::Str | Type::StrRefine { .. } => {
+                        let (regex, mut min_len, mut max_len) = match ty {
+                            Type::StrRefine {
+                                regex,
+                                min_len,
+                                max_len,
+                            } => (regex, min_len, max_len),
+                            _ => (None, None, None),
+                        };
+                        match op {
+                            Tok::Ge => min_len = Some(bound),
+                            Tok::Le => max_len = Some(bound),
+                            _ => unreachable!(),
+                        }
+                        Ok(Type::StrRefine {
+                            regex,
+                            min_len,
+                            max_len,
+                        })
+                    }
+                    other => {
+                        Err(self
+                            .error(format!("len refinement applies only to str, not {other:?}")))
                     }
                 }
             }

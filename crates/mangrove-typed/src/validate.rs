@@ -136,12 +136,48 @@ fn check(
             _ => vec![mismatch(path, value, ty)],
         },
 
-        Type::StrRegex(re) => match value {
-            Value::Str(s) => match Regex::new(re) {
-                Ok(r) if r.is_match(s) => vec![],
-                Ok(_) => vec![mismatch(path, value, ty).with_failed(format!("=~ {re:?}"))],
-                Err(_) => vec![mismatch(path, value, ty).with_failed("valid regex in schema")],
-            },
+        Type::StrRefine {
+            regex,
+            min_len,
+            max_len,
+        } => match value {
+            Value::Str(s) => {
+                // Check regex first (if present).
+                if let Some(re) = regex {
+                    match Regex::new(re) {
+                        Ok(r) if r.is_match(s) => {}
+                        Ok(_) => {
+                            return vec![
+                                mismatch(path, value, ty).with_failed(format!("=~ {re:?}")),
+                            ];
+                        }
+                        Err(_) => {
+                            return vec![
+                                mismatch(path, value, ty).with_failed("valid regex in schema"),
+                            ];
+                        }
+                    }
+                }
+                // Check length bounds (Unicode scalar count).
+                let char_count = s.chars().count();
+                if let Some(mn) = min_len {
+                    if char_count < *mn {
+                        return vec![
+                            mismatch(path, value, ty)
+                                .with_failed(format!("len >= {mn} (got {char_count})")),
+                        ];
+                    }
+                }
+                if let Some(mx) = max_len {
+                    if char_count > *mx {
+                        return vec![
+                            mismatch(path, value, ty)
+                                .with_failed(format!("len <= {mx} (got {char_count})")),
+                        ];
+                    }
+                }
+                vec![]
+            }
             _ => vec![mismatch(path, value, ty)],
         },
 
@@ -502,7 +538,23 @@ fn render_type(ty: &Type) -> String {
         Type::Bytes => "bytes".into(),
         Type::IntRange { min, max } => render_range("int", min, max),
         Type::DecRange { min, max } => render_range("decimal", min, max),
-        Type::StrRegex(re) => format!("str & =~ {re:?}"),
+        Type::StrRefine {
+            regex,
+            min_len,
+            max_len,
+        } => {
+            let mut s = "str".to_string();
+            if let Some(re) = regex {
+                s.push_str(&format!(" & =~ {re:?}"));
+            }
+            if let Some(mn) = min_len {
+                s.push_str(&format!(" & len >= {mn}"));
+            }
+            if let Some(mx) = max_len {
+                s.push_str(&format!(" & len <= {mx}"));
+            }
+            s
+        }
         Type::LitStr(s) => format!("{s:?}"),
         Type::LitInt(n) => n.to_string(),
         Type::LitBool(b) => b.to_string(),
@@ -1140,5 +1192,75 @@ mod tests {
         assert_eq!(e.len(), 1, "expected one error, got: {e:?}");
         assert_eq!(e[0].path, "spec.storage");
         assert_ne!(e[0].failed.as_deref(), Some("no matching variant"));
+    }
+
+    // --- string-length refinement tests ---
+
+    #[test]
+    fn str_len_bounds_ok_and_too_short_and_too_long() {
+        // Parsed through the real type parser.
+        assert!(errs(Value::Str("abc".into()), "str & len >= 1 & len <= 5").is_empty());
+        let e = errs(Value::Str(String::new()), "str & len >= 1 & len <= 5");
+        assert_eq!(e.len(), 1);
+        let failed = e[0].failed.as_deref().unwrap_or("");
+        assert!(
+            failed.contains("len >= 1"),
+            "expected len>=1 error, got: {failed:?}"
+        );
+        let e = errs(Value::Str("abcdef".into()), "str & len >= 1 & len <= 5");
+        assert_eq!(e.len(), 1);
+        let failed = e[0].failed.as_deref().unwrap_or("");
+        assert!(
+            failed.contains("len <= 5"),
+            "expected len<=5 error, got: {failed:?}"
+        );
+    }
+
+    #[test]
+    fn str_combined_regex_and_len() {
+        // "ab" ok; "abcd" too long; "AB" regex-mismatch (distinct errors)
+        let t = "str & =~ \"[a-z]+\" & len <= 3";
+        assert!(errs(Value::Str("ab".into()), t).is_empty());
+        let e = errs(Value::Str("abcd".into()), t);
+        assert_eq!(e.len(), 1);
+        assert!(e[0].failed.as_deref().unwrap_or("").contains("len <= 3"));
+        let e = errs(Value::Str("AB".into()), t);
+        assert_eq!(e.len(), 1);
+        // regex is checked first, so we get regex mismatch, NOT a length error
+        assert!(
+            e[0].failed.as_deref().unwrap_or("").contains("=~"),
+            "expected regex error for 'AB', got: {:?}",
+            e[0].failed
+        );
+    }
+
+    #[test]
+    fn str_len_counts_unicode_scalars() {
+        // "é" is one Unicode scalar value (U+00E9), so len 1.
+        assert!(errs(Value::Str("é".into()), "str & len >= 1 & len <= 1").is_empty());
+        // A 2-byte UTF-8 sequence still counts as 1 scalar, so len = 1 < min 2 fails.
+        let e = errs(Value::Str("é".into()), "str & len >= 2");
+        assert_eq!(e.len(), 1);
+    }
+
+    #[test]
+    fn str_len_non_str_value_mismatch() {
+        let e = errs(Value::Int(5.into()), "str & len >= 1");
+        assert_eq!(e.len(), 1);
+        // Should be a type-kind mismatch, not a len error
+        assert!(
+            e[0].failed.as_deref().unwrap_or("").is_empty()
+                || !e[0].failed.as_deref().unwrap_or("").contains("len"),
+        );
+    }
+
+    #[test]
+    fn str_regex_regression_unchanged() {
+        // Existing regex behavior must be unaffected.
+        assert!(errs(Value::Str("abc".into()), "str & =~ \"^[a-z]+$\"").is_empty());
+        assert_eq!(
+            errs(Value::Str("A".into()), "str & =~ \"^[a-z]+$\"").len(),
+            1
+        );
     }
 }

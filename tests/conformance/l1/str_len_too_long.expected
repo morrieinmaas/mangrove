@@ -1,0 +1,1 @@
+name | len <= 5 (got 6) | str & len >= 1 & len <= 5

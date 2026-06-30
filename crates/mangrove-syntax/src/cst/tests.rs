@@ -134,6 +134,14 @@ fn oracle_declarations() {
     assert_document_equivalent(
         "type Base = { a: int }\nschema Base & { b: str }\na: 1\nb: \"x\"\n",
     );
+    // str-len refinement (len >= N & len <= M)
+    assert_document_equivalent(
+        "type Label = str & len >= 1 & len <= 63\nschema Label\nx: \"hi\"\n",
+    );
+    // str-refine combined: regex + len
+    assert_document_equivalent(
+        "type Label = str & =~ \"[a-z]+\" & len >= 1 & len <= 63\nschema Label\nx: \"hi\"\n",
+    );
 }
 
 #[test]

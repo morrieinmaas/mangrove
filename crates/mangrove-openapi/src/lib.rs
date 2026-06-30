@@ -481,16 +481,29 @@ fn render(
                     return lits.join(" | ");
                 }
             }
-            if schema.get("minLength").is_some() || schema.get("maxLength").is_some() {
-                warnings.push(
-                    "string minLength/maxLength is not expressible as a Mangrove type \
-                     refinement; ignored"
-                        .into(),
-                );
-            }
-            match schema.get("pattern").and_then(J::as_str) {
-                Some(p) => format!("str & =~ {}", mstr(p)),
-                None => "str".to_string(),
+            let pattern = schema.get("pattern").and_then(J::as_str);
+            let min_len = schema
+                .get("minLength")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            let max_len = schema
+                .get("maxLength")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            if pattern.is_none() && min_len.is_none() && max_len.is_none() {
+                "str".to_string()
+            } else {
+                let mut s = "str".to_string();
+                if let Some(p) = pattern {
+                    s.push_str(&format!(" & =~ {}", mstr(p)));
+                }
+                if let Some(mn) = min_len {
+                    s.push_str(&format!(" & len >= {mn}"));
+                }
+                if let Some(mx) = max_len {
+                    s.push_str(&format!(" & len <= {mx}"));
+                }
+                s
             }
         }
         Some("integer") => format!("int{}", numeric_bounds(schema)),
@@ -669,14 +682,51 @@ mod tests {
     }
 
     #[test]
-    fn string_length_bounds_warn_and_are_ignored() {
-        // no type-level string-length refinement exists in Mangrove → warn, keep `str`.
+    fn string_length_bounds_map_to_str_refine() {
+        // maxLength maps to str & len <= N; no warning emitted.
         let spec = r##"{ "definitions": { "S": { "type": "object", "required": ["s"],
           "properties": { "s": { "type": "string", "maxLength": 63 } } } } }"##;
         let g = generate(spec, Some("S")).unwrap();
-        assert_eq!(g.warnings.len(), 1, "{:?}", g.warnings);
-        assert!(g.types.contains("s: str"), "{}", g.types);
-        assert!(!g.types.contains("&"), "{}", g.types);
+        assert!(
+            g.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            g.warnings
+        );
+        assert!(g.types.contains("s: str & len <= 63"), "{}", g.types);
+    }
+
+    #[test]
+    fn string_pattern_plus_min_max_length_folds_into_one_str_refine() {
+        // k8s RFC1123 label shape: pattern + maxLength → single StrRefine, no warning.
+        let spec = r##"{ "definitions": { "S": { "type": "object", "required": ["name"],
+          "properties": { "name": { "type": "string",
+            "pattern": "[a-z]+", "minLength": 1, "maxLength": 63 } } } } }"##;
+        let g = generate(spec, Some("S")).unwrap();
+        assert!(
+            g.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            g.warnings
+        );
+        assert!(
+            g.types
+                .contains(r#"name: str & =~ "[a-z]+" & len >= 1 & len <= 63"#),
+            "{}",
+            g.types
+        );
+    }
+
+    #[test]
+    fn string_min_length_only_emits_open_ended_on_max() {
+        let spec = r##"{ "definitions": { "S": { "type": "object", "required": ["s"],
+          "properties": { "s": { "type": "string", "minLength": 1 } } } } }"##;
+        let g = generate(spec, Some("S")).unwrap();
+        assert!(
+            g.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            g.warnings
+        );
+        assert!(g.types.contains("s: str & len >= 1"), "{}", g.types);
+        assert!(!g.types.contains("len <="), "{}", g.types);
     }
 
     #[test]

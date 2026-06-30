@@ -198,12 +198,23 @@ fn sub(new: &Type, old: &Type, env: &TypeEnv, depth: usize) -> Result<(), String
             Ok(())
         }
 
-        // strings & regex (containment deferred — identical only).
+        // strings & refinements (containment deferred — identical only).
         // (Str, Str) is handled by the exact-match arm above.
-        (Type::StrRegex(_), Type::Str) => Ok(()),
-        (Type::StrRegex(a), Type::StrRegex(b)) if a == b => Ok(()),
-        (_, Type::StrRegex(_)) => {
-            Err("regex subtype not supported (deferred); narrowing must be identical".into())
+        (Type::StrRefine { .. }, Type::Str) => Ok(()),
+        (
+            Type::StrRefine {
+                regex: ra,
+                min_len: mna,
+                max_len: mxa,
+            },
+            Type::StrRefine {
+                regex: rb,
+                min_len: mnb,
+                max_len: mxb,
+            },
+        ) if ra == rb && mna == mnb && mxa == mxb => Ok(()),
+        (_, Type::StrRefine { .. }) => {
+            Err("str-refine subtype not supported (deferred); narrowing must be identical".into())
         }
 
         // literals are subtypes of the primitive/range they satisfy
