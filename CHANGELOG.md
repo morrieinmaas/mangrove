@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.11.0
+
+### Typed
+- **String-length refinements.** `str & len >= 1 & len <= 63` constrains a
+  string's length (counted in Unicode code points). It folds with a regex into a
+  single refined type — `str & =~ "[a-z]+" & len >= 1 & len <= 63` — matching the
+  common Kubernetes shape (a `pattern` plus a `maxLength`). A negative or
+  non-integer bound is a parse error; too-short / too-long / regex-mismatch each
+  report a distinct, precise validation error.
+- **`gen-openapi` no longer drops `minLength`/`maxLength`.** A string schema's
+  `pattern`, `minLength`, and `maxLength` now generate one refined `str` type
+  (previously length was discarded with a warning).
+
+The internal `StrRegex` type was unified into a single `StrRefine { regex,
+min_len, max_len }`; the regex-only surface syntax and semantics are unchanged.
+
 ## v0.10.1
 
 Two refinements to the v0.10.0 work.

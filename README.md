@@ -7,7 +7,7 @@ and **templating** (L3), on top of a supply-chain layer for verified imports. Ev
 reduces to a single canonical value with a stable BLAKE3 content hash, so two documents that
 *mean* the same thing hash the same.
 
-> **Status:** v0.10.1 — an experimental, solo, spec-complete implementation with a
+> **Status:** v0.11.0 — an experimental, solo, spec-complete implementation with a
 > formatter and a language server. Not used in production yet. The ideas (below) are
 > the point; a hosted docs site and broad editor packaging are still to come.
 
@@ -54,7 +54,7 @@ See the [language specification](mangrove-spec.md) and the [design RFC](mangrove
 | Layer | What it adds |
 |-------|--------------|
 | **L0 — Data** | maps, lists, strings (incl. text blocks & raw), ints, decimals, bools, bytes |
-| **L1 — Typed** | `type`/`schema`, refinements (`int & >= 1 & <= N`), unions (incl. `kind`-discriminated, for precise per-variant errors), literals, units (`512Mi`), brands, `require`, annotations (`@key`, `@message`, `@deprecated`), defaults, **productive recursive types** (arbitrary-JSON / trees) |
+| **L1 — Typed** | `type`/`schema`, refinements (`int & >= 1 & <= N`, `str & =~ regex & len >= 1 & len <= 63`), unions (incl. `kind`-discriminated, for precise per-variant errors), literals, units (`512Mi`), brands, `require`, annotations (`@key`, `@message`, `@deprecated`), defaults, **productive recursive types** (arbitrary-JSON / trees) |
 | **L2 — Composed** | `use` + spread (`...alias`), deep merge, `unset`, `@key` list-ops, subtype redefinition (`schema Base & {…}`) |
 | **L3 — Templated** | `params`, references, string interpolation (`${v}`), `match`, schema `fn` constructors, module calls (`emit: webapp(...)`) |
 | **Supply chain** | resolver split (identity/location/auth), local + git backends, `mangrove.lock` hash-verify, per-package anchoring, cross-file type imports, per-type version pins |

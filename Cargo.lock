@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-canonical"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "blake3",
  "mangrove-cbor",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-cbor"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bigdecimal",
  "mangrove-core",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-cli"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "mangrove-canonical",
  "mangrove-compose",
@@ -283,7 +283,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-compose"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "mangrove-core",
  "mangrove-resolve",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-conformance"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "mangrove-canonical",
  "mangrove-syntax",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-convert"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bigdecimal",
  "mangrove-canonical",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-core"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bigdecimal",
  "num-bigint",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-fmt"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "mangrove-canonical",
  "mangrove-core",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-lsp"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "lsp-server",
  "lsp-types",
@@ -346,14 +346,14 @@ dependencies = [
 
 [[package]]
 name = "mangrove-openapi"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "mangrove-resolve"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "blake3",
  "toml",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-syntax"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bigdecimal",
  "mangrove-canonical",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "mangrove-typed"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bigdecimal",
  "mangrove-core",
