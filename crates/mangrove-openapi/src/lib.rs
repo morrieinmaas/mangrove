@@ -846,4 +846,72 @@ mod tests {
         .unwrap();
         assert!(g.types.contains("type A = { x: str }"), "{}", g.types);
     }
+
+    // --- --k8s injection tests ---
+
+    const PLAN_SPEC: &str = r#"{
+        "type": "object",
+        "properties": {
+            "spec": { "type": "object", "additionalProperties": true },
+            "status": { "type": "object", "additionalProperties": true }
+        }
+    }"#;
+
+    #[test]
+    fn k8s_injects_apiversion_kind_metadata_when_absent() {
+        let g = generate_many(&[GenInput {
+            spec_json: PLAN_SPEC,
+            root: Some("Plan"),
+            k8s: true,
+        }])
+        .unwrap();
+        assert!(g.types.contains("type Plan ="), "{}", g.types);
+        assert!(g.types.contains("apiVersion?:"), "{}", g.types);
+        assert!(g.types.contains("kind?:"), "{}", g.types);
+        assert!(g.types.contains("\"Plan\""), "{}", g.types);
+        assert!(g.types.contains("metadata?:"), "{}", g.types);
+    }
+
+    #[test]
+    fn k8s_false_does_not_inject() {
+        let g = generate_many(&[GenInput {
+            spec_json: PLAN_SPEC,
+            root: Some("Plan"),
+            k8s: false,
+        }])
+        .unwrap();
+        assert!(g.types.contains("type Plan ="), "{}", g.types);
+        assert!(!g.types.contains("apiVersion"), "{}", g.types);
+        assert!(!g.types.contains("kind"), "{}", g.types);
+        assert!(!g.types.contains("metadata"), "{}", g.types);
+    }
+
+    #[test]
+    fn k8s_does_not_clobber_existing_kind() {
+        // A schema that already declares `kind` with a different enum value must keep it.
+        let pvc_spec = r#"{
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "enum": ["PersistentVolumeClaim"] },
+                "spec": { "type": "object", "additionalProperties": true }
+            }
+        }"#;
+        let g = generate_many(&[GenInput {
+            spec_json: pvc_spec,
+            root: Some("PVC"),
+            k8s: true,
+        }])
+        .unwrap();
+        // The existing kind enum value must be preserved, not replaced with "PVC".
+        assert!(
+            g.types.contains("\"PersistentVolumeClaim\""),
+            "kind must keep PersistentVolumeClaim, got:\n{}",
+            g.types
+        );
+        assert!(
+            !g.types.contains("\"PVC\""),
+            "kind must not be clobbered to PVC, got:\n{}",
+            g.types
+        );
+    }
 }
