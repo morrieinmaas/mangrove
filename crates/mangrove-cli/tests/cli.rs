@@ -20,6 +20,72 @@ fn hashf(p: &std::path::Path) -> String {
     String::from_utf8(o.stdout).unwrap()
 }
 
+/// Write `contents` to a uniquely-named temp file and return its content hash
+/// (asserts success). Exercises the full compose→eval→hash pipeline from source.
+fn hash_src(tag: &str, contents: &str) -> String {
+    let p = std::env::temp_dir().join(format!("cli_{tag}_{}.mang", std::process::id()));
+    std::fs::write(&p, contents).unwrap();
+    hashf(&p)
+}
+
+// ---- v0.10.0: conditional list elements `item if cond` (source-level; these go
+// through the real parser+eval, unlike synthetic Value-construction unit tests,
+// so they catch a non-exhaustive-match regression on a Ref scrutinee — the bug a
+// synthetic test missed). ----
+
+#[test]
+fn conditional_element_included_when_true_omitted_when_false() {
+    // Both sides carry the same `on:` binding so only the conditional element differs.
+    assert_eq!(
+        hash_src("cond_on", "on: true\nout: [ \"a\", \"b\" if on ]\n"),
+        hash_src("cond_on_lit", "on: true\nout: [ \"a\", \"b\" ]\n"),
+    );
+    assert_eq!(
+        hash_src("cond_off", "on: false\nout: [ \"a\", \"b\" if on ]\n"),
+        hash_src("cond_off_lit", "on: false\nout: [ \"a\" ]\n"),
+    );
+}
+
+#[test]
+fn conditional_element_works_for_inline_record() {
+    // The k8s shape: a whole resource record gated by a condition.
+    assert_eq!(
+        hash_src("cond_rec", "on: true\nout: [ { k: 1 }, { k: 2 } if on ]\n"),
+        hash_src("cond_rec_lit", "on: true\nout: [ { k: 1 }, { k: 2 } ]\n"),
+    );
+}
+
+#[test]
+fn match_over_bool_is_exhaustive_without_wildcard() {
+    // `match name { true: …, false: … }` on an untyped sibling binding (a Ref
+    // scrutinee with no static type) must be accepted as total — no `_` required.
+    assert_eq!(
+        hash_src("m_bool", "on: true\nout: match on { true: 1, false: 2 }\n"),
+        hash_src("m_bool_lit", "on: true\nout: 1\n"),
+    );
+}
+
+#[test]
+fn conditional_element_non_bool_condition_is_a_clean_error() {
+    // A non-bool condition matches neither arm → clean error, never silent omit.
+    let p = std::env::temp_dir().join(format!("cli_cond_nb_{}.mang", std::process::id()));
+    std::fs::write(&p, "out: [ \"a\", \"b\" if 5 ]\n").unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_mangrove"))
+        .arg("hash")
+        .arg(&p)
+        .output()
+        .unwrap();
+    assert!(
+        !o.status.success(),
+        "non-bool condition must fail, not omit"
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("match scrutinee"),
+        "expected a match-not-covered error, got: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}
+
 #[test]
 fn nested_module_call_resolves() {
     // B1 regression: a module that calls a helper module must compose.

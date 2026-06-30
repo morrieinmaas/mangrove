@@ -350,6 +350,18 @@ fn check_match_exhaustive(
     if arms.iter().any(|(p, _)| p.is_none()) {
         return Ok(()); // has a `_` wildcard
     }
+    // Arms covering both bool literals are total over the bool domain — regardless
+    // of whether the scrutinee's type is statically known (an untyped sibling
+    // binding, a field, or a param all work). A non-bool scrutinee then matches no
+    // arm and yields a clean "scrutinee not covered" error at eval, never a silent
+    // fall-through. This is what makes `x if cond` (→ match cond {true:…,false:…})
+    // total for any boolean condition.
+    let pats: Vec<&Value> = arms.iter().filter_map(|(p, _)| p.as_ref()).collect();
+    if pats.iter().any(|p| **p == Value::Bool(true))
+        && pats.iter().any(|p| **p == Value::Bool(false))
+    {
+        return Ok(());
+    }
     if let Value::Ref(name) = scrutinee
         && let Some(ty) = cx.ptypes.get(name)
         && let Some(members) = literal_union_members(ty, cx.types)
