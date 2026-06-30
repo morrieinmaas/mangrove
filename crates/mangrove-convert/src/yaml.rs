@@ -46,6 +46,9 @@ pub fn import_opts(s: &str, skip_empty: bool) -> Result<Value, String> {
     let mut docs = YamlLoader::load_from_str(s).map_err(|e| format!("YAML parse error: {e}"))?;
     if skip_empty {
         docs.retain(|d| !matches!(d, Yaml::Null));
+        if docs.is_empty() {
+            return Ok(Value::List(vec![]));
+        }
     }
     match docs.as_slice() {
         [] => Err("empty YAML document".into()),
@@ -337,6 +340,27 @@ metadata:
     fn import_skip_empty_does_not_allow_null_values_inside_a_doc() {
         // skip_empty drops empty *documents*, never a null *value* inside one.
         assert!(import_opts("kind: PVC\n---\nx: null\n", true).is_err());
+    }
+
+    #[test]
+    fn import_skip_empty_all_empty_stream_yields_empty_list() {
+        // When skip_empty is set and every document in the stream is empty/null,
+        // the result is Value::List([]) rather than an error (helm template edge
+        // case where all resources are disabled).
+        assert_eq!(import_opts("", true).unwrap(), Value::List(vec![]));
+        // All-blank multi-doc stream (only `---` separators and blank docs)
+        assert_eq!(
+            import_opts("---\n\n---\n\n", true).unwrap(),
+            Value::List(vec![])
+        );
+        // Single null doc
+        assert_eq!(import_opts("~\n", true).unwrap(), Value::List(vec![]));
+    }
+
+    #[test]
+    fn import_empty_without_skip_still_errors() {
+        // The no-flag path is unchanged: empty input still errors.
+        assert!(import("").is_err());
     }
 
     // ── export_stream ──────────────────────────────────────────────────────────
