@@ -34,10 +34,16 @@ fn main() -> ExitCode {
             Some(path) => cmd_update(path),
             None => usage(),
         },
-        Some("import") => match args.get(2) {
-            Some(path) => cmd_import(path),
-            None => usage(),
-        },
+        Some("import") => {
+            // `import [--skip-empty] <file>` — `--skip-empty` drops blank/null
+            // documents from a multi-doc stream (e.g. `helm template` output).
+            let skip_empty = args.get(2).map(String::as_str) == Some("--skip-empty");
+            let path = if skip_empty { args.get(3) } else { args.get(2) };
+            match path {
+                Some(p) => cmd_import(p, skip_empty),
+                None => usage(),
+            }
+        }
         Some("export") => match args.get(2) {
             // `export <file> [--to <fmt>]`
             Some(path) => {
@@ -72,7 +78,7 @@ fn cmd_lsp() -> ExitCode {
 fn usage() -> ExitCode {
     eprintln!(
         "usage: mangrove [--version | hash <file> | check <file> | update <file> \
-         | import <file.yaml|.toml> | export <file.mang> [--to yaml|yaml-stream|toml] \
+         | import [--skip-empty] <file.yaml|.toml> | export <file.mang> [--to yaml|yaml-stream|toml] \
          | gen-openapi [--k8s] <spec>... [--root <Def>]... \
          | fmt <file…> | fmt --check <file…> | fmt - | lsp]"
     );
@@ -259,7 +265,7 @@ fn cmd_hash(path: &str) -> ExitCode {
 
 /// `mangrove import <file.yaml|.toml>` — parse a YAML/TOML file into plain data and
 /// print it as a schemaless Mangrove document (D42). Format is chosen by extension.
-fn cmd_import(path: &str) -> ExitCode {
+fn cmd_import(path: &str, skip_empty: bool) -> ExitCode {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -268,7 +274,7 @@ fn cmd_import(path: &str) -> ExitCode {
         }
     };
     let value = match format_of(path) {
-        Some(Format::Yaml) => mangrove_convert::yaml::import(&text),
+        Some(Format::Yaml) => mangrove_convert::yaml::import_opts(&text, skip_empty),
         Some(Format::Toml) => mangrove_convert::toml::import(&text),
         None => Err(format!(
             "{path}: unknown format (expected .yaml/.yml/.toml)"

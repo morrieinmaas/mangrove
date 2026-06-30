@@ -31,7 +31,22 @@ const MAX_DEPTH: usize = 128;
 /// assert!(matches!(multi, mangrove_core::Value::List(_)));
 /// ```
 pub fn import(s: &str) -> Result<Value, String> {
-    let docs = YamlLoader::load_from_str(s).map_err(|e| format!("YAML parse error: {e}"))?;
+    import_opts(s, false)
+}
+
+/// Like [`import`], but when `skip_empty` is set, empty/null documents in a
+/// multi-document stream are dropped instead of rejected. A `helm template`
+/// stream emits a blank document for every disabled resource; this lets such a
+/// stream import cleanly. The surviving documents follow the same single-value
+/// vs. list shape as [`import`] (one survivor → that value; several → a list).
+/// This does not weaken the no-null axiom: an empty *document* in a stream is
+/// "no document", not a null *value* — a `null` appearing as an actual value
+/// inside a document is still rejected.
+pub fn import_opts(s: &str, skip_empty: bool) -> Result<Value, String> {
+    let mut docs = YamlLoader::load_from_str(s).map_err(|e| format!("YAML parse error: {e}"))?;
+    if skip_empty {
+        docs.retain(|d| !matches!(d, Yaml::Null));
+    }
     match docs.as_slice() {
         [] => Err("empty YAML document".into()),
         [one] => yaml_to_value(one, "", 0),
@@ -297,6 +312,31 @@ metadata:
         // Null within any document in the stream is still rejected.
         let yaml = "kind: PVC\n---\nx: null\n";
         assert!(import(yaml).is_err());
+    }
+
+    #[test]
+    fn import_skip_empty_drops_blank_stream_docs() {
+        // A blank document between separators (helm renders disabled resources to
+        // empty docs) is rejected by default but dropped with skip_empty.
+        let yaml = "kind: A\n---\n\n---\nkind: B\n";
+        assert!(import(yaml).is_err(), "blank doc rejected by default");
+        match import_opts(yaml, true).unwrap() {
+            Value::List(xs) => assert_eq!(xs.len(), 2, "two real docs survive"),
+            other => panic!("expected a 2-element list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn import_skip_empty_collapses_to_single_survivor() {
+        // After dropping blanks, a lone survivor follows the single-value shape.
+        let v = import_opts("kind: Only\n---\n\n", true).unwrap();
+        assert!(matches!(v, Value::Map(_)), "expected Map, got {v:?}");
+    }
+
+    #[test]
+    fn import_skip_empty_does_not_allow_null_values_inside_a_doc() {
+        // skip_empty drops empty *documents*, never a null *value* inside one.
+        assert!(import_opts("kind: PVC\n---\nx: null\n", true).is_err());
     }
 
     // ── export_stream ──────────────────────────────────────────────────────────
