@@ -868,3 +868,26 @@ fn cond_elem_cst_node_kind() {
         "expected a COND_ELEM child inside a LIST for `2 if flag`"
     );
 }
+
+// ---- CST/legacy parity: cross-newline and missing-separator list input ----
+
+/// Regression: the CST previously accepted `[ 1 2 ]` (elements with no separator)
+/// while the legacy parser rejected it. Both frontends must now agree (both error).
+#[test]
+fn cst_missing_separator_in_list_matches_legacy() {
+    // No separator between two adjacent elements — legacy errors, CST must also error.
+    assert_document_equivalent("xs: [ 1 2 ]\n");
+    assert_document_equivalent("xs: [ \"a\" \"b\" ]\n");
+}
+
+/// Regression: in `[ "x"\n if on ]` the legacy parser errors ("expected ',' or
+/// newline in list" — because after `skip_seps` consumes the newline, `if` and `on`
+/// become two adjacent bare elements with no separator).  The CST used to silently
+/// produce `List([Str("x"), Ref("if"), Ref("on")])`.  Both frontends now agree (both
+/// error).
+#[test]
+fn cst_cross_newline_if_without_separator_matches_legacy() {
+    // The `if` on the next line is a bareword element; `on` follows with no separator.
+    assert_document_equivalent("xs: [ \"x\"\n if on ]\n");
+    assert_document_equivalent("on: true\nout: [ \"a\"\nif on ]\n");
+}

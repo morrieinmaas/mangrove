@@ -567,7 +567,22 @@ fn parse_list(p: &mut Parser, depth: usize) {
                     parse_atom(p, true, depth); // the cond
                     p.finish(); // COND_ELEM
                 }
-                // else: plain element already parsed, nothing more to do
+                // Enforce separator: the legacy parser errors when two list
+                // elements appear without a comma or newline between them
+                // (e.g. `[ 1 2 ]` or `[ "x" if on ]` where `if` and `on`
+                // end up as adjacent bare elements). `p.current()` skips only
+                // WHITESPACE/COMMENT (not NEWLINE), so a bare-value token here
+                // means no separator was present. Emit an error node; the loop
+                // will resync via the COMMA/NEWLINE/R_BRACKET arms.
+                if !matches!(
+                    p.current(),
+                    SyntaxKind::COMMA
+                        | SyntaxKind::NEWLINE
+                        | SyntaxKind::R_BRACKET
+                        | SyntaxKind::EOF
+                ) {
+                    p.error_and_recover("expected ',' or newline in list", true);
+                }
             }
         }
     }
