@@ -8,7 +8,7 @@
 //!   `mangrove export <file> --to yaml`          — evaluate a document and emit YAML (default)
 //!   `mangrove export <file> --to yaml-stream`   — emit a Value::List as a YAML multi-doc stream
 //!   `mangrove export <file> --to toml`          — evaluate a document and emit TOML
-//!   `mangrove gen-openapi <spec>`               — generate Mangrove types from an OpenAPI spec
+//!   `mangrove gen-openapi [--k8s] <spec>…`      — generate Mangrove types from OpenAPI spec(s)
 //!   `mangrove fmt <file>…`                      — format documents (--check to gate; - for stdin)
 //!   `mangrove lsp`                              — run the language server over stdio (editors)
 
@@ -50,20 +50,7 @@ fn main() -> ExitCode {
             }
             None => usage(),
         },
-        Some("gen-openapi") => match args.get(2) {
-            // `gen-openapi <spec.json> [--root <Definition>]`
-            Some(path) => {
-                if args.get(3).map(String::as_str) == Some("--root") {
-                    match args.get(4) {
-                        Some(root) => cmd_gen_openapi(path, Some(root)),
-                        None => usage(), // bare `--root` with no value
-                    }
-                } else {
-                    cmd_gen_openapi(path, None)
-                }
-            }
-            None => usage(),
-        },
+        Some("gen-openapi") => cmd_gen_openapi_multi(&args[2..]),
         Some("fmt") => cmd_fmt(&args[2..]),
         Some("lsp") => cmd_lsp(),
         _ => usage(),
@@ -86,23 +73,89 @@ fn usage() -> ExitCode {
     eprintln!(
         "usage: mangrove [--version | hash <file> | check <file> | update <file> \
          | import <file.yaml|.toml> | export <file.mang> [--to yaml|yaml-stream|toml] \
-         | gen-openapi <spec.json> [--root <Definition>] \
+         | gen-openapi [--k8s] <spec>... [--root <Def>]... \
          | fmt <file…> | fmt --check <file…> | fmt - | lsp]"
     );
     ExitCode::from(2)
 }
 
-/// `mangrove gen-openapi <spec.json> [--root <Def>]` — emit Mangrove `type`s for
-/// an OpenAPI spec (e.g. the Kubernetes API). Warnings go to stderr, types to stdout.
-fn cmd_gen_openapi(path: &str, root: Option<&str>) -> ExitCode {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("{path}: {e}");
-            return ExitCode::from(1);
+/// `mangrove gen-openapi [--k8s] <spec>... [--root <Def>]...`
+///
+/// Parses args: `--k8s` (global flag), positional spec paths, repeatable `--root` values.
+/// Single file: root is optional (back-compat). Multiple files: roots must match files 1:1.
+fn cmd_gen_openapi_multi(args: &[String]) -> ExitCode {
+    let mut k8s = false;
+    let mut files: Vec<&str> = Vec::new();
+    let mut roots: Vec<&str> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--k8s" => k8s = true,
+            "--root" => {
+                i += 1;
+                match args.get(i) {
+                    Some(r) => roots.push(r.as_str()),
+                    None => {
+                        eprintln!("gen-openapi: --root requires a value");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            arg if arg.starts_with("--") => {
+                eprintln!("gen-openapi: unknown flag `{arg}`");
+                return ExitCode::from(2);
+            }
+            path => files.push(path),
         }
-    };
-    match mangrove_openapi::generate(&text, root) {
+        i += 1;
+    }
+
+    if files.is_empty() {
+        return usage();
+    }
+
+    if files.len() > 1 && roots.len() != files.len() {
+        eprintln!(
+            "gen-openapi: {} spec(s) but {} --root(s); with multiple specs, \
+             provide exactly one --root per spec (positionally matched)",
+            files.len(),
+            roots.len()
+        );
+        return ExitCode::from(2);
+    }
+
+    // Read all files.
+    let mut texts: Vec<String> = Vec::new();
+    for path in &files {
+        match std::fs::read_to_string(path) {
+            Ok(t) => texts.push(t),
+            Err(e) => {
+                eprintln!("{path}: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // Build GenInput list.
+    let inputs: Vec<mangrove_openapi::GenInput> = files
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| {
+            let root = if files.len() == 1 {
+                roots.first().copied()
+            } else {
+                Some(roots[idx])
+            };
+            mangrove_openapi::GenInput {
+                spec_json: texts[idx].as_str(),
+                root,
+                k8s,
+            }
+        })
+        .collect();
+
+    match mangrove_openapi::generate_many(&inputs) {
         Ok(g) => {
             for w in &g.warnings {
                 eprintln!("warning: {w}");
@@ -111,7 +164,7 @@ fn cmd_gen_openapi(path: &str, root: Option<&str>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("{path}: {e}");
+            eprintln!("{e}");
             ExitCode::from(1)
         }
     }

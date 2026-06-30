@@ -24,6 +24,15 @@ pub struct Generated {
     pub warnings: Vec<String>,
 }
 
+/// One schema input for [`generate_many`].
+pub struct GenInput<'a> {
+    pub spec_json: &'a str,
+    pub root: Option<&'a str>,
+    /// When true, inject `apiVersion`/`kind`/`metadata` into the root object
+    /// schema before generation (see [`generate_many`] docs).
+    pub k8s: bool,
+}
+
 /// Generate Mangrove types for every definition reachable from `root`
 /// (or all definitions if `root` is `None`).
 ///
@@ -45,51 +54,102 @@ pub struct Generated {
 /// assert!(g.types.contains("type Port = { n: int }"));
 /// ```
 pub fn generate(spec_json: &str, root: Option<&str>) -> Result<Generated, String> {
-    let spec: J = serde_json::from_str(spec_json).map_err(|e| format!("invalid JSON: {e}"))?;
+    generate_many(&[GenInput {
+        spec_json,
+        root,
+        k8s: false,
+    }])
+}
 
-    // Synthesize a one-entry definition map when the spec is a bare JSON Schema
-    // (has top-level "properties" or "type" but no OpenAPI envelope).
-    let bare_holder: Map<String, J>;
-    let defs: &Map<String, J> = match definitions(&spec) {
-        Some(d) => d,
-        None => {
-            let is_bare_schema = spec.get("properties").and_then(J::as_object).is_some()
-                || spec.get("type").is_some();
-            if is_bare_schema {
-                let name = root.ok_or(
-                    "a bare JSON Schema (no definitions/components.schemas) requires \
-                     --root <Name> to name the generated type",
-                )?;
-                let mut m = Map::new();
-                m.insert(name.to_string(), spec.clone());
-                bare_holder = m;
-                &bare_holder
-            } else {
-                return Err(
-                    "spec has no `definitions` (OpenAPI v2) or `components.schemas` (v3)"
-                        .to_string(),
-                );
+/// Combine multiple schemas/roots in a single run, emitting `type Json` at most once.
+///
+/// Each [`GenInput`] is parsed independently; all selected definitions are merged
+/// into a single namespace using the same collision-resolution as a single-run.
+/// The `type Json` preamble is emitted at most once, only if any input needs it.
+///
+/// When `files.len() > 1`, each file is expected to be a bare schema with a
+/// `root` name. When a single file is provided, `root` is optional (back-compat).
+///
+/// When `k8s` is true on an input, the root object schema has `apiVersion`,
+/// `kind`, and `metadata` injected (only if absent) before generation.
+pub fn generate_many(inputs: &[GenInput]) -> Result<Generated, String> {
+    // Merged definition namespace across all inputs.
+    let mut merged_defs: BTreeMap<String, J> = BTreeMap::new();
+    // The set of root names to emit (from each input's root selection).
+    let mut all_selected: BTreeSet<String> = BTreeSet::new();
+    let mut all_warnings: Vec<String> = Vec::new();
+
+    for input in inputs {
+        let mut spec: J =
+            serde_json::from_str(input.spec_json).map_err(|e| format!("invalid JSON: {e}"))?;
+
+        // Synthesize a one-entry definition map when the spec is a bare JSON Schema.
+        let defs: BTreeMap<String, J> = match definitions(&spec) {
+            Some(d) => d.clone().into_iter().collect(),
+            None => {
+                let is_bare_schema = spec.get("properties").and_then(J::as_object).is_some()
+                    || spec.get("type").is_some();
+                if is_bare_schema {
+                    let name = input.root.ok_or(
+                        "a bare JSON Schema (no definitions/components.schemas) requires \
+                         --root <Name> to name the generated type",
+                    )?;
+                    // Apply k8s injection to the bare schema before inserting.
+                    if input.k8s {
+                        inject_k8s_fields(&mut spec, name);
+                    }
+                    let mut m = BTreeMap::new();
+                    m.insert(name.to_string(), spec.clone());
+                    m
+                } else {
+                    return Err(
+                        "spec has no `definitions` (OpenAPI v2) or `components.schemas` (v3)"
+                            .to_string(),
+                    );
+                }
+            }
+        };
+
+        // Determine which names to select from this input.
+        let names: Vec<String> = match input.root {
+            Some(r) => {
+                if !defs.contains_key(r) {
+                    return Err(format!("root definition `{r}` not found in the spec"));
+                }
+                reachable_in_map(r, &defs)
+            }
+            None => defs.keys().cloned().collect(),
+        };
+
+        // Merge definitions into the global namespace (first insertion wins for
+        // collision avoidance — sanitize-based collision resolution handles the rest).
+        for (name, schema) in defs {
+            merged_defs.entry(name).or_insert(schema);
+        }
+
+        // For OpenAPI-envelope specs with k8s, inject envelope fields into the
+        // merged root entry. (Bare-schema injection was already applied above.)
+        if input.k8s {
+            if let Some(root_name) = input.root {
+                if let Some(root_schema) = merged_defs.get_mut(root_name) {
+                    inject_k8s_fields(root_schema, root_name);
+                }
             }
         }
-    };
 
-    let names: Vec<String> = match root {
-        Some(r) => {
-            if !defs.contains_key(r) {
-                return Err(format!("root definition `{r}` not found in the spec"));
-            }
-            reachable(r, defs)
+        for name in names {
+            all_selected.insert(name);
         }
-        None => defs.keys().cloned().collect(),
-    };
-    let selected: BTreeSet<&str> = names.iter().map(String::as_str).collect();
-    let in_cycle = cycle_defs(&selected, defs);
+    }
 
-    let mut warnings = Vec::new();
+    // Now run the standard generation pipeline over merged_defs + all_selected.
+    let selected_refs: BTreeSet<&str> = all_selected.iter().map(String::as_str).collect();
+    let in_cycle = cycle_defs(&selected_refs, &merged_defs);
+
     if !in_cycle.is_empty() {
         let mut ns: Vec<&str> = in_cycle.iter().copied().collect();
         ns.sort();
-        warnings.push(format!(
+        all_warnings.push(format!(
             "{} non-productively-recursive definition(s) (recursion not guarded by a \
              record/list/map, so not representable); modeled as `Json`: {}",
             in_cycle.len(),
@@ -97,19 +157,14 @@ pub fn generate(spec_json: &str, root: Option<&str>) -> Result<Generated, String
         ));
     }
 
-    // Only definitions actually present in the spec are emitted; a dangling
-    // `$ref` resolves to no emitted type (→ opaque), never an index panic.
-    let mut present: Vec<&str> = selected
+    let mut present: Vec<&str> = selected_refs
         .iter()
         .copied()
-        .filter(|n| defs.contains_key(*n))
+        .filter(|n| merged_defs.contains_key(*n))
         .collect();
     present.sort();
 
-    // Assign a unique, collision-resolved Mangrove name to each emitted def, so
-    // two definitions that sanitize to the same identifier don't both emit
-    // `type X = …` (which `TypeEnv` would reject as a duplicate). `$ref`s resolve
-    // through this same map, so references stay consistent.
+    // Assign unique, collision-resolved Mangrove names.
     let mut type_names: BTreeMap<String, String> = BTreeMap::new();
     let mut used: BTreeSet<String> = ["Json".to_string()].into_iter().collect();
     for orig in &present {
@@ -128,25 +183,50 @@ pub fn generate(spec_json: &str, root: Option<&str>) -> Result<Generated, String
     let mut body = String::new();
     for orig in &present {
         let ty = render(
-            &defs[*orig],
-            defs,
+            &merged_defs[*orig],
+            &merged_defs,
             &in_cycle,
             &type_names,
             &mut used_opaque,
-            &mut warnings,
+            &mut all_warnings,
         );
         body.push_str(&format!("type {} = {}\n", type_names[*orig], ty));
     }
 
     let mut types = String::new();
     if used_opaque {
-        // Arbitrary JSON, as a productive recursive type (M8). No `null` member —
-        // Mangrove has no null (§2.4), so a free-form value containing JSON null
-        // is rejected, consistent with the language.
         types.push_str("type Json = str | int | decimal | bool | [ Json ] | { [str]: Json }\n");
     }
     types.push_str(&body);
-    Ok(Generated { types, warnings })
+    Ok(Generated {
+        types,
+        warnings: all_warnings,
+    })
+}
+
+/// Inject `apiVersion`, `kind`, and `metadata` into a schema's `properties`
+/// if they are not already present.
+fn inject_k8s_fields(schema: &mut J, root_name: &str) {
+    if let Some(props) = schema.get_mut("properties").and_then(J::as_object_mut) {
+        if !props.contains_key("apiVersion") {
+            props.insert(
+                "apiVersion".to_string(),
+                serde_json::json!({ "type": "string" }),
+            );
+        }
+        if !props.contains_key("kind") {
+            props.insert(
+                "kind".to_string(),
+                serde_json::json!({ "type": "string", "enum": [root_name] }),
+            );
+        }
+        if !props.contains_key("metadata") {
+            props.insert(
+                "metadata".to_string(),
+                serde_json::json!({ "type": "object", "additionalProperties": true }),
+            );
+        }
+    }
 }
 
 /// The definition map, supporting both OpenAPI v2 and v3.
@@ -183,8 +263,8 @@ fn collect_refs(schema: &J, out: &mut Vec<String>) {
     }
 }
 
-/// Every definition reachable from `root` (inclusive), via `$ref`.
-fn reachable(root: &str, defs: &Map<String, J>) -> Vec<String> {
+/// Like `reachable` but operates over a [`BTreeMap`] instead of a [`Map`].
+fn reachable_in_map(root: &str, defs: &BTreeMap<String, J>) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut queue = VecDeque::new();
     queue.push_back(root.to_string());
@@ -228,7 +308,7 @@ fn collect_unguarded_refs(schema: &J, out: &mut Vec<String>) {
 /// The subset of `selected` definitions in a *non-productive* `$ref` cycle (one
 /// reachable without crossing a record/list/map). Productive recursion is
 /// representable in Mangrove (M8) and emitted faithfully; only these break.
-fn cycle_defs<'a>(selected: &BTreeSet<&'a str>, defs: &Map<String, J>) -> BTreeSet<&'a str> {
+fn cycle_defs<'a>(selected: &BTreeSet<&'a str>, defs: &BTreeMap<String, J>) -> BTreeSet<&'a str> {
     let mut out = BTreeSet::new();
     for &name in selected {
         // A node is non-productively recursive iff it reaches itself via unguarded refs.
@@ -307,7 +387,7 @@ fn field_key(name: &str) -> String {
 
 fn render(
     schema: &J,
-    defs: &Map<String, J>,
+    defs: &BTreeMap<String, J>,
     in_cycle: &BTreeSet<&str>,
     type_names: &BTreeMap<String, String>,
     used_opaque: &mut bool,
@@ -436,7 +516,7 @@ fn numeric_bounds(schema: &J) -> String {
 
 fn render_record(
     schema: &J,
-    defs: &Map<String, J>,
+    defs: &BTreeMap<String, J>,
     in_cycle: &BTreeSet<&str>,
     type_names: &BTreeMap<String, String>,
     used_opaque: &mut bool,
@@ -713,5 +793,57 @@ mod tests {
         let g = generate(SPEC, Some("Container")).unwrap();
         assert!(g.types.contains("type Container ="), "{}", g.types);
         assert!(g.types.contains("type Probe ="), "{}", g.types);
+    }
+
+    // --- generate_many tests ---
+
+    #[test]
+    fn generate_many_two_bare_schemas_single_json_preamble() {
+        let spec_a = r#"{ "type": "object", "required": ["n"],
+            "properties": { "n": { "type": "integer" } } }"#;
+        // spec_b uses additionalProperties to trigger Json emission
+        let spec_b = r#"{ "type": "object",
+            "properties": { "s": { "type": "string" }, "extra": { "type": "object", "additionalProperties": true } } }"#;
+        let inputs = vec![
+            GenInput {
+                spec_json: spec_a,
+                root: Some("A"),
+                k8s: false,
+            },
+            GenInput {
+                spec_json: spec_b,
+                root: Some("B"),
+                k8s: false,
+            },
+        ];
+        let g = generate_many(&inputs).unwrap();
+        // Exactly one `type Json` line
+        assert_eq!(
+            g.types
+                .lines()
+                .filter(
+                    |l| *l == "type Json = str | int | decimal | bool | [ Json ] | { [str]: Json }"
+                )
+                .count(),
+            1,
+            "expected exactly one type Json line:\n{}",
+            g.types
+        );
+        assert!(g.types.contains("type A ="), "{}", g.types);
+        assert!(g.types.contains("type B ="), "{}", g.types);
+    }
+
+    #[test]
+    fn generate_many_single_input_regression() {
+        // REGRESSION: generate_many with a single input behaves like generate.
+        let spec = r#"{ "type": "object", "required": ["x"],
+            "properties": { "x": { "type": "string" } } }"#;
+        let g = generate_many(&[GenInput {
+            spec_json: spec,
+            root: Some("A"),
+            k8s: false,
+        }])
+        .unwrap();
+        assert!(g.types.contains("type A = { x: str }"), "{}", g.types);
     }
 }
