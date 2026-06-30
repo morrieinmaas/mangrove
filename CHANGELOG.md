@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.11.1
+
+### Tests / examples
+- **GitOps conformance example.** Added `examples/gitops-resources.mang` — a
+  realistic resource list exercising discriminated-union dispatch (on `kind`),
+  string-length refinements, a bare-list top-level body, a conditional list
+  element, and list spread together — pinned with a golden content hash and a
+  YAML-stream round-trip + precise-error negative tests. Locks the v0.10/v0.11
+  composition features into CI so they can't silently regress. No library
+  changes.
+
 ## v0.11.0
 
 ### Typed
