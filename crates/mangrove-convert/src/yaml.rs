@@ -14,6 +14,21 @@ use yaml_rust2::{YamlEmitter, YamlLoader};
 /// stack overflow on adversarial input, rather than relying on the YAML library's.
 const MAX_DEPTH: usize = 128;
 
+/// Options for [`import_with`].
+///
+/// - `skip_empty`: drop empty/null top-level documents in a multi-doc stream
+///   (the `--skip-empty` CLI flag; `helm template` emits blank docs for disabled
+///   resources).
+/// - `drop_null`: treat `null` as a **map value** as key absence — the key is
+///   omitted from the resulting `Value::Map`. This is the only axiom-consistent
+///   reading: Mangrove expresses absence by the key not being present. A `null`
+///   appearing as a list element or document root still errors even with this flag.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImportOpts {
+    pub skip_empty: bool,
+    pub drop_null: bool,
+}
+
 /// Parse a YAML document or multi-document stream into a `Value` (schemaless L0 data, D42).
 ///
 /// - A single-document stream returns the document's value directly.
@@ -31,7 +46,7 @@ const MAX_DEPTH: usize = 128;
 /// assert!(matches!(multi, mangrove_core::Value::List(_)));
 /// ```
 pub fn import(s: &str) -> Result<Value, String> {
-    import_opts(s, false)
+    import_with(s, ImportOpts::default())
 }
 
 /// Like [`import`], but when `skip_empty` is set, empty/null documents in a
@@ -43,8 +58,24 @@ pub fn import(s: &str) -> Result<Value, String> {
 /// "no document", not a null *value* — a `null` appearing as an actual value
 /// inside a document is still rejected.
 pub fn import_opts(s: &str, skip_empty: bool) -> Result<Value, String> {
+    import_with(
+        s,
+        ImportOpts {
+            skip_empty,
+            drop_null: false,
+        },
+    )
+}
+
+/// Full-options entry point. Prefer [`import`] or [`import_opts`] for simple
+/// cases; use this when both `skip_empty` and `drop_null` may be set.
+///
+/// `drop_null` treats a `Yaml::Null` appearing as a **map value** as key
+/// absence (the key is omitted). A null list element or document root still
+/// errors — dropping a positional element would be lossy.
+pub fn import_with(s: &str, opts: ImportOpts) -> Result<Value, String> {
     let mut docs = YamlLoader::load_from_str(s).map_err(|e| format!("YAML parse error: {e}"))?;
-    if skip_empty {
+    if opts.skip_empty {
         docs.retain(|d| !matches!(d, Yaml::Null));
         if docs.is_empty() {
             return Ok(Value::List(vec![]));
@@ -52,11 +83,11 @@ pub fn import_opts(s: &str, skip_empty: bool) -> Result<Value, String> {
     }
     match docs.as_slice() {
         [] => Err("empty YAML document".into()),
-        [one] => yaml_to_value(one, "", 0),
+        [one] => yaml_to_value(one, "", 0, opts),
         many => {
             let mut out = Vec::with_capacity(many.len());
             for (i, doc) in many.iter().enumerate() {
-                out.push(yaml_to_value(doc, &format!("[doc {i}]"), 0)?);
+                out.push(yaml_to_value(doc, &format!("[doc {i}]"), 0, opts)?);
             }
             Ok(Value::List(out))
         }
@@ -112,7 +143,7 @@ pub fn export(v: &Value) -> Result<String, String> {
     Ok(out)
 }
 
-fn yaml_to_value(y: &Yaml, path: &str, depth: usize) -> Result<Value, String> {
+fn yaml_to_value(y: &Yaml, path: &str, depth: usize, opts: ImportOpts) -> Result<Value, String> {
     if depth >= MAX_DEPTH {
         return Err(format!("{path}: nesting too deep"));
     }
@@ -135,7 +166,12 @@ fn yaml_to_value(y: &Yaml, path: &str, depth: usize) -> Result<Value, String> {
         Yaml::Array(a) => {
             let mut out = Vec::with_capacity(a.len());
             for (i, item) in a.iter().enumerate() {
-                out.push(yaml_to_value(item, &format!("{path}[{i}]"), depth + 1)?);
+                out.push(yaml_to_value(
+                    item,
+                    &format!("{path}[{i}]"),
+                    depth + 1,
+                    opts,
+                )?);
             }
             Ok(Value::List(out))
         }
@@ -145,12 +181,16 @@ fn yaml_to_value(y: &Yaml, path: &str, depth: usize) -> Result<Value, String> {
                 let Yaml::String(key) = k else {
                     return Err(format!("{path}: only string keys are supported"));
                 };
+                // With drop_null: a null map value means "key absent" — omit it.
+                if opts.drop_null && matches!(v, Yaml::Null) {
+                    continue;
+                }
                 let child = if path.is_empty() {
                     key.clone()
                 } else {
                     format!("{path}.{key}")
                 };
-                m.insert(key.clone(), yaml_to_value(v, &child, depth + 1)?);
+                m.insert(key.clone(), yaml_to_value(v, &child, depth + 1, opts)?);
             }
             Ok(Value::Map(m))
         }
@@ -361,6 +401,90 @@ metadata:
     fn import_empty_without_skip_still_errors() {
         // The no-flag path is unchanged: empty input still errors.
         assert!(import("").is_err());
+    }
+
+    // ── drop_null ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn drop_null_omits_null_map_values() {
+        // a: null → key absent; b: 1 → kept.
+        let opts = ImportOpts {
+            drop_null: true,
+            ..Default::default()
+        };
+        let v = import_with("a: null\nb: 1\n", opts).unwrap();
+        let Value::Map(m) = v else {
+            panic!("expected Map")
+        };
+        assert!(!m.contains_key("a"), "null key must be dropped");
+        assert_eq!(m.get("b"), Some(&Value::Int(1.into())));
+    }
+
+    #[test]
+    fn drop_null_nested_map_value() {
+        // annotations: null → dropped; name: "x" → kept.
+        let opts = ImportOpts {
+            drop_null: true,
+            ..Default::default()
+        };
+        let yaml = "meta:\n  annotations: null\n  name: x\n";
+        let v = import_with(yaml, opts).unwrap();
+        let Value::Map(root) = &v else { panic!() };
+        let Value::Map(meta) = root.get("meta").unwrap() else {
+            panic!()
+        };
+        assert!(
+            !meta.contains_key("annotations"),
+            "nested null must be dropped"
+        );
+        assert_eq!(meta.get("name"), Some(&Value::Str("x".into())));
+    }
+
+    #[test]
+    fn drop_null_false_null_map_value_still_errors() {
+        // Without drop_null, null map values still error.
+        assert!(import("a: null\n").is_err());
+        let opts = ImportOpts {
+            drop_null: false,
+            ..Default::default()
+        };
+        assert!(import_with("a: null\n", opts).is_err());
+    }
+
+    #[test]
+    fn drop_null_list_element_still_errors() {
+        // drop_null ONLY covers map values — a null list element still errors.
+        let opts = ImportOpts {
+            drop_null: true,
+            ..Default::default()
+        };
+        let result = import_with("a:\n  - 1\n  - null\n  - 2\n", opts);
+        assert!(
+            result.is_err(),
+            "null list element must still error with drop_null"
+        );
+    }
+
+    #[test]
+    fn drop_null_composes_with_skip_empty() {
+        // Both flags together: blank docs dropped AND null map values dropped.
+        let opts = ImportOpts {
+            skip_empty: true,
+            drop_null: true,
+        };
+        let yaml = "kind: A\nannotations: null\n---\n\n---\nkind: B\n";
+        let v = import_with(yaml, opts).unwrap();
+        let Value::List(elems) = v else {
+            panic!("expected List, got {v:?}")
+        };
+        assert_eq!(elems.len(), 2, "blank doc dropped");
+        let Value::Map(first) = &elems[0] else {
+            panic!()
+        };
+        assert!(
+            !first.contains_key("annotations"),
+            "null map value dropped in doc 0"
+        );
     }
 
     // ── export_stream ──────────────────────────────────────────────────────────

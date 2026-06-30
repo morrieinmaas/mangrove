@@ -1,16 +1,16 @@
 //! The `mangrove` command-line tool.
-//!   `mangrove --version`                        — print the version
-//!   `mangrove hash <file>`                      — print the BLAKE3 content address of an L0 document
-//!   `mangrove check <file>`                     — validate a document against its bound schema
-//!   `mangrove update <file>`                    — resolve + pin namespaced imports into mangrove.lock
-//!   `mangrove import <file>`                    — convert a YAML/TOML file to a Mangrove document
-//!                                                 (multi-doc YAML streams import as a Mangrove list)
-//!   `mangrove export <file> --to yaml`          — evaluate a document and emit YAML (default)
-//!   `mangrove export <file> --to yaml-stream`   — emit a Value::List as a YAML multi-doc stream
-//!   `mangrove export <file> --to toml`          — evaluate a document and emit TOML
-//!   `mangrove gen-openapi [--k8s] <spec>…`      — generate Mangrove types from OpenAPI spec(s)
-//!   `mangrove fmt <file>…`                      — format documents (--check to gate; - for stdin)
-//!   `mangrove lsp`                              — run the language server over stdio (editors)
+//!   `mangrove --version`                           — print the version
+//!   `mangrove hash <file>`                         — print the BLAKE3 content address of an L0 document
+//!   `mangrove check <file>`                        — validate a document against its bound schema
+//!   `mangrove update <file>`                       — resolve + pin namespaced imports into mangrove.lock
+//!   `mangrove import [--skip-empty] [--drop-null] <file>` — convert a YAML/TOML file to a Mangrove document
+//!                                                    (multi-doc YAML streams import as a Mangrove list)
+//!   `mangrove export <file> --to yaml`             — evaluate a document and emit YAML (default)
+//!   `mangrove export <file> --to yaml-stream`      — emit a Value::List as a YAML multi-doc stream
+//!   `mangrove export <file> --to toml`             — evaluate a document and emit TOML
+//!   `mangrove gen-openapi [--k8s] <spec>…`         — generate Mangrove types from OpenAPI spec(s)
+//!   `mangrove fmt <file>…`                         — format documents (--check to gate; - for stdin)
+//!   `mangrove lsp`                                 — run the language server over stdio (editors)
 
 use mangrove_core::error::ValidationError;
 use std::process::ExitCode;
@@ -35,13 +35,15 @@ fn main() -> ExitCode {
             None => usage(),
         },
         Some("import") => {
-            // `import [--skip-empty] <file>` or `import <file> [--skip-empty]`
+            // `import [--skip-empty] [--drop-null] <file>` — flags may appear in any order.
             // `--skip-empty` drops blank/null documents from a multi-doc stream.
+            // `--drop-null` treats null map values as key absence (unblocks real Helm output).
             let import_args: Vec<&str> = args[2..].iter().map(String::as_str).collect();
             let skip_empty = import_args.contains(&"--skip-empty");
+            let drop_null = import_args.contains(&"--drop-null");
             let path = import_args.into_iter().find(|a| !a.starts_with("--"));
             match path {
-                Some(p) => cmd_import(p, skip_empty),
+                Some(p) => cmd_import(p, skip_empty, drop_null),
                 None => usage(),
             }
         }
@@ -79,7 +81,8 @@ fn cmd_lsp() -> ExitCode {
 fn usage() -> ExitCode {
     eprintln!(
         "usage: mangrove [--version | hash <file> | check <file> | update <file> \
-         | import [--skip-empty] <file.yaml|.toml> | export <file.mang> [--to yaml|yaml-stream|toml] \
+         | import [--skip-empty] [--drop-null] <file.yaml|.toml> \
+         | export <file.mang> [--to yaml|yaml-stream|toml] \
          | gen-openapi [--k8s] <spec>... [--root <Def>]... \
          | fmt <file…> | fmt --check <file…> | fmt - | lsp]"
     );
@@ -264,9 +267,16 @@ fn cmd_hash(path: &str) -> ExitCode {
     }
 }
 
-/// `mangrove import <file.yaml|.toml>` — parse a YAML/TOML file into plain data and
-/// print it as a schemaless Mangrove document (D42). Format is chosen by extension.
-fn cmd_import(path: &str, skip_empty: bool) -> ExitCode {
+/// `mangrove import [--skip-empty] [--drop-null] <file.yaml|.toml>` — parse a
+/// YAML/TOML file into plain data and print it as a schemaless Mangrove document
+/// (D42). Format is chosen by extension.
+///
+/// `--drop-null` treats a null YAML map value as key absence (the key is
+/// omitted), enabling import of real Helm/k8s renders that use implicit nulls.
+/// Null list elements and document roots still error — dropping positional
+/// elements would be lossy. TOML has no null, so `--drop-null` is a no-op for
+/// `.toml` files.
+fn cmd_import(path: &str, skip_empty: bool, drop_null: bool) -> ExitCode {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -274,8 +284,12 @@ fn cmd_import(path: &str, skip_empty: bool) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let opts = mangrove_convert::yaml::ImportOpts {
+        skip_empty,
+        drop_null,
+    };
     let value = match format_of(path) {
-        Some(Format::Yaml) => mangrove_convert::yaml::import_opts(&text, skip_empty),
+        Some(Format::Yaml) => mangrove_convert::yaml::import_with(&text, opts),
         Some(Format::Toml) => mangrove_convert::toml::import(&text),
         None => Err(format!(
             "{path}: unknown format (expected .yaml/.yml/.toml)"

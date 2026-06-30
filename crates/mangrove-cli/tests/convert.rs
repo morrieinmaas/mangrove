@@ -270,3 +270,101 @@ fn import_skip_empty_flag_after_path() {
         "--skip-empty position must not affect output"
     );
 }
+
+// ── --drop-null (v0.12.0) ─────────────────────────────────────────────────────
+
+#[test]
+fn import_drop_null_omits_null_map_values() {
+    // A YAML with an implicit null map value (e.g. `annotations:`) should succeed
+    // with --drop-null, and the output must not contain "annotations".
+    let pid = std::process::id();
+    let y = std::env::temp_dir().join(format!("dropnull_basic_{pid}.yaml"));
+    std::fs::write(
+        &y,
+        "metadata:\n  annotations:\n  name: myapp\nreplicas: 3\n",
+    )
+    .unwrap();
+    let path = y.to_str().unwrap();
+
+    // Without --drop-null: fails with null error.
+    let out_no_flag = mangrove(&["import", path]);
+    assert_eq!(
+        out_no_flag.status.code(),
+        Some(1),
+        "null map value must error without --drop-null"
+    );
+    let stderr = String::from_utf8_lossy(&out_no_flag.stderr);
+    assert!(
+        stderr.contains("null"),
+        "error must mention null, got: {stderr}"
+    );
+
+    // With --drop-null (flag before path): succeeds, no annotations key.
+    let out_flag_before = mangrove(&["import", "--drop-null", path]);
+    assert!(
+        out_flag_before.status.success(),
+        "--drop-null before path failed: {}",
+        String::from_utf8_lossy(&out_flag_before.stderr)
+    );
+    let text = String::from_utf8(out_flag_before.stdout.clone()).unwrap();
+    assert!(
+        !text.contains("annotations"),
+        "annotations must be absent after drop-null: {text}"
+    );
+    assert!(text.contains("name"), "name must be present: {text}");
+    assert!(
+        text.contains("replicas"),
+        "replicas must be present: {text}"
+    );
+
+    // With --drop-null (flag after path): same output.
+    let out_flag_after = mangrove(&["import", path, "--drop-null"]);
+    assert!(
+        out_flag_after.status.success(),
+        "--drop-null after path failed: {}",
+        String::from_utf8_lossy(&out_flag_after.stderr)
+    );
+    assert_eq!(
+        out_flag_before.stdout, out_flag_after.stdout,
+        "--drop-null flag position must not affect output"
+    );
+}
+
+#[test]
+fn import_drop_null_with_skip_empty_compose() {
+    // Both flags together: blank docs dropped AND null map values dropped.
+    let pid = std::process::id();
+    let y = std::env::temp_dir().join(format!("dropnull_combo_{pid}.yaml"));
+    std::fs::write(
+        &y,
+        "kind: Deployment\nannotations:\n---\n\n---\nkind: Service\nlabels:\n",
+    )
+    .unwrap();
+    let path = y.to_str().unwrap();
+
+    let out = mangrove(&["import", "--drop-null", "--skip-empty", path]);
+    assert!(
+        out.status.success(),
+        "--drop-null --skip-empty failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains("annotations"), "annotations must be dropped");
+    assert!(!text.contains("labels"), "labels must be dropped");
+    assert!(text.contains("Deployment"), "Deployment must be present");
+    assert!(text.contains("Service"), "Service must be present");
+}
+
+#[test]
+fn import_drop_null_list_element_still_errors() {
+    // --drop-null only covers map values; a null list element still errors.
+    let pid = std::process::id();
+    let y = std::env::temp_dir().join(format!("dropnull_list_{pid}.yaml"));
+    std::fs::write(&y, "items:\n  - 1\n  - null\n  - 2\n").unwrap();
+    let out = mangrove(&["import", "--drop-null", y.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "null list element must still error with --drop-null"
+    );
+}
