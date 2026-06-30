@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.9.1
+
+Two additive refinements that make typing real Kubernetes manifests clean
+(surfaced migrating a GitOps repo). Neither changes any existing accept/reject
+behaviour.
+
+### Typed
+- **Discriminated-union dispatch fires on an optional discriminant.** Detection
+  no longer requires the discriminant field (e.g. `kind`) to be non-optional —
+  it must still be present in every variant, literal-typed, and pairwise
+  distinct. This matters because `gen-openapi` emits k8s discriminants as
+  optional (`kind?: "PersistentVolumeClaim"`), so precise per-resource errors
+  (`[0].spec.accessModes: got 123, expected [ str ]`) now actually fire on
+  generated types instead of degrading to "no matching variant". A value that
+  omits the optional discriminant still falls back to try-each.
+
+### Interop
+- **`gen-openapi` accepts a bare-root JSON Schema.** A standalone JSON Schema
+  file (top-level `properties`/`type`, no `definitions`/`components.schemas` —
+  the common per-resource k8s/CRD schema shape) is now generated directly,
+  named by `--root`, with no OpenAPI-envelope wrapping step.
+
 ## v0.9.0
 
 Multi-document interop. A multi-document YAML stream (e.g. a Kubernetes
