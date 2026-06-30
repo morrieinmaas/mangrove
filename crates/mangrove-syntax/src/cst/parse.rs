@@ -82,6 +82,13 @@ impl<'a> Parser<'a> {
         self.builder.finish_node();
     }
 
+    fn checkpoint(&self) -> rowan::Checkpoint {
+        self.builder.checkpoint()
+    }
+    fn start_at(&mut self, cp: rowan::Checkpoint, kind: SyntaxKind) {
+        self.builder.start_node_at(cp, rowan_kind(kind));
+    }
+
     /// Record a parse error at the current position (line/col 0 — LSP recomputes
     /// from byte offsets; exact position is non-critical for v0.3.0).
     fn push_error(&mut self, msg: &str) {
@@ -535,32 +542,32 @@ fn parse_list(p: &mut Parser, depth: usize) {
                 p.finish(); // LIST_SPREAD
             }
             _ => {
-                // `item if cond` — conditional element. Only possible for single-token
-                // items (scalars/refs): peek if the 2nd significant token is bareword `if`.
-                let is_single_atom = matches!(
-                    p.current(),
-                    SyntaxKind::INT
-                        | SyntaxKind::STR
-                        | SyntaxKind::BOOL
-                        | SyntaxKind::DECIMAL
-                        | SyntaxKind::UNIT_LIT
-                        | SyntaxKind::INTERP_STR
-                        | SyntaxKind::BYTES
-                        | SyntaxKind::BAREWORD
-                );
-                let has_if_suffix = is_single_atom
-                    && nth_sig(p, 1) == SyntaxKind::BAREWORD
-                    && nth_bareword_text(p, 1).as_deref() == Some("if");
-
-                if has_if_suffix {
-                    p.start(SyntaxKind::COND_ELEM);
-                    parse_atom(p, true, depth); // the item
+                // `item if cond` — conditional element (any value type: scalar,
+                // record, or list). Strategy: emit leading trivia, take a
+                // checkpoint, parse the element, then peek (without consuming)
+                // for a same-line `if` bareword. If found, retroactively wrap
+                // the element in a COND_ELEM via the checkpoint.
+                //
+                // Trivia is emitted BEFORE the checkpoint so the COND_ELEM
+                // node does not absorb preceding whitespace/separators.
+                //
+                // The `if` must be on the SAME logical line: `p.current()`
+                // skips only WHITESPACE/COMMENT (not NEWLINE), so a NEWLINE
+                // between the item and `if` makes `p.current()` return NEWLINE,
+                // not BAREWORD — correctly rejecting cross-line conditional
+                // syntax to match the legacy parser.
+                p.eat_trivia();
+                let cp = p.checkpoint();
+                parse_atom(p, true, depth); // the item (any shape)
+                let next_is_if = p.current() == SyntaxKind::BAREWORD
+                    && nth_bareword_text(p, 0).as_deref() == Some("if");
+                if next_is_if {
+                    p.start_at(cp, SyntaxKind::COND_ELEM);
                     p.bump(); // the `if` bareword
                     parse_atom(p, true, depth); // the cond
                     p.finish(); // COND_ELEM
-                } else {
-                    parse_atom(p, true, depth); // plain element — stop_at_closer=true: don't eat ]
                 }
+                // else: plain element already parsed, nothing more to do
             }
         }
     }

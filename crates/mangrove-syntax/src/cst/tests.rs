@@ -808,6 +808,35 @@ fn oracle_cond_elem_both_frontends_agree() {
     assert_value_equivalent("on: false\nout: [ \"a\", \"b\" if on ]\n");
     assert_value_equivalent("xs: [ 1, 2 if true, 3 ]\n");
     assert_value_equivalent("xs: [ 1 if false ]\n");
+    // Compound items in conditional elements — the CST must agree with legacy.
+    assert_value_equivalent("on: true\nout: [ { k: 1 } if on ]\n");
+    assert_value_equivalent("on: false\nout: [ { k: 1 } if on ]\n");
+    assert_value_equivalent("on: true\nout: [ [ 10, 20 ] if on ]\n");
+    assert_value_equivalent("on: false\nout: [ [ 10, 20 ] if on ]\n");
+    // Spread of compound (inner is a list literal containing a record)
+    assert_value_equivalent("out: [ ...[ { a: 1 } ] ]\n");
+    // Mixed: scalar + compound conditional elements together
+    assert_value_equivalent(
+        "on: true\nout: [ { kind: \"A\" }, { kind: \"B\" } if on, \"c\" if on ]\n",
+    );
+}
+
+#[test]
+fn cst_no_cond_elem_across_newline() {
+    // `item\nif cond` must NOT create a COND_ELEM in the CST: the `if` must be
+    // on the same logical line as the item. `p.current()` skips only
+    // WHITESPACE/COMMENT (not NEWLINE), so a NEWLINE between item and `if`
+    // means `p.current()` returns NEWLINE, blocking the conditional-element path.
+    let src = "xs: [ \"x\"\n if on ]\n";
+    let p = super::parse::parse_cst(src);
+    let cond_elem = p
+        .syntax()
+        .descendants()
+        .find(|n| n.kind() == super::kind::SyntaxKind::COND_ELEM);
+    assert!(
+        cond_elem.is_none(),
+        "cross-newline `if` must not produce a COND_ELEM node"
+    );
 }
 
 #[test]

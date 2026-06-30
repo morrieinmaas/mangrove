@@ -35,10 +35,11 @@ fn main() -> ExitCode {
             None => usage(),
         },
         Some("import") => {
-            // `import [--skip-empty] <file>` — `--skip-empty` drops blank/null
-            // documents from a multi-doc stream (e.g. `helm template` output).
-            let skip_empty = args.get(2).map(String::as_str) == Some("--skip-empty");
-            let path = if skip_empty { args.get(3) } else { args.get(2) };
+            // `import [--skip-empty] <file>` or `import <file> [--skip-empty]`
+            // `--skip-empty` drops blank/null documents from a multi-doc stream.
+            let import_args: Vec<&str> = args[2..].iter().map(String::as_str).collect();
+            let skip_empty = import_args.contains(&"--skip-empty");
+            let path = import_args.into_iter().find(|a| !a.starts_with("--"));
             match path {
                 Some(p) => cmd_import(p, skip_empty),
                 None => usage(),

@@ -237,3 +237,36 @@ fn export_yaml_stream_list_produces_multidoc_output() {
     let out_bad = mangrove(&["export", f2.to_str().unwrap(), "--to", "json"]);
     assert_eq!(out_bad.status.code(), Some(1));
 }
+
+#[test]
+fn import_skip_empty_flag_after_path() {
+    // `import <file> --skip-empty` (flag AFTER path) must behave identically to
+    // `import --skip-empty <file>` (flag before path).
+    let pid = std::process::id();
+    let y = std::env::temp_dir().join(format!("m5_skip_{pid}.yaml"));
+    std::fs::write(
+        &y,
+        "kind: Deployment\nmetadata:\n  name: app\n---\n\n---\nkind: Service\nmetadata:\n  name: svc\n",
+    )
+    .unwrap();
+    let path = y.to_str().unwrap();
+
+    let out_flag_before = mangrove(&["import", "--skip-empty", path]);
+    assert!(
+        out_flag_before.status.success(),
+        "--skip-empty before path failed: {}",
+        String::from_utf8_lossy(&out_flag_before.stderr)
+    );
+
+    let out_flag_after = mangrove(&["import", path, "--skip-empty"]);
+    assert!(
+        out_flag_after.status.success(),
+        "--skip-empty after path failed: {}",
+        String::from_utf8_lossy(&out_flag_after.stderr)
+    );
+
+    assert_eq!(
+        out_flag_before.stdout, out_flag_after.stdout,
+        "--skip-empty position must not affect output"
+    );
+}
