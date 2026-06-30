@@ -78,6 +78,10 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
         Value::ModuleCall { .. } => {
             panic!("unresolved module call reached the CBOR encoder — eval first")
         }
+        // ponytail: guard — a list spread is flattened by eval.
+        Value::ListSpread(_) => {
+            panic!("`...` list spread reached the CBOR encoder — eval first")
+        }
     }
 }
 

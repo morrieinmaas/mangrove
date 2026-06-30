@@ -159,11 +159,27 @@ fn reduce(v: &Value, cx: &Ctx, depth: usize) -> Result<Value, Box<ValidationErro
         }
         Value::Call { name, args } => reduce_call(name, args, cx, depth),
         Value::ModuleCall { alias, args } => reduce_module_call(alias, args, cx, depth),
-        Value::List(xs) => Ok(Value::List(
-            xs.iter()
-                .map(|x| reduce(x, cx, depth + 1))
-                .collect::<Result<_, _>>()?,
-        )),
+        Value::List(xs) => {
+            let mut out: Vec<Value> = Vec::with_capacity(xs.len());
+            for x in xs {
+                if let Value::ListSpread(inner) = x {
+                    let reduced = reduce(inner, cx, depth + 1)?;
+                    match reduced {
+                        Value::List(ys) => out.extend(ys),
+                        other => {
+                            return Err(err(
+                                "",
+                                crate::validate::render(&other),
+                                "a list (spread `...` requires a list value)",
+                            ));
+                        }
+                    }
+                } else {
+                    out.push(reduce(x, cx, depth + 1)?);
+                }
+            }
+            Ok(Value::List(out))
+        }
         Value::Map(m) => {
             let mut out = BTreeMap::new();
             for (k, val) in m {
@@ -407,6 +423,7 @@ fn contains_ref(v: &Value) -> bool {
         | Value::Match { .. }
         | Value::Call { .. }
         | Value::ModuleCall { .. } => true,
+        Value::ListSpread(inner) => contains_ref(inner),
         Value::List(xs) => xs.iter().any(contains_ref),
         Value::Map(m) => m.values().any(contains_ref),
         _ => false,
@@ -806,5 +823,79 @@ mod tests {
         m.insert("a".into(), int(1));
         let body = Value::Map(m);
         assert_eq!(eval(&body, &[], &[], &types(), &nomods()).unwrap(), body);
+    }
+
+    fn list(xs: Vec<Value>) -> Value {
+        Value::List(xs)
+    }
+
+    #[test]
+    fn list_spread_splices_middle() {
+        // xs:[1,2]  ys:[0,...xs,3]  →  ys:[0,1,2,3]
+        let mut m = BTreeMap::new();
+        m.insert("xs".into(), list(vec![int(1), int(2)]));
+        m.insert(
+            "ys".into(),
+            list(vec![
+                int(0),
+                Value::ListSpread(Box::new(Value::Ref("xs".into()))),
+                int(3),
+            ]),
+        );
+        let out = eval(&Value::Map(m), &[], &[], &types(), &nomods()).unwrap();
+        let Value::Map(o) = out else { panic!() };
+        assert_eq!(
+            o.get("ys"),
+            Some(&list(vec![int(0), int(1), int(2), int(3)]))
+        );
+    }
+
+    #[test]
+    fn list_spread_at_start() {
+        // [...[1,2],3]  →  [1,2,3]
+        let v = list(vec![
+            Value::ListSpread(Box::new(list(vec![int(1), int(2)]))),
+            int(3),
+        ]);
+        let out = eval(&v, &[], &[], &types(), &nomods()).unwrap();
+        assert_eq!(out, list(vec![int(1), int(2), int(3)]));
+    }
+
+    #[test]
+    fn list_spread_at_end() {
+        // [0,...[1,2]]  →  [0,1,2]
+        let v = list(vec![
+            int(0),
+            Value::ListSpread(Box::new(list(vec![int(1), int(2)]))),
+        ]);
+        let out = eval(&v, &[], &[], &types(), &nomods()).unwrap();
+        assert_eq!(out, list(vec![int(0), int(1), int(2)]));
+    }
+
+    #[test]
+    fn list_spread_of_empty_list() {
+        // [...[]]  →  []
+        let v = list(vec![Value::ListSpread(Box::new(list(vec![])))]);
+        let out = eval(&v, &[], &[], &types(), &nomods()).unwrap();
+        assert_eq!(out, list(vec![]));
+    }
+
+    #[test]
+    fn list_spread_nested() {
+        // [...[1,...[2,3]]]  →  [1,2,3]
+        let v = list(vec![Value::ListSpread(Box::new(list(vec![
+            int(1),
+            Value::ListSpread(Box::new(list(vec![int(2), int(3)]))),
+        ])))]);
+        let out = eval(&v, &[], &[], &types(), &nomods()).unwrap();
+        assert_eq!(out, list(vec![int(1), int(2), int(3)]));
+    }
+
+    #[test]
+    fn list_spread_of_non_list_errors() {
+        // [...5]  →  clean eval error, NOT a panic
+        let v = list(vec![Value::ListSpread(Box::new(int(5)))]);
+        let err = eval(&v, &[], &[], &types(), &nomods()).unwrap_err();
+        assert!(err.expected.contains("list"), "{err}");
     }
 }

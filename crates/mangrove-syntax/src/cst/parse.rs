@@ -528,6 +528,12 @@ fn parse_list(p: &mut Parser, depth: usize) {
                 p.bump(); // consume the foreign closer
                 p.finish();
             }
+            SyntaxKind::DOT_DOT_DOT => {
+                p.start(SyntaxKind::LIST_SPREAD);
+                p.bump(); // DOT_DOT_DOT
+                parse_atom(p, true, depth); // inner expression — stop_at_closer=true
+                p.finish(); // LIST_SPREAD
+            }
             _ => {
                 parse_atom(p, true, depth); // element value — stop_at_closer=true: don't eat ]
             }

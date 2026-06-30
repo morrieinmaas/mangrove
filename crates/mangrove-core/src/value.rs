@@ -54,6 +54,10 @@ pub enum Value {
         alias: String,
         args: Vec<(String, Value)>,
     },
+    /// A list spread element (`[...expr]`, §list-spread): splice the elements of a
+    /// list-valued expression into the enclosing list literal. Flattened by the
+    /// eval stage; must never reach the CBOR encoder unresolved.
+    ListSpread(Box<Value>),
 }
 
 /// One piece of an interpolated string (§6.3): literal text or a `$name`/`${name}`

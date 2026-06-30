@@ -427,7 +427,8 @@ mod tests {
             | Interp(_)
             | Match { .. }
             | Call { .. }
-            | ModuleCall { .. } => false,
+            | ModuleCall { .. }
+            | ListSpread(_) => false,
         }
     }
 

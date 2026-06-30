@@ -240,6 +240,10 @@ fn lower_composite(node: &SyntaxNode) -> Result<Value, ParseError> {
                     NodeOrToken::Token(t) => {
                         items.push(decode_scalar(&t)?);
                     }
+                    NodeOrToken::Node(n) if n.kind() == SyntaxKind::LIST_SPREAD => {
+                        let inner = lower_list_spread(&n)?;
+                        items.push(Value::ListSpread(Box::new(inner)));
+                    }
                     NodeOrToken::Node(n) => {
                         items.push(lower_composite(&n)?);
                     }
@@ -362,6 +366,28 @@ fn lower_bare_value_node(node: &SyntaxNode) -> Result<Value, ParseError> {
     }
     Err(ParseError {
         message: "BARE_VALUE node has no value content".into(),
+        line: 0,
+        col: 0,
+    })
+}
+
+/// Lower a LIST_SPREAD node to the inner Value.
+/// The node contains DOT_DOT_DOT token followed by the inner value node/token.
+fn lower_list_spread(node: &SyntaxNode) -> Result<Value, ParseError> {
+    for elem in node.children_with_tokens() {
+        match elem {
+            NodeOrToken::Token(t) if t.kind().is_trivia() => continue,
+            NodeOrToken::Token(t) if t.kind() == SyntaxKind::DOT_DOT_DOT => continue,
+            NodeOrToken::Token(t) => {
+                return decode_scalar(&t);
+            }
+            NodeOrToken::Node(n) => {
+                return lower_composite(&n);
+            }
+        }
+    }
+    Err(ParseError {
+        message: "LIST_SPREAD node has no inner value".into(),
         line: 0,
         col: 0,
     })

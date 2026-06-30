@@ -604,6 +604,50 @@ fn deeply_nested_value_does_not_overflow() {
     );
 }
 
+// ---- list spread oracle ----
+
+#[test]
+fn oracle_list_spread_both_frontends_agree() {
+    // The value-equivalent oracle is required here because ListSpread is a
+    // transient marker (not CBOR-encodable); both parsers must produce the same Value.
+    assert_value_equivalent("xs: [ 1, 2 ]\nys: [ 0, ...xs, 3 ]\n");
+    assert_value_equivalent("a: [ ...[] ]\n");
+    assert_value_equivalent("v: [ ...[1, ...[2, 3]] ]\n");
+    assert_value_equivalent(
+        "start: [ ...a, 1 ]\nmid: [ 1, ...a, 2 ]\nend: [ 1, ...a ]\na: [ 9 ]\n",
+    );
+}
+
+#[test]
+fn list_spread_cst_losslessness() {
+    for src in [
+        "ys: [ 0, ...xs, 3 ]\n",
+        "a: [ ...[] ]\n",
+        "b: [ ...[1, 2], 3 ]\n",
+    ] {
+        let node = super::parse::parse_cst(src).syntax();
+        assert_eq!(
+            node.text().to_string(),
+            src,
+            "list spread must round-trip losslessly: {src:?}"
+        );
+    }
+}
+
+#[test]
+fn list_spread_cst_node_kind() {
+    // The CST must emit a LIST_SPREAD node inside a LIST for `...expr`
+    let p = super::parse::parse_cst("xs: [ 0, ...ys, 3 ]\n");
+    let root = p.syntax();
+    let list_spread = root
+        .descendants()
+        .find(|n| n.kind() == super::kind::SyntaxKind::LIST_SPREAD);
+    assert!(
+        list_spread.is_some(),
+        "expected a LIST_SPREAD child inside a LIST for `...ys`"
+    );
+}
+
 /// D2: a reasonably nested valid input (10-deep) still parses correctly and
 /// round-trips through lower with NO errors — the depth cap does not affect
 /// real-world inputs.

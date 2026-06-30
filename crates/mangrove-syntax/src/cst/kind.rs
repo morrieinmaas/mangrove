@@ -97,6 +97,7 @@ pub enum SyntaxKind {
     TYPE_BRAND,
     REQUIRE,
     PRED,
+    LIST_SPREAD,
     __LAST,
 }
 
@@ -188,6 +189,7 @@ impl SyntaxKind {
         SyntaxKind::TYPE_BRAND,
         SyntaxKind::REQUIRE,
         SyntaxKind::PRED,
+        SyntaxKind::LIST_SPREAD,
     ];
 
     pub fn is_trivia(self) -> bool {

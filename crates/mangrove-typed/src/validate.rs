@@ -489,6 +489,7 @@ pub(crate) fn render(v: &Value) -> String {
         Value::Match { .. } => "<match>".into(),
         Value::Call { name, .. } => format!("{name}(…)"),
         Value::ModuleCall { alias, .. } => format!("{alias}(…)"),
+        Value::ListSpread(_) => "<list spread>".into(),
     }
 }
 

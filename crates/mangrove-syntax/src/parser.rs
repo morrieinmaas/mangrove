@@ -1162,7 +1162,13 @@ impl Parser {
             if self.at_eof() {
                 return Err(self.error("unexpected end of input, expected ']'".into()));
             }
-            items.push(self.parse_value(depth)?);
+            if self.check(&Tok::DotDotDot) {
+                self.advance();
+                let inner = self.parse_value(depth)?;
+                items.push(Value::ListSpread(Box::new(inner)));
+            } else {
+                items.push(self.parse_value(depth)?);
+            }
 
             let had_sep = self.at_sep();
             self.skip_seps();
@@ -1938,5 +1944,42 @@ mod tests {
     fn bare_value_empty_list() {
         let d = parse_document("[]\n").unwrap();
         assert_eq!(d.body, Value::List(vec![]));
+    }
+
+    #[test]
+    fn list_spread_parses_as_list_spread_value() {
+        let v = parse("[ 0, ...xs, 3 ]\n").unwrap();
+        assert!(
+            matches!(
+                &v,
+                Value::List(items) if items.len() == 3
+                    && matches!(&items[0], Value::Int(n) if n == &BigInt::from(0))
+                    && matches!(&items[1], Value::ListSpread(inner) if matches!(inner.as_ref(), Value::Ref(n) if n == "xs"))
+                    && matches!(&items[2], Value::Int(n) if n == &BigInt::from(3))
+            ),
+            "expected [0, ...xs, 3], got {v:?}"
+        );
+    }
+
+    #[test]
+    fn list_spread_at_start_middle_end() {
+        let v = parse("[ ...a, 1, ...b, 2, ...c ]\n").unwrap();
+        let Value::List(items) = v else { panic!() };
+        assert_eq!(items.len(), 5);
+        assert!(matches!(&items[0], Value::ListSpread(_)));
+        assert!(matches!(&items[1], Value::Int(_)));
+        assert!(matches!(&items[2], Value::ListSpread(_)));
+        assert!(matches!(&items[3], Value::Int(_)));
+        assert!(matches!(&items[4], Value::ListSpread(_)));
+    }
+
+    #[test]
+    fn list_spread_of_empty_list_literal() {
+        let v = parse("[ ...[] ]\n").unwrap();
+        let Value::List(items) = v else { panic!() };
+        assert_eq!(items.len(), 1);
+        assert!(
+            matches!(&items[0], Value::ListSpread(inner) if matches!(inner.as_ref(), Value::List(xs) if xs.is_empty()))
+        );
     }
 }
