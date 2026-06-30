@@ -33,10 +33,45 @@ pub struct Generated {
 /// let g = mangrove_openapi::generate(spec, Some("Port")).unwrap();
 /// assert!(g.types.contains("type Port = { n: int }"));
 /// ```
+///
+/// A bare-root JSON Schema (top-level `"properties"` or `"type"`, no
+/// `definitions`/`components.schemas`) is also accepted when `root` names the
+/// generated type:
+///
+/// ```
+/// let spec = r#"{ "type": "object", "required": ["n"],
+///     "properties": { "n": { "type": "integer" } } }"#;
+/// let g = mangrove_openapi::generate(spec, Some("Port")).unwrap();
+/// assert!(g.types.contains("type Port = { n: int }"));
+/// ```
 pub fn generate(spec_json: &str, root: Option<&str>) -> Result<Generated, String> {
     let spec: J = serde_json::from_str(spec_json).map_err(|e| format!("invalid JSON: {e}"))?;
-    let defs = definitions(&spec)
-        .ok_or("spec has no `definitions` (OpenAPI v2) or `components.schemas` (v3)")?;
+
+    // Synthesize a one-entry definition map when the spec is a bare JSON Schema
+    // (has top-level "properties" or "type" but no OpenAPI envelope).
+    let bare_holder: Map<String, J>;
+    let defs: &Map<String, J> = match definitions(&spec) {
+        Some(d) => d,
+        None => {
+            let is_bare_schema = spec.get("properties").and_then(J::as_object).is_some()
+                || spec.get("type").is_some();
+            if is_bare_schema {
+                let name = root.ok_or(
+                    "a bare JSON Schema (no definitions/components.schemas) requires \
+                     --root <Name> to name the generated type",
+                )?;
+                let mut m = Map::new();
+                m.insert(name.to_string(), spec.clone());
+                bare_holder = m;
+                &bare_holder
+            } else {
+                return Err(
+                    "spec has no `definitions` (OpenAPI v2) or `components.schemas` (v3)"
+                        .to_string(),
+                );
+            }
+        }
+    };
 
     let names: Vec<String> = match root {
         Some(r) => {
@@ -641,5 +676,42 @@ mod tests {
           "properties": { "v": { "oneOf": [ { "type": "integer" }, { "type": "string" } ] } } } } }"##;
         let g = generate(spec, Some("U")).unwrap();
         assert!(g.types.contains("v: int | str"), "{}", g.types);
+    }
+
+    // --- bare-root JSON Schema tests ---
+
+    #[test]
+    fn bare_schema_with_root_generates_type() {
+        let spec = r#"{ "type": "object", "required": ["n"],
+            "properties": { "n": { "type": "integer" } } }"#;
+        let g = generate(spec, Some("Port")).unwrap();
+        assert!(g.types.contains("type Port = { n: int }"), "{}", g.types);
+    }
+
+    #[test]
+    fn bare_schema_without_root_errors() {
+        let spec = r#"{ "type": "object", "required": ["n"],
+            "properties": { "n": { "type": "integer" } } }"#;
+        let err = generate(spec, None).err().expect("expected an error");
+        assert!(
+            err.contains("--root"),
+            "error should mention --root, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bare_schema_with_only_properties_no_type() {
+        // top-level "properties" is sufficient to detect a bare schema.
+        let spec = r#"{ "properties": { "x": { "type": "string" } } }"#;
+        let g = generate(spec, Some("Foo")).unwrap();
+        assert!(g.types.contains("type Foo ="), "{}", g.types);
+    }
+
+    #[test]
+    fn openapi_envelope_still_works_regression() {
+        // REGRESSION: the existing OpenAPI envelope path still works.
+        let g = generate(SPEC, Some("Container")).unwrap();
+        assert!(g.types.contains("type Container ="), "{}", g.types);
+        assert!(g.types.contains("type Probe ="), "{}", g.types);
     }
 }
