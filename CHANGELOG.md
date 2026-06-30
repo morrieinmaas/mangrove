@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.10.1
+
+Two refinements to the v0.10.0 work.
+
+### Fixed
+- **`import --skip-empty` yields `[]` for an all-empty stream.** When every
+  document in a stream is blank (e.g. a `helm template` where all resources are
+  disabled), `--skip-empty` now produces an empty list — which validates against
+  `[Resource]` — instead of an "empty document" error. Without the flag, an
+  empty stream still errors.
+- **Front-end parity on malformed list input.** The lossless CST was more lenient
+  than the evaluation parser for some space-/newline-separated list elements
+  (e.g. `[ 1 2 ]`, or an element and an `if` split across a newline): the parser
+  errored while the CST silently accepted. Both front-ends now reject these
+  identically, restoring the parse-equivalence invariant.
+
 ## v0.10.0
 
 List composition and conditional resources — so a document that evaluates to a
